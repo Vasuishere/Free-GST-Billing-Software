@@ -587,7 +587,6 @@ export const getNextDnNumber = async ({ peek = false, businessKey = '', date = '
     ? nextCounterValue((await apiFetch(`${API}/meta/${key}`)).value)
     : (await apiFetch(`${API}/meta/${key}/increment`, { method: 'POST', body: JSON.stringify({}) })).value;
   return formatDnNumber(next, date);
->>>>>>> v1.10.86
 };
 
 // ---- Recurring Invoices ----

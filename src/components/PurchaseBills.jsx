@@ -52,7 +52,7 @@ import SupplierStatement from './SupplierStatement';
 import ComboInput from './ComboInput';
 // v1.10.86 - (#175) a bill handed over from GST Returns -> GSTR-2B ("2B only").
 import { takeTwoBDraft, markBackToTwoB } from '../utils/gstr2bBill';
-import { productKey, findLineProduct, purchaseStockPlan, purchaseStockReversal, lineProductHint } from '../utils/purchaseStock';
+import { productKey, findLineProduct, purchaseStockPlan, purchaseStockReversal, registerNewProductsFromPo, lineProductHint } from '../utils/purchaseStock';
 
 // v1.10.31 — UI-C3: Same accent-color helper as ClientsView so the
 // Purchase Bill PDF header rule + totals line pick up the user's brand.
@@ -518,20 +518,43 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
   const handleSavePo = async () => {
     if (!form.date) { toast('PO date is required', 'warning'); return; }
     if (!form.supplierName.trim()) { toast('Supplier name is required', 'warning'); return; }
-    const items = form.items
-      .filter(i => (i.name || '').trim() && (parseFloat(i.quantity) || 0) > 0)
-      .map(i => ({
+    const activeLines = form.items.filter(i => (i.name || '').trim() && (parseFloat(i.quantity) || 0) > 0);
+    if (!activeLines.length) { toast('Add at least one item with a quantity', 'warning'); return; }
+    for (const i of activeLines) {
+      const rateVal = parseFloat(i.rate);
+      if (!Number.isFinite(rateVal) || rateVal < 0) {
+        toast(`Enter a valid purchase price (>= 0) for "${i.name.trim()}"`, 'warning');
+        return;
+      }
+      const existingProd = findLineProduct(products, i);
+      if (!existingProd) {
+        const sellRaw = i.sellingPrice;
+        const sellVal = parseFloat(sellRaw);
+        if (sellRaw === '' || sellRaw === undefined || sellRaw === null || !Number.isFinite(sellVal) || sellVal < 0) {
+          toast(`Enter a selling price for new product "${i.name.trim()}"`, 'warning');
+          return;
+        }
+      }
+    }
+    let items = activeLines.map(i => {
+      const existingProd = findLineProduct(products, i);
+      const rateVal = parseFloat(i.rate) || 0;
+      const storedCost = existingProd ? (Number(existingProd.purchasePrice) || Number(existingProd.rate) || 0) : null;
+      return {
         name: i.name.trim(),
+        ...(i.productId ? { productId: i.productId } : {}),
         hsn: (i.hsn || '').trim(),
         quantity: parseFloat(i.quantity) || 0,
         unit: (i.unit || '').trim(),
-        rate: parseFloat(i.rate) || 0,
+        rate: rateVal,
+        ...(existingProd && rateVal !== storedCost ? { isPriceOverridden: true } : {}),
+        ...(!existingProd && i.sellingPrice !== '' && i.sellingPrice !== undefined ? { sellingPrice: parseFloat(i.sellingPrice) || 0 } : {}),
         taxPercent: parseFloat(i.taxPercent) || 0,
         cessPercent: parseFloat(i.cessPercent) || 0,
         ...lineDiscountFields(i), // v1.10.85 (#171)
         ...altLineFields(i), // v1.10.85 (#148) - ordered in boxes: billed in boxes
-      }));
-    if (!items.length) { toast('Add at least one item with a quantity', 'warning'); return; }
+      };
+    });
     const existing = editingId ? orders.find(o => o.id === editingId) : null;
     let poNumber = (form.poNumber || '').trim();
     try {
@@ -548,6 +571,12 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
     }
     const t = calcPurchaseTotal(items);
     try {
+      let newProdWrites = [];
+      try {
+        const reg = registerNewProductsFromPo(await getAllProducts(), items, newProductId);
+        items = reg.items;
+        newProdWrites = reg.writes;
+      } catch { /* non-fatal */ }
       await savePurchaseOrder({
         ...(existing || {}),
         poNumber,
@@ -573,7 +602,18 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
         totalAmount: t.finalTotal,
         createdAt: existing?.createdAt || new Date().toISOString(),
       });
-      toast(existing ? `${poNumber} updated` : `${poNumber} saved`, 'success');
+      if (newProdWrites.length > 0) {
+        await Promise.all(newProdWrites.map(p => saveProduct(p))).catch(() => {});
+        loadProducts();
+      }
+      toast(
+        existing
+          ? `${poNumber} updated`
+          : newProdWrites.length > 0
+            ? `${poNumber} saved — ${newProdWrites.length} new product(s) registered`
+            : `${poNumber} saved`,
+        'success'
+      );
       closeForm();
       loadPurchases();
     } catch {
@@ -773,23 +813,30 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
     if (returnsProblem) { toast(returnsProblem, 'warning', 10000); return; }
     try {
       // v1.10.86 - each line keeps its part of the bill discount (billDiscShare).
-      const items = withBillDiscount(form.items.map(i => ({
-        name: (i.name || '').trim(),
-        // v1.10.86 (#199) - the product this line is (see utils/purchaseStock.js).
-        ...(i.productId ? { productId: i.productId } : {}),
-        hsn: (i.hsn || '').trim(),
-        quantity: parseFloat(i.quantity) || 0,
-        rate: parseFloat(i.rate) || 0,
-        taxPercent: parseFloat(i.taxPercent) || 0,
-        cessPercent: parseFloat(i.cessPercent) || 0,
-        // v1.10.83 (#112) - only lines from a purchase order carry a unit.
-        ...(String(i.unit || '').trim() ? { unit: String(i.unit).trim() } : {}),
-        // v1.10.85 (#171, #160) - a discount and serial numbers only when given.
-        ...lineDiscountFields(i),
-        ...(String(i.serialNo || '').trim() ? { serialNo: String(i.serialNo).trim() } : {}),
-        // v1.10.85 (#148) - bought in the product's second unit (Box = 12).
-        ...altLineFields(i),
-      })), billDisc, billDiscType);
+      const items = withBillDiscount(form.items.map(i => {
+        const existingProd = findLineProduct(products, i);
+        const rateVal = parseFloat(i.rate) || 0;
+        const storedCost = existingProd ? (Number(existingProd.purchasePrice) || Number(existingProd.rate) || 0) : null;
+        return {
+          name: (i.name || '').trim(),
+          // v1.10.86 (#199) - the product this line is (see utils/purchaseStock.js).
+          ...(i.productId ? { productId: i.productId } : {}),
+          hsn: (i.hsn || '').trim(),
+          quantity: parseFloat(i.quantity) || 0,
+          rate: rateVal,
+          ...(existingProd && rateVal !== storedCost ? { isPriceOverridden: true } : {}),
+          ...(!existingProd && i.sellingPrice !== '' && i.sellingPrice !== undefined ? { sellingPrice: parseFloat(i.sellingPrice) || 0 } : {}),
+          taxPercent: parseFloat(i.taxPercent) || 0,
+          cessPercent: parseFloat(i.cessPercent) || 0,
+          // v1.10.83 (#112) - only lines from a purchase order carry a unit.
+          ...(String(i.unit || '').trim() ? { unit: String(i.unit).trim() } : {}),
+          // v1.10.85 (#171, #160) - a discount and serial numbers only when given.
+          ...lineDiscountFields(i),
+          ...(String(i.serialNo || '').trim() ? { serialNo: String(i.serialNo).trim() } : {}),
+          // v1.10.85 (#148) - bought in the product's second unit (Box = 12).
+          ...altLineFields(i),
+        };
+      }), billDisc, billDiscType);
       const totals = calcPurchaseTotal(items, form.applyRoundOff);
       const before = editingId ? purchases.find(p => p.id === editingId) : null;
       const purchaseFields = {
@@ -1429,7 +1476,7 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
       })()}
 
       {payPurchase && (
-        <PurchasePaymentModal purchase={payPurchase} onClose={() => setPayPurchase(null)} onChanged={() => loadPurchases()} />
+        <PurchasePaymentModal purchase={payPurchase} allPurchases={purchases} onClose={() => setPayPurchase(null)} onChanged={() => loadPurchases()} />
       )}
 
       {/* Stats */}
@@ -1520,6 +1567,7 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
                   <input type="date" className="form-input" value={form.expectedDate} onChange={e => updateField('expectedDate', e.target.value)} />
                 </div>
               ) : (
+              <>
               <div className="form-group">
                 <label className="form-label">Due Date</label>
                 <input type="date" className="form-input" value={form.dueDate || ''} onChange={e => updateField('dueDate', e.target.value)} />
@@ -1540,6 +1588,7 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
                   </select>
                 )}
               </div>
+              </>
               )}
               <div className="form-group">
                 <label className="form-label">Supplier Name *</label>
@@ -1720,12 +1769,46 @@ export default function PurchaseBills({ onOpenGstReturns } = {}) {
                     </div>
                   );
                 })()}
-                <div className="form-group" style={{ flex: 1, margin: 0 }}>
-                  {idx === 0 && <label className="form-label">Rate</label>}
-                  <input type="number" className="form-input" value={item.rate} min="0" step="any"
-                    onFocus={e => e.target.select()}
-                    onChange={e => updateItem(idx, 'rate', e.target.value)} />
-                </div>
+                {(() => {
+                  const linkedProd = findLineProduct(products, item);
+                  const isNewProd = !!(item.name || '').trim() && !linkedProd;
+                  const storedCost = linkedProd ? (Number(linkedProd.purchasePrice) || Number(linkedProd.rate) || 0) : null;
+                  const overridden = linkedProd && storedCost !== null && (parseFloat(item.rate) || 0) !== storedCost;
+                  const belowCost = isNewProd && item.sellingPrice !== '' && item.sellingPrice !== undefined && Number(item.sellingPrice) < (Number(item.rate) || 0);
+                  return (
+                    <>
+                      <div className="form-group" style={{ flex: 1, margin: 0 }}>
+                        {idx === 0 && <label className="form-label">{isPo ? 'Purchase Price' : 'Rate'}</label>}
+                        <input type="number" className="form-input" value={item.rate} min="0" step="any"
+                          onFocus={e => e.target.select()}
+                          onChange={e => updateItem(idx, 'rate', e.target.value)} />
+                        {overridden && (
+                          <div style={{ fontSize: '0.68rem', color: '#d97706', marginTop: 2, display: 'flex', gap: 4, alignItems: 'center' }}>
+                            <span>Stored: ₹{storedCost}</span>
+                            <button type="button" className="link-btn" style={{ fontSize: '0.68rem' }}
+                              onClick={() => updateItem(idx, 'rate', storedCost)}>
+                              Reset
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      {isNewProd && (
+                        <div className="form-group" style={{ flex: 1, margin: 0 }}>
+                          {idx === 0 && <label className="form-label">Selling Price *</label>}
+                          <input type="number" className="form-input" value={item.sellingPrice ?? ''} min="0" step="any"
+                            placeholder="Sell price"
+                            onFocus={e => e.target.select()}
+                            onChange={e => updateItem(idx, 'sellingPrice', e.target.value)} />
+                          {belowCost && (
+                            <div style={{ fontSize: '0.68rem', color: '#d97706', marginTop: 2 }}>
+                              Below purchase price
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
                 {/* v1.10.85 (#171) - a discount off the line, % or an amount, before GST. */}
                 {showDiscountCol && (
                   <div className="form-group" style={{ flex: 1, margin: 0 }}>

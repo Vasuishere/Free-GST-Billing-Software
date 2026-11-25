@@ -62,11 +62,14 @@ export function purchaseStockPlan(products, lines, priorLines = [], newId) {
     // New product - two lines of the same new item add up.
     const key = productKey(it.name);
     const had = created.get(key);
+    const sell = it.sellingPrice !== undefined && it.sellingPrice !== '' && Number.isFinite(Number(it.sellingPrice))
+      ? Number(it.sellingPrice)
+      : it.rate;
     const made = had
       ? { ...had, stock: roundQty(had.stock + qty) }
       : {
         id: newId(), name: String(it.name).trim().replace(/\s+/g, ' '), hsn: it.hsn || '',
-        purchasePrice: purchaseUnitCost(it), sellingPrice: it.rate, rate: it.rate,
+        purchasePrice: purchaseUnitCost(it), sellingPrice: sell, rate: sell,
         taxPercent: it.taxPercent || 0, cessPercent: it.cessPercent || 0, unit: it.unit || 'Nos',
         stock: roundQty(qty), description: '',
       };
@@ -89,6 +92,37 @@ export function purchaseStockReversal(products, lines) {
     if (prod) out[prod.id] = roundQty((out[prod.id] || 0) - baseQty(it));
   }
   return out;
+}
+
+// Register any brand-new products from a Purchase Order (stock stays 0 until billed/received).
+export function registerNewProductsFromPo(products, lines, newId) {
+  const created = new Map();
+  const items = (lines || []).map((it) => {
+    if (!stocked(it)) return it;
+    const prod = findLineProduct(products, it);
+    if (prod) return { ...it, productId: prod.id };
+    const key = productKey(it.name);
+    if (!created.has(key)) {
+      const sell = it.sellingPrice !== undefined && it.sellingPrice !== '' && Number.isFinite(Number(it.sellingPrice))
+        ? Number(it.sellingPrice)
+        : it.rate;
+      created.set(key, {
+        id: newId(),
+        name: String(it.name).trim().replace(/\s+/g, ' '),
+        hsn: it.hsn || '',
+        purchasePrice: purchaseUnitCost(it),
+        sellingPrice: sell,
+        rate: sell,
+        taxPercent: it.taxPercent || 0,
+        cessPercent: it.cessPercent || 0,
+        unit: it.unit || 'Nos',
+        stock: 0,
+        description: '',
+      });
+    }
+    return { ...it, productId: created.get(key).id };
+  });
+  return { items, writes: [...created.values()] };
 }
 
 // A line's hint in the form: 'new' (no product - one is made on save),

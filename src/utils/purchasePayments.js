@@ -19,8 +19,9 @@
 import { purchaseTotals } from './purchaseOrders.js';
 
 export const PURCHASE_PAYMENT_MODES = [
-  ['cash', 'Cash'], ['upi', 'UPI'], ['bank-transfer', 'Bank transfer'],
-  ['cheque', 'Cheque'], ['card', 'Card'], ['other', 'Other'],
+  ['neft', 'NEFT'], ['rtgs', 'RTGS'], ['imps', 'IMPS'], ['upi', 'UPI'],
+  ['bank-transfer', 'Bank transfer'], ['cheque', 'Cheque'], ['cash', 'Cash'],
+  ['card', 'Card'], ['other', 'Other'],
 ];
 export const purchasePaymentModeName = (mode) => (PURCHASE_PAYMENT_MODES.find(([v]) => v === mode) || [])[1] || mode || '';
 export const PURCHASE_STATUS_LABEL = { Paid: 'Paid', Partial: 'Partly paid', Unpaid: 'Unpaid' };
@@ -95,9 +96,9 @@ export function validatePurchasePayment(x) {
   if (typeof amount !== 'number' || !Number.isFinite(amount) || r2(amount) <= 0) return 'Enter an amount more than 0';
   if (amount > MAX_AMOUNT) return 'The amount is too large';
   if (!isIsoDate(x.date)) return 'Enter the payment date';
-  for (const [k, max] of Object.entries({ ...LIMITS, mode: 30, id: 80 })) {
+  for (const [k, max] of Object.entries({ ...LIMITS, mode: 30, id: 80, sourceBankAccount: 120 })) {
     if (x[k] !== undefined && x[k] !== null && typeof x[k] !== 'string') return 'Invalid payment';
-    if (String(x[k] || '').length > max) return `The ${k === 'reference' ? 'reference / cheque no.' : k} is too long (${max} letters at most)`;
+    if (String(x[k] || '').length > max) return `The ${k === 'reference' ? 'reference / cheque no.' : k === 'sourceBankAccount' ? 'source bank account' : k} is too long (${max} letters at most)`;
   }
   return '';
 }

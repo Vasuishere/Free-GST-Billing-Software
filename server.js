@@ -207,7 +207,6 @@ try {
   try { fs.appendFileSync(path.join(DATA_DIR, 'errors.log'), `[${new Date().toISOString()}] [startup] ${why} ${err.code || ''}\n`, 'utf-8'); } catch { /* the folder is the problem */ }
   process.exit(1);
 }
-}
 
 // Helper: safe filename from ID (replace slashes, etc.)
 function safeFileName(id) {
