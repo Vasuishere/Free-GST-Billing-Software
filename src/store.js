@@ -10,6 +10,7 @@ import { DEFAULT_LEVEL_NAMES, normaliseLevelNames, priceLevelList } from './util
 import { logProblem } from './utils/problemLog';
 import { setUpdateProgress } from './utils/updateNotice';
 import { defaultTermsFor } from './utils/termsDefaults';
+import { isBrowserMode, browserApiFetch } from './utils/browserApi';
 
 const API = '/api';
 
@@ -24,6 +25,9 @@ const logApiProblem = (options, url, status, message) => {
 };
 
 async function apiFetch(url, options = {}) {
+  if (isBrowserMode()) {
+    return browserApiFetch(url, options);
+  }
   let res;
   try {
     res = await fetch(url, {

@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
 import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, Menu, Heart, Banknote } from 'lucide-react';
 import { getAllProfilesWithHidden, saveProfile, getEnabledModules, getMenuOrder, getMenuHidden, getMenuDots, onMenuChanged, getAllBills, getAllProducts, getAllRecurring, getStockAlertSettings, runUpdateNow, getLockStatus, visibleProfiles, hasHiddenProfiles, openHiddenCompanies, hideCompaniesAgain, isOpenedHidden, DATA_SAVED_EVENT } from './store';
 import { isModuleEnabled, localToday, DOCS_URL, trackedStock } from './utils';
+import { isLocalhostOrigin, enableBrowserMode, browserApiFetch } from './utils/browserApi';
 import { orderedMenu } from './utils/businessTypes';
 import SidebarMenu, { NavDot } from './components/SidebarMenu';
 import MenuCustomise, { onOpenCustomiseMenu } from './components/MenuCustomise';
@@ -365,6 +366,26 @@ function App() {
         throw new Error('not ok');
       } catch {
         if (cancelled) return;
+        // On static hosted deployments (e.g. Vercel) without server.js,
+        // switch to browser localStorage mode instead of showing "Needs a Quick Start".
+        if (!isLocalhostOrigin()) {
+          enableBrowserMode();
+          setServerDown(false);
+          setServerStatus('online');
+          if (!profileLoaded.current) {
+            profileLoaded.current = true;
+            const p = await browserApiFetch('/api/profile');
+            setProfile(p);
+            if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
+              setShowWelcome(true);
+            }
+          }
+          if (retryTimer.current) {
+            clearInterval(retryTimer.current);
+            retryTimer.current = null;
+          }
+          return;
+        }
         misses += 1;
         if (!profileLoaded.current || misses >= 3) {
           setServerDown(true);
