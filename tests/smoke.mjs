@@ -22,8 +22,11 @@
  */
 import { firefox } from 'playwright';
 import { spawn } from 'child_process';
+import { readFileSync } from 'fs';
+import { request as httpRequest } from 'http';
 import { PDFDocument } from 'pdf-lib';
 import { setTimeout as sleep } from 'timers/promises';
+import { runV86bChecks, cleanupV86b } from './smoke-v86b.mjs';
 
 const results = [];
 let serverProc = null;
@@ -51,6 +54,8 @@ async function startServer() {
 /** Remove only the records this suite created. */
 async function cleanup(page) {
   try {
+    // v1.10.86 #214 #202 #199 #209 - clients, receipts, the purchase and products of smoke-v86b.mjs.
+    await cleanupV86b(page).catch(() => {});
     await page.evaluate(async () => {
       const del = async (kind) => {
         const list = await (await fetch(`/api/${kind}`)).json();
@@ -60,11 +65,29 @@ async function cleanup(page) {
       };
       await del('purchases');
       await del('products');
+      // v1.10.85 - stock adjustments get generated ids: found by their product.
+      const adjs = await (await fetch('/api/stock-adjustments')).json().catch(() => []);
+      await Promise.all((Array.isArray(adjs) ? adjs : []).filter((a) => String(a.productId || '').startsWith('smoketest-'))
+        .map((a) => fetch(`/api/stock-adjustments/${encodeURIComponent(a.id)}`, { method: 'DELETE' })));
+      // v1.10.85 #125 - the hidden test company goes only with its key.
+      const opened = await (await fetch('/api/profiles/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: '246813' }) })).json().catch(() => ({}));
+      await Promise.all((opened.profiles || []).filter((p) => String(p.id).startsWith('smoketest-'))
+        .map((p) => fetch(`/api/profiles/${encodeURIComponent(p.id)}`, { method: 'DELETE', headers: { 'X-Hidden-Key': p.key } })));
       await del('profiles');
       await del('expenses');
       await del('receipts');
       await del('recurring');
       await del('templates');
+      // v1.10.84 - "marked read" is kept in the books folder now
+      // (fgsb_dismissedNotifs); one that names this suite's invoices would
+      // silence #53 in the next run.
+      const prefs = (await (await fetch('/api/local-prefs')).json())?.value || {};
+      if (/SMOKE-|smoketest-/.test(prefs.fgsb_dismissedNotifs || '')) {
+        await fetch('/api/local-prefs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ set: {}, remove: ['fgsb_dismissedNotifs'] }) });
+      }
+      // v1.10.85 - books this suite closed (only its own date) open again.
+      const lock = await (await fetch('/api/period-lock')).json().catch(() => ({}));
+      if (lock?.upTo === '2025-01-31') await fetch('/api/period-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upTo: '' }) });
       // v1.10.77 - a PIN this suite set must never stay on the user's app.
       await fetch('/api/lock/set', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: null, currentPin: '13572468' }) });
       // The expense added through the form gets a generated id.
@@ -97,9 +120,9 @@ async function cleanup(page) {
  * far less than one that simply clears the way and carries on.
  */
 async function dismissFirstRun(page) {
-  // A fresh install shows TWO screens in sequence, and their buttons are
-  // capitalised differently: a region step ("Skip Setup") and then a
-  // business-type step ("Skip setup"). Clearing one reveals the other.
+  // A fresh install shows the welcome ("Skip Setup"). Until v1.10.86 a second
+  // window followed it (business type, "Skip setup"); the patterns below still
+  // clear either, so the suite also runs against an older build.
   //
   // The visibility test matters as much as the clicking. An earlier version
   // used `offsetParent !== null`, which is ALWAYS null for a
@@ -156,6 +179,8 @@ const page = await ctx.newPage();
 
 const cspViolations = [];
 page.on('console', (m) => { if (/Content-Security-Policy/i.test(m.text())) cspViolations.push(m.text()); });
+// v1.10.84 - the Invoices screen's folder tabs (Invoices | Cancelled | Trash).
+const openFolder = async (name) => { const b = page.locator('.invoice-folders button', { hasText: name }); if (await b.count()) { await b.first().click(); await sleep(500); } };
 
 try {
   await page.goto(APP, { waitUntil: 'networkidle' });
@@ -169,7 +194,18 @@ try {
   // the app's own stylesheet inside html2canvas's clone — so PDFs rendered
   // with no CSS. Both were Firefox-only and silent.
   check('app loads with no CSP violations', cspViolations.length === 0,
-    cspViolations[0]?.slice(0, 90) || '');
+    cspViolations[0]?.slice(0, 400) || '');
+
+  // Security review (v1.10.84): DNS rebinding - a page that re-points its own
+  // domain to 127.0.0.1 sends Host: its-domain; the app must refuse it.
+  const foreignHost = await new Promise((resolve) => {
+    const u = new URL(APP);
+    const rq = httpRequest({ host: u.hostname, port: u.port, path: '/api/bills', headers: { Host: 'evil.example' } },
+      (r) => { r.resume(); resolve(r.statusCode); });
+    rq.on('error', () => resolve(0));
+    rq.end();
+  });
+  check('DNS rebinding: a request with a foreign Host is refused', foreignHost === 403, String(foreignHost));
 
   const styled = await page.evaluate(() => document.styleSheets.length > 0
     && getComputedStyle(document.body).fontFamily.includes('Inter'));
@@ -204,16 +240,21 @@ try {
   await sleep(1200);
   // The suggestions come from products and past purchases loaded in the
   // background: on a slow machine (Docker) a fixed wait read them too early.
-  for (let i = 0; i < 16 && !(await page.locator('#fgsb-item-history option').count()); i++) await sleep(500);
+  // v1.10.86 - the app's own list (ComboInput), open while the box is clicked.
+  const itemBox = page.locator('input[data-list="fgsb-item-history"]').first();
+  for (let i = 0; i < 16 && !(await page.locator('#fgsb-item-history [role="option"]').count()); i++) {
+    await itemBox.click().catch(() => {});
+    await sleep(500);
+  }
 
   const opts = await page.evaluate(() =>
-    [...document.querySelectorAll('#fgsb-item-history option')].map((o) => ({
-      value: o.value,
-      // ERR-008: Firefox renders label/text INSTEAD of value. Assert on what
-      // the user would actually SEE, not on the data behind the option — the
-      // original test checked .value and passed against the broken build.
-      displayed: o.getAttribute('label') || (o.textContent || '').trim() || o.value,
+    [...document.querySelectorAll('#fgsb-item-history [role="option"]')].map((o) => ({
+      value: o.dataset.value,
+      // ERR-008: Firefox rendered a datalist label INSTEAD of the value. Assert
+      // on what the user would actually SEE, not on the data behind the option.
+      displayed: (o.querySelector('.combo-opt-value')?.textContent || '').trim(),
     })));
+  if (await page.locator('.combo-pop').count()) await page.keyboard.press('Escape'); // closes the list, not the form
 
   check('#42 product catalogue appears in item suggestions',
     opts.some((o) => o.value === 'Mouse') && opts.some((o) => o.value === 'Pen drive'),
@@ -224,13 +265,22 @@ try {
     opts.find((o) => o.displayed !== o.value)?.displayed || '');
 
   // ---- Purchase bill: re-selection refreshes details ---------------------
-  const item = page.locator('input[list="fgsb-item-history"]').first();
+  const item = page.locator('input[data-list="fgsb-item-history"]').first();
   const rowVals = () => page.evaluate(() => {
-    const el = document.querySelector('input[list="fgsb-item-history"]');
+    const el = document.querySelector('input[data-list="fgsb-item-history"]');
     const wrap = el.closest('div[style*="flex"]')?.parentElement;
     return [...(wrap?.querySelectorAll('input.form-input') || [])].map((i) => i.value);
   });
 
+  // On fresh test books the page reloads itself once, a few seconds after the
+  // first load (the new service worker taking over), which closes the form
+  // (it stopped the whole suite here several times, with the 1.10.84 build
+  // too). Wait for that moment to pass, and open the form again if it went.
+  await sleep(5000);
+  if (!(await item.isVisible().catch(() => false))) {
+    await page.getByRole('button', { name: /add purchase/i }).first().click();
+    await item.waitFor({ timeout: 15000 });
+  }
   await item.fill('Pen drive'); await sleep(600);
   await item.fill('Mouse'); await sleep(600);
   const swapped = await rowVals();
@@ -248,7 +298,7 @@ try {
     edited[1] === 'MYOWN', `hsn=${edited[1]}`);
 
   // ---- Purchase bill: supplier re-selection ------------------------------
-  const sup = page.locator('input[list="fgsb-supplier-history"]');
+  const sup = page.locator('input[data-list="fgsb-supplier-history"]');
   const gstinBox = page.locator('input[placeholder="15-digit GSTIN"]');
   await sup.fill('Alpha Traders'); await sleep(600);
   await sup.fill('Beta Supplies'); await sleep(600);
@@ -256,8 +306,12 @@ try {
     (await gstinBox.inputValue()) === '29BBBBB1111B2Z2',
     await gstinBox.inputValue());
 
-  await page.keyboard.press('Escape');
-  await sleep(600);
+  // v1.10.86 - the supplier box is the app's own dropdown (ComboInput): the
+  // first Esc closes its open list, the next one the purchase form.
+  for (let i = 0; i < 3 && await page.locator('.modal-content').filter({ hasText: 'Add Purchase Bill' }).count(); i++) {
+    await page.keyboard.press('Escape');
+    await sleep(600);
+  }
 
   // ---- Invoice preview + PDF --------------------------------------------
   await page.getByText('New Invoice', { exact: false }).first().click();
@@ -271,16 +325,53 @@ try {
     .fill('Smoke Test Client');
   await sleep(500);
   await page.keyboard.press('Escape');           // dismiss the client suggestion list
-  // The line-item name box carries no placeholder, so target it through its
-  // row: `.line-item-row` -> first text input, then the row's numeric fields.
+  // The line-item name box (a growing textarea since v1.10.83), found through
+  // its row, then the row's numeric fields.
   const row = page.locator('.line-item-row').first();
-  await row.locator('input[type="text"]').first().fill('Test item');
+  await row.locator('textarea.line-item-name').first().fill('Test item');
   await sleep(400);
   await page.keyboard.press('Escape');           // dismiss product suggestions
   const rowNums = row.locator('input[type="number"]');
   await rowNums.nth(0).fill('2');                // qty
   await rowNums.nth(1).fill('500');              // rate
   await sleep(800);
+
+  // #167: Enter moves along the row like a billing program: Item -> HSN -> Qty.
+  await row.locator('textarea.line-item-name').first().press('Enter');
+  await sleep(200);
+  const afterItem = await page.evaluate(() => document.activeElement?.className || '');
+  await page.keyboard.press('Enter');
+  await sleep(200);
+  const inQty = await page.evaluate(() => document.activeElement === document.querySelector('.line-item-row input[type="number"]'));
+  check('#167 Enter moves Item -> HSN -> Qty', /line-item-hsn/.test(afterItem) && inQty, `after Item: "${afterItem}", in Qty: ${inQty}`);
+
+  // #167 (reported again 6 Nov from 1.10.83): ...and on in the SAME row,
+  // Qty -> Unit -> Rate; Enter in Rate finishes the row. ERR-078 (#151): on
+  // the last row that adds a row with the cursor in its Item box (it went to
+  // the next row's HSN once the box became a textarea). The new row is
+  // removed again so the rest of the run sees one line.
+  const walk = [];
+  for (let i = 0; i < 5; i++) {
+    await page.keyboard.press('Enter');
+    await sleep(300);
+    const at = await page.evaluate(() => {
+      const a = document.activeElement;
+      const r = [...document.querySelectorAll('.line-item-row')].findIndex((x) => x.contains(a)) + 1;
+      const kind = a?.classList.contains('line-item-name') ? 'Item' : a?.classList.contains('line-item-rate') ? 'Rate'
+        : a?.classList.contains('line-item-hsn') ? 'HSN' : a?.tagName === 'SELECT' ? 'Unit' : a?.type === 'number' ? 'Qty' : a?.tagName || '?';
+      return `${r}:${kind}`;
+    });
+    walk.push(at);
+    if (at.startsWith('2:')) break;
+  }
+  check('#167 Enter goes on Qty -> Unit -> Rate in the same row, then the next row\'s Item', walk.join(' ') === '1:Unit 1:Rate 2:Item', walk.join(' '));
+  const enterFocus = await page.evaluate(() => {
+    const names = [...document.querySelectorAll('.line-item-row .line-item-name')];
+    return { rows: names.length, inNewItem: document.activeElement === names[names.length - 1] };
+  });
+  check('ERR-078 Enter adds a row, cursor in its Item box', enterFocus.rows === 2 && enterFocus.inNewItem, JSON.stringify(enterFocus));
+  if (enterFocus.rows === 2) await page.locator('.line-item-row').nth(1).locator('button[title="Remove"]').click();
+  await sleep(300);
 
   // ERR-005: transform: scale() does not shrink the layout box, and a
   // centred overflow puts the left edge in unreachable negative scroll.
@@ -328,15 +419,42 @@ try {
   try {
     const [dl] = await Promise.all([
       page.waitForEvent('download', { timeout: 60_000 }),
-      page.getByRole('button', { name: /save & download/i }).first().click(),
+      page.getByRole('button', { name: /^save pdf$/i }).first().click(),
     ]);
     const { statSync } = await import('fs');
     pdfBytes = statSync(await dl.path()).size;
   } catch { /* leaves pdfBytes 0 → fails below */ }
-  check('PDF downloads and is styled', pdfBytes > 300_000, `${pdfBytes} bytes`);
+  // v1.10.86 - 300 KB -> 200 KB: the styled A4 invoice is about 277 KB now
+  // (lighter fonts/images); an unstyled one is far smaller, so it still fails.
+  check('PDF downloads and is styled', pdfBytes > 200_000, `${pdfBytes} bytes`);
+
+  // #161: with the preview hidden, Save PDF leaves it hidden (it used
+  // to open and close again), and the PDF is still a full, styled page.
+  await page.getByRole('button', { name: /Hide Preview/i }).first().click();
+  await sleep(500);
+  await page.evaluate(() => {
+    window.__paneShown = false;
+    const sv = document.querySelector('.split-view');
+    new MutationObserver(() => { if (!sv.classList.contains('split-view-focus')) window.__paneShown = true; })
+      .observe(sv, { attributes: true, attributeFilter: ['class'] });
+  });
+  let hiddenPdfBytes = 0;
+  try {
+    const [dl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60_000 }),
+      page.getByRole('button', { name: /^save pdf$/i }).first().click(),
+    ]);
+    const { statSync } = await import('fs');
+    hiddenPdfBytes = statSync(await dl.path()).size;
+  } catch { /* leaves 0 → fails below */ }
+  const paneShown = await page.evaluate(() => window.__paneShown);
+  check('#161 hidden preview stays hidden on Save PDF, PDF still styled',
+    !paneShown && hiddenPdfBytes > 200_000, `${hiddenPdfBytes} bytes, preview shown: ${paneShown}`);
+  await page.getByRole('button', { name: /Show Preview/i }).first().click();
+  await sleep(400);
 
   check('no CSP violations during PDF generation', cspViolations.length === 0,
-    cspViolations[0]?.slice(0, 90) || '');
+    cspViolations[0]?.slice(0, 400) || '');
 
   // Generating the PDF saves the invoice, so the editor now holds a real,
   // dirty bill and navigating away raises the leave-guard. Dismiss it, then
@@ -362,6 +480,8 @@ try {
   // so "editing" changes nothing and no bar should appear — the test would
   // fail while the app behaved correctly. Original is restored below so the
   // suite leaves the user's business name untouched.
+  // v1.10.83 - Settings opens on the Business type tab; the name is on Company.
+  await page.locator('.settings-jumpnav a[href="#tab-company"]').click();
   const nameField = page.locator('#section-company input[name="businessName"]');
   // The form unlocks once the saved profile has loaded (v1.10.75).
   await page.waitForFunction(() => document.querySelector('#section-company fieldset')?.disabled === false, null, { timeout: 30000 });
@@ -579,6 +699,42 @@ try {
   check('#58 the dashboard re-filters on a company switch, with no reload',
     afterSwitch.includes('SMOKE-BETA/1') && !afterSwitch.includes('SMOKE-MINE/1'));
 
+  // v1.10.85 #125: a company hidden behind its own PIN is not in the company
+  // list; "Open a hidden company..." with its PIN opens it; switching away
+  // hides it again.
+  {
+    await page.evaluate(async () => {
+      const post = (u, body) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      await post('/api/profiles', { id: 'smoketest-hidden', businessName: 'Smoke Hidden', gstin: '29HHHHH4444H4Z4' });
+      await post('/api/profiles/smoketest-hidden/hide-pin', { pin: '246813' });
+    });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2500);
+    await dismissFirstRun(page);
+    const menuItems = async () => {
+      await page.locator('.profile-switcher-btn').click();
+      await sleep(500);
+      const items = await page.locator('.profile-switcher-item').allInnerTexts();
+      return items.map((t) => t.trim());
+    };
+    const before = await menuItems();
+    check('#125 a hidden company is not in the company list', !before.includes('Smoke Hidden') && before.includes('Open a hidden company...'), JSON.stringify(before));
+    await page.locator('.profile-switcher-item', { hasText: 'Open a hidden company...' }).click();
+    await sleep(400);
+    await page.locator('.confirm-modal-content input').fill('246813');
+    await page.keyboard.press('Enter');
+    await sleep(2500);
+    const opened = (await page.locator('.profile-switcher-name').innerText()).trim();
+    check('#125 its PIN opens it', opened === 'Smoke Hidden', opened);
+    const during = await menuItems();
+    await page.locator('.profile-switcher-item', { hasText: /^Smoke Beta$/ }).click();
+    await sleep(2500);
+    const after = await menuItems();
+    await page.keyboard.press('Escape');
+    await page.mouse.click(5, 700);
+    check('#125 switching to another company hides it again', during.includes('Smoke Hidden') && !after.includes('Smoke Hidden'), JSON.stringify({ during, after }));
+  }
+
   // ======================================================================
   // v1.10.66 — #64 (@sangwanmail-eng), #61, #62, #59
   // ======================================================================
@@ -646,6 +802,20 @@ try {
   check('#64 dashboard totals include this company\'s new invoice (sanity)',
     close(dash2.total, dash0.total + 1111) && dash2.count === dash0.count + 1,
     `total ${dash0.total} -> ${dash2.total}, count ${dash0.count} -> ${dash2.count}`);
+
+  // v1.10.85 - the cards for a chosen period: today's invoices are in "This
+  // month" and not in "Last month"; "All time" again afterwards.
+  const cardsFor = async (period) => {
+    await page.selectOption('#card-period', period);
+    await sleep(600);
+    return { total: rupees(await cardValues('Total Invoiced')), count: money((await cardValues('Invoices'))?.[0]) };
+  };
+  const dashThis = await cardsFor('this-month');
+  const dashLast = await cardsFor('last-month');
+  await cardsFor('all');
+  check('v85 dashboard totals for a period: this month counts today\'s invoices, last month does not',
+    dashThis.count >= 1 && dashThis.total >= 1111 && dashThis.count + dashLast.count <= dash2.count,
+    JSON.stringify({ all: dash2, thisMonth: dashThis, lastMonth: dashLast }));
 
   // ---- #64 item 2: Reports counted every company's expenses ----------------
   const expenseCard = async () => { await reopenView('Reports'); return rupees(await cardValues('Expenses (ex. GST)')); };
@@ -727,6 +897,40 @@ try {
     !!zr0.cells && !!zr1.cells && close(zr1.cells[0], zr0.cells[0] + 5000) && close(zr1.cells[1], zr0.cells[1] + 900),
     `3.1(b) ${JSON.stringify(zr0.cells)} -> ${JSON.stringify(zr1.cells)}`);
   check('#61 GST Returns flags the export for GSTR-1 Table 6A', zr1.notice);
+
+  // ---- v1.10.83 (#133): the GSTR-1 JSON is in the portal's current format ---
+  // Its own two invoices, in a month nothing else uses (June 2025, after the
+  // May 2025 HSN split): one to a registered buyer, one to an unregistered one.
+  const beta = { gstin: OTHER_GSTIN, businessName: 'Smoke Beta', country: 'India', state: 'Karnataka' };
+  const g1Bill = (id, inv, client) => ({ id, invoiceNumber: inv, invoiceType: 'tax-invoice', clientName: client.name, status: 'unpaid',
+    totalAmount: 1180, invoiceDate: '2025-06-15', payments: [], items: [],
+    data: { profile: beta, client, details: { invoiceNumber: inv, invoiceDate: '2025-06-15', placeOfSupply: 'Karnataka' },
+      items: [{ name: 'Smoke HSN item with a description well over thirty characters', hsn: '4820', unit: 'Nos', quantity: 2, rate: 500, taxPercent: 18 }],
+      totals: { subtotal: 1000, taxableAmount: 1000, cgst: 90, sgst: 90, igst: 0, cess: 0, total: 1180, isInterstate: false } } });
+  await api('/api/bills', g1Bill('smoketest-g1-b2b', 'SMK133-B2B', { name: 'Smoke Registered', gstin: '29AAKFM4321Q1ZP', state: 'Karnataka', country: 'India' }));
+  await api('/api/bills', g1Bill('smoketest-g1-b2c', 'SMK133-B2C', { name: 'Smoke Walk-in', state: 'Karnataka', country: 'India' }));
+  await reopenView('GST Returns');
+  await page.evaluate(() => [...document.querySelectorAll('button')].find((x) => x.innerText.trim() === 'GSTR-1')?.click());
+  await sleep(800);
+  const periodSelects = page.locator('select.form-input');
+  await periodSelects.nth(0).selectOption('month');
+  await periodSelects.nth(1).selectOption('5');
+  await periodSelects.nth(2).selectOption('2025');
+  await sleep(1000);
+  const [g1] = await Promise.all([
+    page.waitForEvent('download', { timeout: 20000 }).catch(() => null),
+    page.evaluate(() => [...document.querySelectorAll('button')].find((x) => x.innerText.trim() === 'JSON Export')?.click()),
+  ]);
+  const g1json = g1 ? JSON.parse(readFileSync(await g1.path(), 'utf8')) : null;
+  const hsnKeys = g1json?.hsn ? Object.keys(g1json.hsn) : [];
+  check('v83 #133 GSTR-1 JSON splits the HSN summary into hsn_b2b / hsn_b2c, with no blank values',
+    !!g1json && g1json.fp === '062025' && hsnKeys.join() === 'hsn_b2b,hsn_b2c'
+      && g1json.hsn.hsn_b2b[0].desc.length <= 30 && (g1json.b2cs || []).length > 0 && g1json.b2cs.every((r) => r.typ === 'OE')
+      && !JSON.stringify(g1json).includes('""') && !('gt' in g1json) && (g1json.b2b || [])[0]?.inv?.[0]?.inum === 'SMK133-B2B',
+    g1 ? `${g1.suggestedFilename()} hsn: ${hsnKeys.join(',')}` : `no download: ${await page.evaluate(() => document.body.innerText.match(/(GSTR-1 export blocked|No invoices)[^\n]*/)?.[0] || '')}`);
+  await page.evaluate(() => Promise.all(['smoketest-g1-b2b', 'smoketest-g1-b2c'].map((id) => fetch(`/api/bills/${id}`, { method: 'DELETE' }))));
+  await periodSelects.nth(1).selectOption(String(new Date().getMonth()));
+  await periodSelects.nth(2).selectOption(String(new Date().getFullYear()));
 
   // ---- #64 item 1: an open screen must follow a company switch -------------
   await reopenView('Expenses');
@@ -823,6 +1027,211 @@ try {
     toggled && /Reverse Charge:? Yes\b/i.test((await preview()).text));
   // Put the option back: it is remembered as a default for future invoices.
   if (toggled) { await clickReverseCharge(); await sleep(1500); }
+
+  // #152 / #138: "Tax % columns" hides only the per-line tax columns; GST is
+  // still charged. The switch that turns GST off says so.
+  const clickOption = (src) => page.evaluate((s) => {
+    const label = [...document.querySelectorAll('label.option-toggle')].find((l) => new RegExp(s).test(l.innerText));
+    const input = label?.querySelector('input');
+    if (input) input.click();
+    return !!input;
+  }, src);
+  const taxView = () => page.evaluate(() => ({
+    head: [...document.querySelectorAll('#invoice-preview .inv-table thead th')].map((t) => t.innerText.trim()),
+    totals: document.querySelector('#invoice-preview .inv-totals')?.innerText || '',
+  }));
+  const tvBefore = await taxView();
+  const tcToggled = await clickOption('^Tax % columns');
+  await sleep(1000);
+  const tvAfter = await taxView();
+  check('#152 "Tax % columns" hides the tax columns, GST is still charged',
+    tcToggled && tvBefore.head.includes('%') && !tvAfter.head.includes('%')
+      && tvAfter.totals === tvBefore.totals && /CGST/.test(tvAfter.totals),
+    `${tvBefore.head.join(',')} -> ${tvAfter.head.join(',')}`);
+  if (tcToggled) { await clickOption('^Tax % columns'); await sleep(1500); }
+  check('#152 the switch that turns GST off is called "Charge GST on this invoice"',
+    await page.evaluate(() => [...document.querySelectorAll('label.option-toggle')].some((l) => /Charge GST on this invoice/.test(l.innerText))));
+
+  // #156: the invoice form's WhatsApp button sends the same full message as
+  // the Invoices list (client, total, status...), not the old short one.
+  // v1.10.86 - on a PC it now saves the invoice and makes the PDF first, then
+  // opens the chat (the first window.open is a blank "getting ready" tab), and
+  // copies the PDF to the clipboard: blocked here so the test never touches the
+  // real clipboard of the PC it runs on (it falls back to a download).
+  await page.evaluate(() => {
+    window.__realOpen = window.open; window.__opened = []; window.open = (u) => { window.__opened.push(u || ''); return null; };
+    window.__realFetch = window.fetch;
+    window.fetch = (u, o) => (/copy-pdf/.test(String(u)) ? Promise.resolve(new Response('{}', { status: 503 })) : window.__realFetch(u, o));
+  });
+  await page.getByRole('button', { name: /WhatsApp/ }).first().click();
+  await page.waitForFunction(() => window.__opened.some((u) => /text=/.test(u)), null, { timeout: 30000 }).catch(() => {});
+  const waText = await page.evaluate(() => {
+    window.open = window.__realOpen; window.fetch = window.__realFetch;
+    return decodeURIComponent(((window.__opened.find((u) => /text=/.test(u)) || '').split('text=')[1]) || '');
+  });
+  check('#156 the invoice form sends the full WhatsApp message',
+    /Client: Smoke Test Client/.test(waText) && /Total: /.test(waText) && /Status: /.test(waText), waText.replace(/\n/g, ' | ').slice(0, 240));
+
+  // #143: unit NA - no quantity box, "-" printed for the quantity, amount = rate.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/NA', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ ...draftItems[0], unit: 'NA', quantity: 1 }],
+    taxInclusive: false,
+  });
+  const na = await page.evaluate(() => ({
+    locked: !!document.querySelector('.line-item-row input[disabled][value="-"]'),
+    cells: [...document.querySelectorAll('#invoice-preview .inv-table tbody td')].map((t) => t.innerText.trim()),
+  }));
+  check('#143 unit NA: no quantity box, "-" printed, amount = rate',
+    na.locked && na.cells.includes('-') && na.cells.some((t) => /1,000\.00/.test(t)), na.cells.join(' , '));
+
+  // #140: size billing (glass): 25 x 30 in, 2 pcs, 6 inch rounding, Rs 50 / sq.ft
+  // = 12.50 sq.ft, Rs 625; changing the length in the form re-works it out.
+  const modulesBefore = await page.evaluate(() => localStorage.getItem('gst_enabledModules'));
+  await page.evaluate(() => {
+    const m = JSON.parse(localStorage.getItem('gst_enabledModules') || '{}');
+    localStorage.setItem('gst_enabledModules', JSON.stringify({ ...m, sizeBilling: true }));
+  });
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/SQFT', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ id: 'smk-glass', name: '6mm Mirror', hsn: '7009', quantity: 12.5, unit: 'Sq.ft', rate: 50, taxPercent: 18, discount: 0, size: { l: 25, w: 30, pcs: 2, step: 6 } }],
+    taxInclusive: false,
+  });
+  const glassRow = () => page.evaluate(() => {
+    const head = [...document.querySelectorAll('#invoice-preview .inv-table thead th')].map((t) => t.innerText.trim().toUpperCase());
+    const cells = [...document.querySelectorAll('#invoice-preview .inv-table tbody tr:first-child td')].map((t) => t.innerText.trim());
+    const at = (name) => cells[head.filter((h) => !/^(%|AMT)$/.test(h)).indexOf(name)];
+    return { size: at('SIZE'), qty: at('QTY'), sqft: at('SQFT'), amount: cells[cells.length - 1] };
+  });
+  const glass1 = await glassRow();
+  check('#140 size line prints Size 25 x 30, Qty 2, SQFT 12.50, amount 625',
+    glass1.size === '25 x 30' && glass1.qty === '2' && glass1.sqft === '12.50' && /625\.00/.test(glass1.amount), JSON.stringify(glass1));
+  const lengthBox = page.locator('.line-item-row').first().locator('label:text("Length (in)") + input');
+  await lengthBox.fill('31');
+  await sleep(800);
+  const glass2 = await glassRow();
+  // 31 rounds up to 36: 36 x 30 / 144 x 2 = 15 sq.ft = Rs 750.
+  check('#140 changing the length re-works the sq.ft and amount (31 in -> 36 in)',
+    glass2.sqft === '15.00' && /750\.00/.test(glass2.amount), JSON.stringify(glass2));
+
+  // v1.10.85 #140: an Rft line (polish) on the glass edges: 30 x 30 rounded,
+  // 2 pcs = 2 x 60 / 12 x 2 = 20 rft x Rs 10 = 200; a longer glass line
+  // (31 -> 36 in) moves it to 22 rft = 220 with no typing on the Rft line.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/RFT', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [
+      { id: 'smk-glass', name: '6mm Mirror', hsn: '7009', quantity: 12.5, unit: 'Sq.ft', rate: 50, taxPercent: 18, discount: 0, size: { l: 25, w: 30, pcs: 2, step: 6 } },
+      { id: 'smk-polish', name: 'Edge polish', hsn: '7009', quantity: 0, unit: 'Rft', rate: 10, taxPercent: 18, discount: 0, rft: { basis: 'perimeter', from: 'all', ids: [], custom: '' } },
+    ],
+    taxInclusive: false,
+  });
+  const rftRow = () => page.evaluate(() => {
+    const cells = [...document.querySelectorAll('#invoice-preview .inv-table tbody tr:nth-child(2) td')].map((t) => t.innerText.trim());
+    return { qty: cells.find((t) => /rft$/.test(t)) || '', amount: cells[cells.length - 1] };
+  });
+  const rft1 = await rftRow();
+  check('#140 an Rft line takes the glass edges: 20 rft, amount 200', rft1.qty === '20 rft' && /200\.00/.test(rft1.amount), JSON.stringify(rft1));
+  await page.locator('.line-item-row').first().locator('label:text("Length (in)") + input').fill('31');
+  await sleep(800);
+  const rft2 = await rftRow();
+  check('#140 the Rft line follows a change to the glass line (22 rft, 220)', rft2.qty === '22 rft' && /220\.00/.test(rft2.amount), JSON.stringify(rft2));
+
+  // v1.10.85 #180: a new invoice dated from 1 April 2026 with the old 194J
+  // moves to the Income-tax Act, 2025: section 393(1) Sl. 6(iii) is printed.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/TDS', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ id: 'smk-fees', name: 'Consulting', hsn: '998311', quantity: 1, rate: 10000, taxPercent: 18, discount: 0, unit: 'Nos' }],
+    taxInclusive: false,
+    invoiceOptions: { showTDS: true, tdsSection: '194J', tdsRate: 10 },
+  });
+  await sleep(800);
+  const tdsLine = await page.evaluate(() => [...document.querySelectorAll('#invoice-preview span')].map((s) => s.innerText.trim()).find((t) => /^Less: TDS/.test(t)) || '');
+  check('#180 a new invoice under the 2025 Act prints TDS (393(1) Sl. 6(iii) @ 10%)', tdsLine === 'Less: TDS (393(1) Sl. 6(iii) @ 10%)', tdsLine);
+  await page.evaluate((m) => { if (m === null) localStorage.removeItem('gst_enabledModules'); else localStorage.setItem('gst_enabledModules', m); }, modulesBefore);
+
+  // v1.10.85 #190: a whole-bill discount Before GST: 1,000 off 10,000 at 18%
+  // intra-state -> GST on 9,000 (CGST 810), total 10,620, and the line's part
+  // shows in its Disc. column. Draft only: nothing is saved.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMK-DRAFT/TRADE', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ id: 'smk-trade', name: 'Cartons', hsn: '4819', quantity: 100, rate: 100, taxPercent: 18, discount: 0, unit: 'Pcs' }],
+    taxInclusive: false,
+    invoiceOptions: { invoiceDiscountValue: 1000, invoiceDiscountType: 'fixed', invoiceDiscountBeforeGst: true },
+  });
+  await sleep(800);
+  const trade = await page.evaluate(() => {
+    const text = document.querySelector('#invoice-preview')?.innerText || '';
+    return { trade: /Trade discount \(before GST\)/i.test(text), cgst: /(810\.00|1,620\.00)/.test(text), total: /10,620\.00/.test(text), cash: /Discount on total/i.test(text),
+      picker: document.querySelector('select[aria-label="When the discount is taken"]')?.value || '' };
+  });
+  check('#190 discount Before GST: GST on 9,000 (CGST 810 or IGST 1,620), total 10,620, printed as a trade discount',
+    trade.trade && trade.cgst && trade.total && !trade.cash && trade.picker === 'before', JSON.stringify(trade));
+
+  // v1.10.85 #185: "Received now" on a new sale; Full fills the balance (11,800,
+  // or 10,800 when the TDS from #180 above is still on). Not saved. The
+  // discount goes back to none, so the drafts below are not changed by it.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/RCVD', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ id: 'smk-rcvd', name: 'Cartons', hsn: '4819', quantity: 100, rate: 100, taxPercent: 18, discount: 0, unit: 'Pcs' }],
+    taxInclusive: false,
+    invoiceOptions: { invoiceDiscountValue: 0, invoiceDiscountBeforeGst: false },
+  });
+  const rcvdBox = page.locator('[data-testid="received-now"]');
+  const rcvdShown = await rcvdBox.isVisible().catch(() => false);
+  if (rcvdShown) await rcvdBox.getByRole('button', { name: 'Full' }).click();
+  const rcvdAmount = rcvdShown ? await page.locator('#received-now-amount').inputValue() : '';
+  check('#185 New Invoice offers "Received now"; Full fills the balance', rcvdShown && ['11800', '10800'].includes(rcvdAmount), `${rcvdShown} ${rcvdAmount}`);
+
+  // #164: "Print rates before GST" with prices that include tax: 13.25 at 18%
+  // prints 11.23, the total stays 2500 x 13.25 = 33,125.00.
+  const rbtDraft = (on) => openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/RBT', invoiceDate: today, placeOfSupply: 'Delhi' },
+    items: [{ id: 'smk-rbt', name: 'Packing box', hsn: '4819', quantity: 2500, rate: 13.25, taxPercent: 18, discount: 0, unit: 'Pcs' }],
+    taxInclusive: true,
+    invoiceOptions: { rateBeforeTax: on },
+  });
+  const rbtView = () => page.evaluate(() => ({
+    cells: [...document.querySelectorAll('#invoice-preview .inv-table tbody tr:first-child td')].map((t) => t.innerText.trim()),
+    total: (document.querySelector('#invoice-preview')?.innerText.match(/33,125\.00/) || [''])[0],
+  }));
+  await rbtDraft(false);
+  const rbtOff = await rbtView();
+  await rbtDraft(true);
+  const rbtOn = await rbtView();
+  check('#164 "Print rates before GST": rate 13.25 prints 11.23, the total is unchanged',
+    rbtOff.cells.some((c) => /13\.25/.test(c)) && rbtOn.cells.some((c) => /11\.23/.test(c)) && !rbtOn.cells.some((c) => /13\.25/.test(c))
+      && rbtOff.total && rbtOn.total, `${rbtOff.cells.join(' | ')}  ->  ${rbtOn.cells.join(' | ')}`);
+
+  // #126: fields the user names print with the order details; an empty one does not.
+  await openDraft({
+    invoiceType: 'tax-invoice',
+    client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Delhi', gstin: '', country: '', email: '', phone: '', isSEZ: false },
+    details: { invoiceNumber: 'SMOKE-DRAFT/OWN', invoiceDate: today, placeOfSupply: 'Delhi',
+      customFields: [{ label: 'R SPH', value: '-1.25' }, { label: 'L SPH', value: '' }] },
+    items: draftItems,
+    taxInclusive: false,
+  });
+  const own = await page.evaluate(() => ({
+    text: document.querySelector('#invoice-preview')?.innerText || '',
+    inForm: [...document.querySelectorAll('input[placeholder="Field name, e.g. R SPH"]')].map((i) => i.value),
+  }));
+  check('#126 your own fields: filled one printed, empty one not, both in the form',
+    /R SPH:?\s*-1\.25/.test(own.text) && !/L SPH/.test(own.text) && own.inForm.join() === 'R SPH,L SPH',
+    own.inForm.join());
 
   await openDraft({
     invoiceType: 'proforma',
@@ -974,16 +1383,13 @@ try {
   });
   await page.waitForSelector('#invoice-preview', { timeout: 20000 });
   await sleep(1500);
+  // v1.10.86 - the type is a drop-down (#invoice-type), not chips.
   const chips = await page.evaluate(() => {
-    const all = [...document.querySelectorAll('.type-selector .type-chip')];
-    return {
-      total: all.length,
-      disabled: all.filter((c) => c.disabled).length,
-      active: all.filter((c) => c.className.includes('type-chip-active')).length,
-    };
+    const sel = document.querySelector('#invoice-type');
+    return { found: !!sel, disabled: !!sel?.disabled, value: sel?.value || '', options: sel ? sel.options.length : 0 };
   });
   check('#66 the invoice type cannot be changed on a saved invoice',
-    chips.total > 1 && chips.disabled === chips.total - 1 && chips.active === 1, JSON.stringify(chips));
+    chips.found && chips.disabled && chips.value === 'tax-invoice' && chips.options > 1, JSON.stringify(chips));
   check('#66 the "Billing From" card is gone from the invoice screen',
     !(await screenText()).includes('Billing From'));
 
@@ -1001,6 +1407,7 @@ try {
   if (await confirmCancel.count()) await confirmCancel.first().click();
   await sleep(2500);
   const afterCancel = await salesCards();
+  await openFolder('Cancelled'); // v1.10.84: cancelled invoices have their own tab
   const cancelledRow = await page.evaluate(() => {
     const row = [...document.querySelectorAll('tr')].find((r) => r.innerText.includes('SMOKE-CANCEL/9'));
     if (!row) return null;
@@ -1017,6 +1424,73 @@ try {
   const cancelledStatus = await page.evaluate(async () =>
     (await (await fetch('/api/bills')).json()).find((b) => b.id === 'smoketest-cancel')?.status ?? null);
   check('#66 the invoice itself is kept, not deleted', cancelledStatus === 'cancelled', `status=${cancelledStatus}`);
+
+  // v1.10.84 (maintainer): Delete in the same menu, also on a cancelled
+  // invoice, moves it to the Trash (30 days) - off the list, in /api/trash.
+  await page.locator('tr', { hasText: 'SMOKE-CANCEL/9' }).locator('button[aria-label^="More actions"]').click();
+  await page.locator('[role=menu] [role=menuitem]', { hasText: /^\s*Delete\s*$/ }).click();
+  await sleep(700);
+  await page.getByRole('button', { name: /^Delete$/ }).last().click();
+  await sleep(2500);
+  const trashed = await page.evaluate(async () => ({
+    listed: [...document.querySelectorAll('tr')].some((r) => r.innerText.includes('SMOKE-CANCEL/9')),
+    bill: (await (await fetch('/api/bills')).json()).some((b) => b.id === 'smoketest-cancel'),
+    trash: (await (await fetch('/api/trash')).json()).some((b) => b.id === 'smoketest-cancel'),
+  }));
+  check('Delete on the Invoices list moves the invoice to the Trash (also a cancelled one)', !trashed.listed && !trashed.bill && trashed.trash, JSON.stringify(trashed));
+  // The Trash copy is the suite's own: removed for good.
+  await page.evaluate(async () => fetch('/api/trash/smoketest-cancel?permanent=1', { method: 'DELETE' }).catch(() => {}));
+
+  // v1.10.84 (maintainer, 7 Nov: "cancel button not working"): with only
+  // cancelled invoices ticked, Cancel invoices says so; Delete invoices in the
+  // same bar moves the ticked ones to the Trash.
+  {
+    await page.evaluate(async () => {
+      const prof = await (await fetch('/api/profile')).json();
+      for (const n of [1, 2]) {
+        await fetch('/api/bills', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+          id: `smoketest-bd-${n}`, invoiceNumber: `SMOKE-BD/${n}`, clientName: 'Smoke Test Client', invoiceDate: '2026-11-07',
+          status: 'cancelled', totalAmount: 100, payments: [], items: [], profileId: prof.id,
+          data: { details: { invoiceNumber: `SMOKE-BD/${n}`, invoiceDate: '2026-11-07' }, client: { name: 'Smoke Test Client' }, profile: prof, totals: { total: 100 } } }) });
+      }
+    });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2000);
+    await dismissFirstRun(page);
+    await openView('Dashboard');
+    await openFolder('Cancelled');
+    await page.fill('input[placeholder^="Search client, invoice"]', 'SMOKE-BD/');
+    await sleep(800);
+    for (const n of [1, 2]) await page.locator('tr', { hasText: `SMOKE-BD/${n}` }).first().locator('input[type="checkbox"]').check();
+    await page.locator('button', { hasText: 'Cancel invoices' }).first().click();
+    const said = await page.getByText(/already cancelled/i).first().isVisible({ timeout: 4000 }).catch(() => false);
+    check('Cancel invoices with only cancelled invoices ticked says so (it did nothing, silently)', said);
+    await page.locator('button', { hasText: 'Delete invoices' }).first().click();
+    await sleep(600);
+    await page.getByRole('button', { name: /^Delete 2$/ }).click();
+    await sleep(2500);
+    const bd = await page.evaluate(async () => {
+      const ids = ['smoketest-bd-1', 'smoketest-bd-2'];
+      const bills = (await (await fetch('/api/bills')).json()).filter((b) => ids.includes(b.id)).length;
+      const trash = (await (await fetch('/api/trash')).json()).filter((b) => ids.includes(b.id)).length;
+      return { bills, trash };
+    });
+    // v1.10.84 - the Trash tab lists them with days left; Restore puts one back.
+    await openFolder('Trash');
+    const inTab = await page.locator('tr', { hasText: 'SMOKE-BD/1' }).count();
+    const left = await page.locator('tr', { hasText: 'SMOKE-BD/1' }).first().locator('td').nth(5).innerText().catch(() => '');
+    await page.locator('tr', { hasText: 'SMOKE-BD/1' }).first().getByRole('button', { name: /Restore/ }).click();
+    await sleep(2000);
+    const back = await page.evaluate(async () => (await (await fetch('/api/bills')).json()).some((b) => b.id === 'smoketest-bd-1'));
+    check('The Trash tab lists deleted invoices with 30 days left, and Restore puts one back', inTab === 1 && left.trim() === '30' && back, JSON.stringify({ inTab, left, back }));
+    await page.evaluate(async () => {
+      await fetch('/api/bills/smoketest-bd-1?permanent=1', { method: 'DELETE' }).catch(() => {});
+      for (const id of ['smoketest-bd-1', 'smoketest-bd-2']) await fetch(`/api/trash/${id}`, { method: 'DELETE' }).catch(() => {});
+    });
+    await openFolder('Invoices');
+    check('Delete invoices in the bar moves the ticked invoices to the Trash', bd.bills === 0 && bd.trash === 2, JSON.stringify(bd));
+    await page.fill('input[placeholder^="Search client, invoice"]', '');
+  }
 
   // ---- #66 item 2: a new product starts in Pcs ---------------------------
   await reopenView('Products');
@@ -1036,8 +1510,9 @@ try {
     return (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
   });
   const toggleTheme = async (label) => {
+    // v1.10.83 - the moon / sun button is at the top right, not in the sidebar.
     await page.evaluate((label) => {
-      const b = [...document.querySelectorAll('.sidebar .nav-btn')].find((x) => x.innerText.trim() === label);
+      const b = document.querySelector(`.app-topbar button[aria-label="${label.replace(' Mode', ' mode')}"]`);
       if (b) b.click();
     }, label);
     await sleep(900);
@@ -1092,9 +1567,32 @@ try {
     return n ? n.scrollWidth > n.clientWidth + 1 : null;
   });
   check('v75 the Settings section buttons never scroll sideways', jumpScrolls === false, String(jumpScrolls));
+  // v1.10.84 (maintainer): 6 tabs instead of 14; a tab shows all its cards.
+  const tabs84 = await page.evaluate(() => ({
+    names: [...document.querySelectorAll('.settings-jumpnav a')].map((a) => a.innerText.trim()),
+  }));
+  await page.locator('.settings-jumpnav a[href="#tab-data"]').click();
+  await sleep(500);
+  // v1.10.86 - and the Control Panel's backup ZIP card (section-backupzip).
+  const dataCards = await page.evaluate(() => ['section-backups', 'section-backupzip', 'section-cloud', 'section-data', 'section-company']
+    .map((id) => { const el = document.getElementById(id); return !!el && getComputedStyle(el).display !== 'none'; }));
+  check('v84 Settings has 7 tabs, and Data & Backups shows Backups, Backup files (ZIP), Google Drive and Import/Export (not Company)',
+    tabs84.names.join('|') === 'Company|Print & PDF|Features|Privacy & Security|Data & Backups|Appearance|App & updates' && dataCards.join() === 'true,true,true,true,false',
+    JSON.stringify({ ...tabs84, dataCards }));
+  // v1.10.86 - the Control Panel moved into Settings: a tab still on it opens App & updates.
+  await page.evaluate(() => { sessionStorage.setItem('gst_currentView', 'controlpanel'); sessionStorage.setItem('gst_settingsTab', 'tab-company'); });
+  await page.reload({ waitUntil: 'networkidle' });
+  await sleep(2500);
+  await dismissFirstRun(page);
+  const cpMoved = await page.evaluate(() => ['section-updates', 'section-app', 'section-company']
+    .map((id) => { const el = document.getElementById(id); return !!el && getComputedStyle(el).display !== 'none'; }).join()
+    + '|' + [...document.querySelectorAll('.nav-btn')].some((b) => /Control Panel/.test(b.innerText)));
+  check('v86 an old saved Control Panel screen opens Settings -> App & updates, and the menu has no Control Panel',
+    cpMoved === 'true,true,false|false', cpMoved);
 
   // One click saves two different sections.
   const getMeta = (key) => page.evaluate(async (k) => ((await (await fetch('/api/meta/' + k)).json()).value || {}), key);
+  await page.locator('.settings-jumpnav a[href="#tab-company"]').click();
   const nameBefore = await page.locator('#section-company input[name="businessName"]').inputValue();
   const numBefore = await getMeta('invoiceNumberSettings');
   await page.locator('#section-company input[name="businessName"]').fill(`Smoke SaveAll ${Date.now() % 100000}`);
@@ -1124,6 +1622,8 @@ try {
     await page.evaluate(() => /All changes saved/.test(document.querySelector('.settings-savebar')?.innerText || '')));
 
   // ---- v1.10.75: the app-wide round-off switch saves the invoice default --
+  // v1.10.83 - Settings is tabbed; the switch lives on the Print & PDF tab.
+  await page.locator('.settings-jumpnav a[href="#tab-print"]').click();
   const roundOffBox = page.locator('label', { hasText: 'Round off invoice totals' }).locator('input[type="checkbox"]');
   const roundOffBefore = await roundOffBox.isChecked();
   await roundOffBox.click();
@@ -1144,8 +1644,10 @@ try {
     taxInclusive: false,
   });
   const billedTo = page.locator('.glass-panel').filter({ has: page.locator('h3.section-title', { hasText: 'Billed To' }) });
-  const fieldGroup = (label) => billedTo.locator('.form-group').filter({ has: page.locator(`label.form-label:text-is("${label}")`) });
+  const fieldGroup = (label) => billedTo.locator('.form-group:not(.inv-row3)').filter({ has: page.locator(`label.form-label:text-is("${label}")`) });
   const gstinInput = fieldGroup('GSTIN').locator('input');
+  // v1.10.86 - address, state and GSTIN are folded under "More client details".
+  if (!(await gstinInput.isVisible())) await billedTo.locator('summary', { hasText: 'More client details' }).click();
   await gstinInput.fill('27AAPFU0939F1ZV');
   await page.keyboard.press('Tab');
   await sleep(600);
@@ -1199,7 +1701,8 @@ try {
     `without bank ${doneOf(noBank)}/4, with bank ${doneOf(withBank)}/4`);
 
   // ---- #71 (@sangwanmail-eng) -------------------------------------------
-  // 1. Customize belongs in the sticky toolbar, right before Show Preview.
+  // 1. Customize was moved to the sticky toolbar in v1.10.69 (#71); in v1.10.86
+  //    it moved into the Document type card, under the type (maintainer, 15 Nov).
   await openDraft({
     invoiceType: 'tax-invoice',
     client: { name: 'Smoke 71 Client', address: '', city: '', pin: '', state: 'Punjab', gstin: '', country: 'India', email: '', phone: '', isSEZ: false },
@@ -1207,17 +1710,27 @@ try {
     items: draftItems,
     taxInclusive: false,
   });
-  const bar71 = await page.evaluate(() => {
-    const el = document.querySelector('.generator-toolbar');
-    return el ? [...el.querySelectorAll('button')].map((b) => b.innerText.trim().replace(/\s+/g, ' ')).filter(Boolean) : null;
+  const cust71 = await page.evaluate(() => {
+    const bar = document.querySelector('.generator-toolbar');
+    const inBar = bar ? [...bar.querySelectorAll('button')].some((b) => /Customize|Hide Options/.test(b.innerText)) : true;
+    const all = [...document.querySelectorAll('button')].filter((b) => /^(Customize invoice|Hide Options)$/.test(b.innerText.trim()));
+    const card = all[0]?.closest('[data-inv-card]');
+    return { inBar, count: all.length, card: card ? card.getAttribute('data-inv-card') : null, underType: !!card?.querySelector('#invoice-type') };
   });
-  const cIdx = bar71 ? bar71.findIndex((t) => /Customize|Hide Options/.test(t)) : -1;
-  const pIdx = bar71 ? bar71.findIndex((t) => /Show Preview|Hide Preview/.test(t)) : -1;
-  check('#71.1 Customize sits in the toolbar, immediately before the preview button',
-    cIdx !== -1 && pIdx === cIdx + 1, JSON.stringify(bar71));
-  const cCount = await page.evaluate(() =>
-    [...document.querySelectorAll('button')].filter((b) => /^(Customize|Hide Options)$/.test(b.innerText.trim())).length);
-  check('#71.1 and there is only one of it', cCount === 1, `found ${cCount}`);
+  check('#71.1 Customize sits in the Document type card, under the type, and no longer in the toolbar',
+    !cust71.inBar && cust71.card === 'type' && cust71.underType, JSON.stringify(cust71));
+  check('#71.1 and there is only one of it', cust71.count === 1, `found ${cust71.count}`);
+  // v1.10.86: a card closes from its header and then says in one line what is in it.
+  await page.locator('[data-inv-card="client"] .inv-card-toggle').click();
+  await sleep(300);
+  const closed86 = await page.evaluate(() => {
+    const c = document.querySelector('[data-inv-card="client"]');
+    return { open: c.classList.contains('inv-card-open'), summary: c.querySelector('.inv-card-summary')?.innerText || '', fields: c.querySelectorAll('input, select, textarea').length };
+  });
+  check('v86 a closed card shows one line of what is in it, and its form is put away',
+    !closed86.open && /Smoke 71 Client/.test(closed86.summary) && closed86.fields === 0, JSON.stringify(closed86));
+  await page.locator('[data-inv-card="client"] .inv-card-toggle').click(); // open again: remembered in this browser
+  await sleep(300);
 
   // 2. Qty / Rate / Cess replace their contents when you click and type.
   await openView('Purchases');
@@ -1260,14 +1773,18 @@ try {
       setter.call(sel, 'Paid');
       sel.dispatchEvent(new Event('change', { bubbles: true }));
     }, st71.idx);
+    // v1.10.85 (#184) - Paid asks how it was paid; Cash goes into the Cash book.
+    await page.locator('.confirm-modal-content select').selectOption('cash', { timeout: 10000 }).catch(() => {});
+    await page.locator('.confirm-modal-primary').click({ timeout: 10000 }).catch(() => {});
     await sleep(2500);
     const saved71 = await page.evaluate(async (invoiceNumber) => {
       const rows = await (await fetch('/api/purchases')).json();
       const r = rows.find((x) => String(x.invoiceNumber).trim() === invoiceNumber);
-      return r ? r.paymentStatus : null;
+      return r ? { status: r.paymentStatus, mode: (r.payments || []).slice(-1)[0]?.mode } : null;
     }, st71.invoiceNumber);
-    check('#71.3 changing it saves against the purchase', saved71 === 'Paid',
-      `invoice ${st71.invoiceNumber} saved as "${saved71}"`);
+    check('#71.3 changing it saves against the purchase', saved71?.status === 'Paid',
+      `invoice ${st71.invoiceNumber} saved as ${JSON.stringify(saved71)}`);
+    check('#184 marking it Paid asks how: Cash is recorded as a cash payment (Cash book)', saved71?.mode === 'cash', JSON.stringify(saved71));
   }
 
   // ---- ERR-024: a page break must never cut through the signature --------
@@ -1306,7 +1823,7 @@ try {
     try {
       await Promise.all([
         page.waitForEvent('download', { timeout: 90_000 }),
-        page.getByRole('button', { name: /save & download/i }).first().click(),
+        page.getByRole('button', { name: /^save pdf$/i }).first().click(),
       ]);
     } catch { /* judged below */ }
     await sleep(800);
@@ -1352,11 +1869,32 @@ try {
         : `page ends at ${seam.ends.map(Math.round).join(', ')}px${cutInto.length ? ` - CUTS THROUGH at ${cutInto.map(Math.round).join(', ')}` : ''}`);
   }
 
+  // ---- v1.10.86 (#188): the invoice stays inside A4 ----------------------
+  // A word with no spaces in the item name, every column on and crore-size
+  // amounts: the sheet used to grow past 210mm (the PDF was then shrunk as a
+  // whole, with a blank strip down the right) and the table ran past its margin.
+  await openDraft({
+    ...seamDraft(3),
+    items: seamDraft(3).items.map((it, i) => ({ ...it, name: i === 1 ? 'SKU-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-NOSPACESATALL' : it.name,
+      quantity: 1234.5, rate: 123456.78, discount: 7.5, taxPercent: 18 })),
+  });
+  const a4fit = await page.evaluate(() => {
+    const sheet = document.querySelector('#invoice-preview');
+    const table = sheet?.querySelector('table.inv-table');
+    if (!table) return null;
+    const p = getComputedStyle(table.parentElement), t = getComputedStyle(table), px = (v) => parseFloat(v) || 0;
+    const room = table.parentElement.clientWidth - px(p.paddingLeft) - px(p.paddingRight) - px(t.marginLeft) - px(t.marginRight);
+    return { sheet: sheet.scrollWidth - sheet.clientWidth, table: Math.round(table.offsetWidth - room), fit: sheet.getAttribute('data-table-fit') };
+  });
+  check('#188 a long item name and every column on stay inside the A4 sheet and the table margin',
+    !!a4fit && a4fit.sheet <= 1 && a4fit.table <= 1, JSON.stringify(a4fit));
+
   // ---- v1.10.73: Boxed grid and Tally style designs ----------------------
   // Chosen through Customize, the way a person does it. The choice is saved
   // as the default for new invoices, so it is put back to Classic at the end.
   const pickStyle = async (label) => {
-    const custom = page.getByRole('button', { name: /^customize$/i }).first();
+    // v1.10.86 - the button is "Customize invoice", in the Document type card.
+    const custom = page.getByRole('button', { name: /^customize invoice$/i }).first();
     if (await custom.count()) { await custom.click(); await sleep(700); }
     await page.locator('button.type-chip', { hasText: label }).first().click();
     await sleep(1500); // display options save after 800 ms
@@ -1398,7 +1936,7 @@ try {
   const off72 = await notePos();
   check('#72 the system-generated note is off unless chosen', off72.note === -1, JSON.stringify(off72));
   await page.evaluate(() => {
-    const b = [...document.querySelectorAll('.generator-toolbar button')].find((x) => /^Customize$/.test(x.innerText.trim()));
+    const b = [...document.querySelectorAll('[data-inv-card="type"] button')].find((x) => /^Customize invoice$/.test(x.innerText.trim()));
     if (b) b.click();
   });
   await sleep(1000);
@@ -1455,16 +1993,25 @@ try {
   // it always said "Could not generate any PDFs".
   if (gen.invoiceNumber) {
     await openView('Dashboard');
-    await page.fill('input[placeholder="Search client or invoice..."]', gen.invoiceNumber);
+    await page.fill('input[placeholder^="Search client, invoice"]', gen.invoiceNumber);
     await sleep(800);
     const row = page.locator('tr', { hasText: gen.invoiceNumber }).first();
     await row.locator('input[type="checkbox"]').check();
     const [dl] = await Promise.all([
       page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
-      page.locator('button', { hasText: 'Bulk PDF' }).first().click(),
+      page.locator('button', { hasText: 'One merged PDF' }).first().click(),
     ]);
-    check('v71 Bulk PDF downloads a PDF of the ticked invoices', !!dl && /\.pdf$/i.test(dl.suggestedFilename()), dl ? dl.suggestedFilename() : 'no download');
-    await page.fill('input[placeholder="Search client or invoice..."]', '');
+    check('v71 One merged PDF downloads a PDF of the ticked invoices', !!dl && /\.pdf$/i.test(dl.suggestedFilename()), dl ? dl.suggestedFilename() : 'no download');
+    // v1.10.83: one PDF per invoice, in a ZIP.
+    const [zipDl] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60000 }).catch(() => null),
+      page.locator('button', { hasText: 'Separate PDFs (ZIP)' }).first().click(),
+    ]);
+    const zipBytes = zipDl ? readFileSync(await zipDl.path()) : null;
+    const pdfName = `${String(gen.invoiceNumber).replace(/[\\/:*?"<>|]+/g, '-')}.pdf`;
+    check('v83 Separate PDFs downloads a ZIP with the invoice\'s own PDF',
+      !!zipBytes && /\.zip$/i.test(zipDl.suggestedFilename()) && zipBytes.includes(Buffer.from(pdfName)), zipDl ? `${zipDl.suggestedFilename()} (looked for ${pdfName})` : 'no download');
+    await page.fill('input[placeholder^="Search client, invoice"]', '');
   }
 
   // ---- v1.10.76: stock follows edits (#80), quotations (#83), refresh while editing
@@ -1553,6 +2100,107 @@ try {
       JSON.stringify({ locked, unlocked, metaRefused, off }));
     await dismissFirstRun(page);
 
+    // v1.10.85 - Settings -> Privacy & Security -> Use on phone or tablet.
+    // Off by default, and it cannot be switched on without a PIN.
+    {
+      const phoneCard = async () => {
+        await openView('Settings');
+        await page.locator('.settings-jumpnav a[href="#tab-privacy"]').click();
+        await sleep(800);
+        return page.evaluate(() => {
+          const card = document.getElementById('section-phone');
+          const sw = document.getElementById('phone-access-switch');
+          return { shown: !!card && getComputedStyle(card).display !== 'none', title: /Use on phone or tablet/.test(card?.innerText || ''),
+            sw: !!sw, checked: !!sw?.checked, disabled: !!sw?.disabled, needsPin: /Set a PIN first/.test(card?.innerText || '') };
+        });
+      };
+      const before = (await get77('/api/phone-access')).json || {};
+      const noPin = await phoneCard();
+      check('v85 Privacy & Security has "Use on phone or tablet": off, and without a PIN it says to set one and cannot be switched on',
+        before.enabled === false && noPin.shown && noPin.title && noPin.sw && !noPin.checked && noPin.disabled && noPin.needsPin, JSON.stringify({ before: before.enabled, noPin }));
+      await post77('/api/lock/set', { pin: '13572468' });
+      await page.evaluate(() => sessionStorage.setItem('gst_unlocked', '1'));
+      await page.reload({ waitUntil: 'networkidle' });
+      await sleep(2000);
+      await dismissFirstRun(page);
+      const withPin = await phoneCard();
+      check('v85 with a PIN the switch can be turned on', withPin.sw && !withPin.disabled && !withPin.needsPin && !withPin.checked, JSON.stringify(withPin));
+      // v1.10.86 - the boxes in the phone card have a gap between them.
+      const phoneGap = await page.evaluate(() => parseFloat(getComputedStyle(document.querySelector('#section-phone .phone-access-body') || document.body).rowGap) || 0);
+      check('v86 the phone card keeps a gap between its boxes', phoneGap >= 12, String(phoneGap));
+      // Turning it on opens a port on the network (and Windows asks about the
+      // firewall), so only against a server started for that:
+      // FGSB_PHONE_LISTEN=127.0.0.1 FGSB_PHONE_PORT=<test port> + SMOKE_PHONE=1.
+      if (process.env.SMOKE_PHONE === '1') {
+        // The switch follows the server's answer, so click and wait for it.
+        await page.locator('#phone-access-switch').click();
+        await sleep(2000);
+        await page.locator('#section-phone').getByRole('button', { name: /Pair a phone or tablet/ }).click({ timeout: 15000 });
+        await sleep(1500);
+        const pc = await page.evaluate(() => ({ qr: !!document.querySelector('.phone-pair img[src^="data:image/png"]'), fp: document.querySelector('.phone-fingerprint')?.innerText.trim() || '' }));
+        const st = (await get77('/api/phone-access')).json;
+        // v1.10.86 - the phone button at the top shows the same QR code; the
+        // address it shows is the guide page (port + 1), HTTPS as the fallback.
+        await page.locator('.app-topbar .topbar-phone').click();
+        await sleep(1500);
+        const top = await page.evaluate(() => {
+          const d = document.querySelector('[aria-labelledby="phone-pair-title"]');
+          return { qr: !!d?.querySelector('.phone-pair img[src^="data:image/png"]'), address: d?.querySelector('.phone-address')?.innerText.trim() || '', https: d?.querySelector('.phone-https-address')?.innerText.trim() || '' };
+        });
+        check('v86 the phone button at the top shows the pairing QR code, the guide page address and the HTTPS one',
+          top.qr && top.address === `http://127.0.0.1:${st.port + 1}` && top.https === `https://127.0.0.1:${st.port}`, JSON.stringify(top));
+        await page.locator('[aria-labelledby="phone-pair-title"]').getByRole('button', { name: 'Close' }).click();
+        const code = (await post77('/api/phone-access/pairing-code', {})).json.code;
+        const phoneCtx = await browser.newContext({ viewport: { width: 390, height: 844 }, ignoreHTTPSErrors: true });
+        const ph = await phoneCtx.newPage();
+        const phoneCsp = [];
+        ph.on('console', (m) => { if (/Content-Security-Policy/i.test(m.text())) phoneCsp.push(m.text()); });
+        const base = `https://127.0.0.1:${st.port}`;
+        await ph.goto(`${base}/`, { waitUntil: 'networkidle' });
+        const sentToPair = new URL(ph.url()).pathname === '/pair';
+        // v1.10.86 - the QR code opens the guide page (plain HTTP); Continue
+        // goes to the HTTPS pairing page with the code after #.
+        await ph.goto(`http://127.0.0.1:${st.port + 1}/#code=${code}`, { waitUntil: 'networkidle' });
+        const guide = await ph.evaluate(() => ({ text: /not private/.test(document.body.innerText) && /Advanced/.test(document.body.innerText) && /Show Details/.test(document.body.innerText),
+          fp: document.querySelector('.fp')?.innerText.trim() || '', href: document.getElementById('go')?.href || '', wide: document.documentElement.scrollWidth <= 390 }));
+        await ph.locator('#go').click();
+        await ph.waitForURL(`${base}/pair`, { timeout: 15000 }).catch(() => {});
+        const codeAsked = await ph.locator('#codeBox').isVisible();
+        check('v86 guide page: the warning explained, the security code, Continue to the HTTPS pairing page with the code (not asked again), fits 390px',
+          guide.text && guide.fp === st.shortFingerprint && guide.href === `${base}/pair#code=${code}` && guide.wide && new URL(ph.url()).pathname === '/pair' && !codeAsked,
+          JSON.stringify({ guide, url: ph.url(), codeAsked }));
+        const phoneFp = (await ph.locator('#fp').innerText()).trim();
+        await ph.locator('#pin').fill('11112222');
+        await ph.locator('#go').click();
+        await sleep(1500);
+        const wrongMsg = (await ph.locator('#err').innerText()).trim();
+        await ph.locator('#pin').fill('13572468');
+        await ph.locator('#go').click();
+        await ph.waitForURL(`${base}/`, { timeout: 20000 }).catch(() => {});
+        await sleep(3000);
+        const appOnPhone = await ph.evaluate(() => /Enter your PIN|Dashboard|New Invoice/.test(document.body.innerText));
+        // v1.10.86 - the PIN is typed once: no lock screen right after pairing,
+        // but a new session on the phone asks for it again.
+        const pinOnce = await ph.evaluate(() => !/Enter your PIN/.test(document.body.innerText) && sessionStorage.getItem('gst_unlocked') === '1');
+        const ph2 = await phoneCtx.newPage();
+        await ph2.goto(`${base}/`, { waitUntil: 'networkidle' });
+        await sleep(2000);
+        const askedAgain = await ph2.evaluate(() => /Enter your PIN/.test(document.body.innerText));
+        await ph2.close();
+        check('v86 after pairing the app opens without asking the PIN again; a new tab asks for it', pinOnce && askedAgain, JSON.stringify({ pinOnce, askedAgain }));
+        const devices = (await get77('/api/phone-access')).json.devices || [];
+        check('v85 pairing screen: QR code and the security code on the PC; the phone is sent to the pairing page, sees the same code, a wrong PIN is refused, the right one opens the app',
+          pc.qr && pc.fp && pc.fp === st.shortFingerprint && sentToPair && phoneFp === pc.fp && /Wrong PIN/.test(wrongMsg) && appOnPhone && devices.length === 1,
+          JSON.stringify({ pc, sentToPair, phoneFp, wrongMsg, appOnPhone, devices: devices.length }));
+        check('v85 the app on the phone loads with no CSP errors', phoneCsp.length === 0, phoneCsp.slice(0, 2).join(' | '));
+        for (const d of devices) await page.evaluate((id) => fetch(`/api/phone-access/devices/${id}`, { method: 'DELETE' }), d.id);
+        await post77('/api/phone-access', { enabled: false });
+        await phoneCtx.close();
+      }
+      await post77('/api/lock/set', { pin: null, currentPin: '13572468' });
+      check('v85 phone access is off again after the test', (await get77('/api/phone-access')).json?.enabled === false);
+    }
+
     // #84 settings are kept in the data folder too, so a browser that loses
     // its storage gets them back (no welcome wizard, same Region and Print).
     const prefs = (await get77('/api/local-prefs')).json?.value || {};
@@ -1564,9 +2212,9 @@ try {
     const prof77 = (await get77('/api/profile')).json;
     const today77 = new Date().toISOString().slice(0, 10);
     const bill77 = {
-      id: 'smoketest-terms77', invoiceNumber: 'smoketest-terms77', clientName: 'Smoke Test Client', invoiceDate: today77, invoiceType: 'tax-invoice',
+      id: 'smoketest-terms77', invoiceNumber: 'SMK-TERMS-77', clientName: 'Smoke Test Client', invoiceDate: today77, invoiceType: 'tax-invoice',
       status: 'unpaid', totalAmount: 1180, paidAmount: 0, payments: [],
-      data: { profile: prof77, client: { name: 'Smoke Test Client', state: prof77.state, country: 'India' }, details: { invoiceNumber: 'smoketest-terms77', invoiceDate: today77 },
+      data: { profile: prof77, client: { name: 'Smoke Test Client', state: prof77.state, country: 'India' }, details: { invoiceNumber: 'SMK-TERMS-77', invoiceDate: today77 },
         invoiceType: 'tax-invoice', invoiceOptions: {}, totals: { total: 1180 }, customTerms: '<p>SMOKE-SAVED-TERMS</p>', stockApplied: {},
         items: [{ id: 'l1', name: 'Smoke item', hsn: '9983', quantity: 1, rate: 1000, taxPercent: 18, discount: 0, unit: 'Nos' }] },
     };
@@ -1584,7 +2232,7 @@ try {
     await page.getByRole('button', { name: /Delivery charges/ }).first().click();
     await sleep(800);
     check('v77 #87 Delivery charges adds a line with SAC 996812',
-      (await page.locator('input[value="Delivery charges"]').count()) > 0 && (await page.locator('input[value="996812"]').count()) > 0);
+      (await page.locator('textarea.line-item-name').evaluateAll((els) => els.some((e) => e.value === 'Delivery charges'))) && (await page.locator('input[value="996812"]').count()) > 0);
 
     // #88 a short invoice is one page in every design
     await openDraft(seamDraft(1));
@@ -1671,6 +2319,7 @@ try {
         items: [{ id: 'l1', name: 'Smoke item', hsn: '9983', quantity: 1, rate: 1000, taxPercent: 18, discount: 0, unit: 'Nos' }] },
     });
     await toView78('dashboard');
+    await openFolder('Cancelled');
     const undoRow = page.locator('tr', { hasText: 'smoketest-undo78' }).first();
     await undoRow.locator('button[title="Undo cancel"]').click();
     await sleep(700);
@@ -1695,9 +2344,17 @@ try {
     const toNew79 = async () => {
       await page.evaluate(() => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', 'new'); });
       await page.reload({ waitUntil: 'networkidle' });
-      await sleep(3000);
+      await sleep(1500);
       await dismissFirstRun(page);
-      return page.locator('#invoice-preview').innerText().catch(() => '');
+      // 7 Nov: up to 10 s for the number (a fixed 3 s read it too early on a
+      // fresh install once); the number shown is reported if the check fails.
+      let text = '';
+      for (let i = 0; i < 20; i++) {
+        text = await page.locator('#invoice-preview').innerText().catch(() => '');
+        if (/[A-Z][A-Z-]*\/[\d-]+\/\d+/.test(text)) break;
+        await sleep(500);
+      }
+      return text;
     };
     const profile79 = await get79('/api/profile');
     const shared79 = (await get79('/api/meta/invoiceNumberSettings')).value;
@@ -1713,7 +2370,7 @@ try {
     const shared79Shown = await toNew79();
     check('v79 #95 a business with its own numbering shows and numbers in its own series',
       /SMKB\/[\d-]*\/?0502\b|SMKB\/0502\b/.test(own79) && !/SMKB/.test(shared79Shown),
-      JSON.stringify({ own: (own79.match(/SMKB[^\s]*/) || ['-'])[0], shared: (shared79Shown.match(/[A-Z-]+\/[\d-]+\/\d+/) || ['-'])[0] }));
+      JSON.stringify({ own: (own79.match(/SMKB[^\s]*/) || own79.match(/[A-Z][A-Z-]*\/[\d-]+\/\d+/) || ['-'])[0], shared: (shared79Shown.match(/[A-Z-]+\/[\d-]+\/\d+/) || ['-'])[0] }));
     await post79('/api/meta/invoiceNumberSeries', { value: series79 || {} });
     await post79('/api/meta/' + encodeURIComponent('counter_INV@27AAPFS9999Q1Z1'), { value: null });
 
@@ -1780,15 +2437,37 @@ try {
         sessionStorage.setItem('gst_currentView', 'new'); sessionStorage.removeItem('gst_invoiceDraft');
       }, q);
       await page.reload({ waitUntil: 'networkidle' });
-      await sleep(3000);
+      await sleep(1500);
       await dismissFirstRun(page);
-      await page.getByRole('button', { name: /^Save$/ }).first().click();
-      await sleep(3500);
+      // Wait for the result, not a fixed time: under the release gate a busy
+      // machine sometimes needed longer than 3.5 s, and the check failed
+      // although both invoices were made (31 Oct 2026).
+      const save79 = page.getByRole('button', { name: /^Save$/ }).first();
+      await save79.waitFor({ state: 'visible', timeout: 30000 });
+      const count79 = async () => (await get79('/api/bills')).filter((x) => x.clientName === 'Smoke Test Client' && x.invoiceType === 'tax-invoice').length;
+      const had79 = await count79();
+      await save79.click();
+      for (let i = 0; i < 60 && (await count79()) === had79; i++) await sleep(250);
     }
     const after79 = (await get79('/api/bills')).filter((x) => x.clientName === 'Smoke Test Client' && x.invoiceType === 'tax-invoice').map((x) => x.id);
     const made79 = after79.filter((id) => !before79.includes(id));
     check('v79 converting two quotations in a row makes two invoices, neither overwritten', made79.length === 2, made79.join(', '));
     for (const id of made79) await page.evaluate(async (id) => fetch('/api/bills/' + encodeURIComponent(id), { method: 'DELETE' }), id);
+
+    // 14 Nov 2026 (maintainer) - a duplicate keeps its bill's currency. The
+    // saved defaults for new invoices loaded a moment later and put back INR.
+    const usd = { ...quoteOf79('smoketest-dupusd'), invoiceType: 'tax-invoice', currency: 'USD' };
+    usd.data = { ...usd.data, invoiceType: 'tax-invoice', invoiceOptions: { currency: 'USD', exchangeRate: '84' } };
+    await page.evaluate((bill) => {
+      sessionStorage.setItem('gst_editingBill', JSON.stringify({ ...bill, _isDuplicate: true }));
+      sessionStorage.setItem('gst_currentView', 'new'); sessionStorage.removeItem('gst_invoiceDraft');
+    }, usd);
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(4000);
+    await dismissFirstRun(page);
+    const dupCur = await page.evaluate(() => [...document.querySelectorAll('select')].map((s) => s.value).filter((v) => /^[A-Z]{3}$/.test(v)));
+    check('duplicating a USD invoice keeps USD', dupCur.includes('USD') && !dupCur.includes('INR'), JSON.stringify(dupCur));
+    await page.evaluate(() => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); });
   }
 
   // ---- v1.10.80: Support page payment note names the business ------------
@@ -1802,6 +2481,614 @@ try {
     const expected = ('Free GST Billing support - ' + String(prof80.businessName || '').replace(/[^A-Za-z0-9 .-]+/g, ' ').replace(/\s+/g, ' ').trim()).slice(0, 50).trim();
     check('v80 the UPI payment note names the business', !!prof80.businessName && noteText.includes(expected), noteText);
   }
+
+  // ---- v1.10.84 (#177): tick products and delete them in one go -----------
+  {
+    // Two products the search shows, one it hides: only the shown ones go.
+    await page.evaluate(async () => {
+      const add = (id, name) => fetch('/api/products', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, name, rate: 10, taxPercent: 18, unit: 'Nos' }) });
+      await add('smoketest-tick-1', 'Smoke Tick 1');
+      await add('smoketest-tick-2', 'Smoke Tick 2');
+      await add('smoketest-tick-keep', 'Smoke Keep Me');
+      sessionStorage.setItem('gst_currentView', 'inventory');
+    });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2500);
+    await dismissFirstRun(page);
+    await page.locator('input[placeholder^="Search by name"]').fill('Smoke Tick');
+    await page.locator('input[aria-label="Select Smoke Tick 2"]').waitFor({ timeout: 10000 });
+    // The search has filtered the list: the product it hides is gone from it.
+    await page.locator('input[aria-label="Select Smoke Keep Me"]').waitFor({ state: 'detached', timeout: 10000 });
+    await page.getByLabel('Select all products shown').check();
+    const barText = await page.getByText(/^\d+ selected$/).first().innerText({ timeout: 5000 }).catch(() => '');
+    await page.getByRole('button', { name: /Delete selected/ }).click();
+    await sleep(500);
+    await page.getByRole('button', { name: /^Delete$/ }).last().click();
+    await sleep(1500);
+    const ids = await page.evaluate(async () => (await (await fetch('/api/products')).json()).map((p) => String(p.id)).filter((id) => id.startsWith('smoketest-tick-')));
+    check('#177 select all + Delete selected removes the products the list shows, and only those', barText === '2 selected' && ids.join() === 'smoketest-tick-keep', `bar="${barText}" left=${ids.join() || 'none'}`);
+  }
+
+  // ---- v1.10.84 (maintainer: "this window should never come"): with the
+  // server not answering, the Windows Setup's own window (WebView2:
+  // window.chrome.webview) shows "Starting again..." - never the Quick Start
+  // instructions, which a browser still gets.
+  {
+    const seen = {};
+    for (const [label, asWindow] of [['window', true], ['browser', false]]) {
+      const c = await browser.newContext({ viewport: { width: 1366, height: 768 } });
+      if (asWindow) await c.addInitScript(() => { window.chrome = window.chrome || {}; window.chrome.webview = {}; });
+      const p = await c.newPage();
+      await p.route('**/api/profile', (r) => r.abort());
+      try {
+        await p.goto(APP, { waitUntil: 'load' });
+        await p.waitForTimeout(3000);
+        const text = await p.locator('body').innerText().catch(() => '');
+        seen[label] = { starting: /Starting again/.test(text), quickStart: /Needs a Quick Start/.test(text) };
+      } finally { await c.close(); }
+    }
+    check('v84 the app window never shows "Needs a Quick Start" (it shows Starting again); a browser still gets the help',
+      seen.window?.starting && !seen.window?.quickStart && seen.browser?.quickStart && !seen.browser?.starting, JSON.stringify(seen));
+  }
+
+  // ---- v1.10.85 (#135, #112, #115): a sales order, part of it sent on a
+  // delivery challan (Partly dispatched), the rest invoiced (Invoiced).
+  {
+    const get85 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const stock85 = async (id) => (await get85('/api/products')).find((x) => x.id === id)?.stock;
+    const prof85 = await get85('/api/profile');
+    const soId = 'smoketest-SO-85';
+    const modules85 = await page.evaluate(() => localStorage.getItem('gst_enabledModules'));
+    await page.evaluate(() => {
+      const m = JSON.parse(localStorage.getItem('gst_enabledModules') || '{}');
+      localStorage.setItem('gst_enabledModules', JSON.stringify({ ...m, salesOrders: true }));
+    });
+    await api('/api/products', { id: 'smoketest-so-chair', name: 'Smoke Chair', hsn: '9401', rate: 1000, taxPercent: 18, unit: 'Nos', stock: 50 });
+    await api('/api/bills', {
+      id: soId, invoiceNumber: soId, clientName: 'Smoke Test Client', invoiceDate: today, invoiceType: 'sales-order', status: 'unpaid',
+      totalAmount: 11800, paidAmount: 0, payments: [],
+      data: { profile: prof85, client: { name: 'Smoke Test Client', state: prof85.state, country: 'India' },
+        details: { invoiceNumber: soId, invoiceDate: today }, invoiceType: 'sales-order', invoiceOptions: {}, totals: { total: 11800 },
+        items: [{ id: 'so85', productId: 'smoketest-so-chair', name: 'Smoke Chair', hsn: '9401', quantity: 10, rate: 1000, taxPercent: 18, discount: 0, unit: 'Nos' }],
+        stockApplied: {} },
+    });
+    const ordersTab85 = async () => {
+      await page.evaluate(() => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', 'dashboard'); });
+      await page.reload({ waitUntil: 'networkidle' });
+      await sleep(2500);
+      await dismissFirstRun(page);
+      await page.getByRole('tab', { name: /Sales orders/ }).click();
+      await sleep(800);
+      return page.locator('tr', { hasText: soId }).first();
+    };
+    const save85 = async () => { await page.getByRole('button', { name: /^Save$/ }).first().click(); await sleep(3500); };
+    const fromOrder85 = (type) => get85('/api/bills').then((all) => all.find((b) => b.invoiceType === type && b.data?.details?.salesOrderNo === soId));
+
+    let row = await ordersTab85();
+    check('v85 #135 a sales order is on the Sales orders tab as Open, and takes no stock',
+      /Open/.test(await row.textContent()) && (await stock85('smoketest-so-chair')) === 50, `${(await row.textContent()).replace(/\s+/g, ' ').slice(0, 120)} stock=${await stock85('smoketest-so-chair')}`);
+    await row.getByRole('button', { name: `Make delivery challan from ${soId}` }).click();
+    await page.waitForSelector('#invoice-preview', { timeout: 30000 });
+    await sleep(1500);
+    await page.locator('.line-item-field', { has: page.locator('label', { hasText: /^Qty$/ }) }).locator('input').first().fill('4');
+    await sleep(500);
+    await save85();
+    const dc85 = await fromOrder85('delivery-challan');
+    check('v85 #135 Make delivery challan: a challan for 4 of the 10, linked to the order, takes 4 out of stock',
+      dc85?.data?.items?.[0]?.quantity === 4 && (await stock85('smoketest-so-chair')) === 46, `challan=${dc85?.id} qty=${dc85?.data?.items?.[0]?.quantity} stock=${await stock85('smoketest-so-chair')}`);
+    row = await ordersTab85();
+    const partly = (await row.textContent()).replace(/\s+/g, ' ');
+    check('v85 #135 the order now shows Partly dispatched, 4 of 10 sent, and the challan number', /Partly dispatched/.test(partly) && /4 of 10 sent/.test(partly) && partly.includes(dc85?.invoiceNumber || '?'), partly.slice(0, 160));
+    await row.getByRole('button', { name: `Invoice the rest of ${soId}` }).click();
+    await page.waitForSelector('#invoice-preview', { timeout: 30000 });
+    await sleep(1500);
+    await save85();
+    const inv85 = await fromOrder85('tax-invoice');
+    const dcAfter = (await get85('/api/bills')).find((b) => b.id === dc85?.id);
+    check('v85 #135 Invoice the rest: one invoice for all 10 (the challan taken in), only 6 more out of stock',
+      inv85?.data?.items?.[0]?.quantity === 10 && dcAfter?.convertedTo === inv85?.id && (await stock85('smoketest-so-chair')) === 40,
+      `qty=${inv85?.data?.items?.[0]?.quantity} challan.convertedTo=${dcAfter?.convertedTo} stock=${await stock85('smoketest-so-chair')}`);
+    check('v85 #135 the invoice carries the order number (Buyer\'s Order No)', inv85?.data?.details?.buyerOrderNo === soId, inv85?.data?.details?.buyerOrderNo);
+    row = await ordersTab85();
+    check('v85 #135 the order is Invoiced', (await row.locator('.type-badge', { hasText: /^Invoiced$/ }).count()) === 1, (await row.textContent()).replace(/\s+/g, ' ').slice(0, 120));
+    await page.evaluate((m) => { if (m === null) localStorage.removeItem('gst_enabledModules'); else localStorage.setItem('gst_enabledModules', m); }, modules85);
+  }
+
+  // ---- v1.10.85 (#168): Return to supplier makes a debit note: stock and
+  // GSTR-3B ITC go down; cancelling it puts both back.
+  {
+    const get85 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const stock85 = async () => (await get85('/api/products')).find((x) => x.id === 'smoketest-ret85')?.stock;
+    const prof85 = await get85('/api/profile');
+    await api('/api/products', { id: 'smoketest-ret85', name: 'Smoke Return Item', hsn: '9608', rate: 100, taxPercent: 18, unit: 'Nos', stock: 10 });
+    await api('/api/purchases', { id: 'smoketest-pur85', date: today, supplierName: 'Smoke Return Supplier', supplierGstin: '07AAAAA0000A1Z1',
+      invoiceNumber: 'SMK-RET-85', paymentStatus: 'Unpaid', interstate: false, ownerGstin: prof85.gstin || '', ownerName: prof85.businessName || '',
+      items: [{ name: 'Smoke Return Item', hsn: '9608', quantity: 10, rate: 100, taxPercent: 18, cessPercent: 0 }], totalAmount: 1180, totalTax: 180, taxableAmount: 1000 });
+    const itcBefore = await netItc();
+    await reopenView('Purchases');
+    // v1.10.86 - Return to supplier is in the row's More menu.
+    await page.getByRole('button', { name: 'More actions for SMK-RET-85' }).click();
+    await page.getByRole('menuitem', { name: 'Return to supplier (debit note)' }).click();
+    await page.getByLabel('Return quantity of Smoke Return Item').fill('3');
+    await page.getByRole('button', { name: 'Save debit note' }).click();
+    await sleep(2500);
+    const dn85 = (await get85('/api/debit-notes')).find((d) => d.purchaseId === 'smoketest-pur85');
+    check('v85 #168 Return to supplier saves a debit note (DN/...) against the bill, and 3 go out of stock',
+      /^DN\//.test(dn85?.dnNumber || '') && dn85?.billNumber === 'SMK-RET-85' && dn85?.items?.[0]?.quantity === 3 && (await stock85()) === 7,
+      `dn=${dn85?.dnNumber} qty=${dn85?.items?.[0]?.quantity} stock=${await stock85()}`);
+    const returnsTab = (await page.getByRole('button', { name: /Returns \(\d+\)/ }).count()) > 0;
+    const itcAfter = await netItc();
+    check('v85 #168 GSTR-3B Net ITC is 54 less (GST on 3 x 100 @ 18%), with the return shown', close(itcAfter, itcBefore - 54)
+      && (await page.locator('tr', { hasText: 'Less: purchase returns (debit notes)' }).count()) > 0 && returnsTab, `${itcBefore} -> ${itcAfter}, Returns tab ${returnsTab}`);
+    await reopenView('Purchases');
+    const balance = (await page.locator('tr', { hasText: 'SMK-RET-85' }).first().innerText()).replace(/\s+/g, ' ');
+    check('v85 #168 the bill now owes 1180 - 354 = 826', /826\.00/.test(balance), balance.slice(0, 160));
+    await page.getByRole('button', { name: /Returns \(\d+\)/ }).click();
+    await page.getByRole('button', { name: `More actions for ${dn85?.dnNumber}` }).click();
+    await page.getByRole('menuitem', { name: 'Cancel debit note' }).click();
+    await sleep(400);
+    await page.getByRole('button', { name: 'Cancel debit note' }).last().click();
+    await sleep(2000);
+    const itcCancelled = await netItc();
+    check('v85 #168 cancelling the debit note puts the stock and the ITC back', (await stock85()) === 10 && close(itcCancelled, itcBefore), `stock=${await stock85()} itc ${itcBefore} -> ${itcCancelled}`);
+    await page.evaluate(async (id) => {
+      await fetch(`/api/debit-notes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await fetch('/api/purchases/smoketest-pur85', { method: 'DELETE' });
+    }, dn85?.id || 'none');
+  }
+
+  // v1.10.85: Close the books (Settings -> Data) up to 31 Jan 2025: an invoice
+  // dated then is refused by the server; the edit history lists the closing;
+  // opening the books again frees it.
+  {
+    await page.evaluate(() => { sessionStorage.setItem('gst_settingsTab', 'tab-data'); sessionStorage.setItem('gst_currentView', 'settings'); sessionStorage.removeItem('gst_editingBill'); });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2500);
+    await dismissFirstRun(page);
+    await page.locator('#books-upto').fill('2025-01-31');
+    await page.getByRole('button', { name: 'Close the books' }).click();
+    await sleep(400);
+    await page.locator('.confirm-modal-primary').click();
+    await sleep(1200);
+    const refused = await page.evaluate(async () => (await fetch('/api/bills', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'smoketest-closed', invoiceNumber: 'SMOKE-CLOSED/1', invoiceType: 'tax-invoice', invoiceDate: '2025-01-15', totalAmount: 100, data: {} }) })).status);
+    await page.getByRole('button', { name: 'Show the edit history' }).click();
+    await sleep(1200);
+    const historyText = await page.locator('.edit-history-table').innerText().catch(() => '');
+    check('v85 closing the books refuses an invoice dated in the closed period, and the history lists it',
+      refused === 423 && /Closed up to/.test(historyText) && /2025-01-31/.test(historyText), `status=${refused} history=${historyText.slice(0, 120)}`);
+    await page.getByRole('button', { name: 'Open the books' }).click();
+    await sleep(400);
+    await page.locator('.confirm-modal-primary').click();
+    await sleep(1200);
+    const open = await page.evaluate(async () => (await (await fetch('/api/period-lock')).json()).upTo);
+    check('v85 opening the books again', open === '', `upTo="${open}"`);
+  }
+
+  // ---- v1.10.85 (#171, #160): a discount and serial numbers on a purchase line
+  {
+    const prof85 = await page.evaluate(async () => (await fetch('/api/profile')).json());
+    await api('/api/purchases', { id: 'smoketest-pur171', date: today, supplierName: 'Smoke Discount Supplier', invoiceNumber: 'SMK-DISC-171',
+      paymentStatus: 'Unpaid', interstate: false, ownerGstin: prof85.gstin || '', ownerName: prof85.businessName || '',
+      items: [{ name: 'Smoke Phone', hsn: '8517', quantity: 2, rate: 1000, taxPercent: 18, cessPercent: 0, discount: 10, discountType: 'percent', serialNo: '356938035643809, 356938035643817' }],
+      totalAmount: 2124, totalTax: 324, taxableAmount: 1800 });
+    await reopenView('Purchases');
+    await page.locator('input[placeholder^="Search supplier"]').fill('643817');
+    await sleep(600);
+    const rowText = (await page.locator('tr', { hasText: 'SMK-DISC-171' }).first().innerText().catch(() => '')).replace(/\s+/g, ' ');
+    check('v85 #160 #171 the Purchases search finds a bill by an IMEI, and its total is after the 10% discount (2,124.00)',
+      /2,124\.00/.test(rowText) && (await page.locator('tbody tr', { hasText: 'SMK-' }).count()) === 1, rowText.slice(0, 160));
+    await page.locator('input[placeholder^="Search supplier"]').fill('');
+    await page.getByRole('button', { name: /add purchase/i }).first().click();
+    await sleep(800);
+    const before = await page.getByLabel('Discount on line 1').count();
+    await page.getByLabel('Discount column').check().catch(() => {});
+    await sleep(300);
+    const after = await page.getByLabel('Discount on line 1').count();
+    check('v85 #171 the Discount column is hidden until ticked', before === 0 && after === 1, `before=${before} after=${after}`);
+    await page.getByLabel('Discount column').uncheck().catch(() => {});
+    await page.getByRole('button', { name: /^Cancel$/ }).first().click().catch(() => {});
+    await page.evaluate(() => fetch('/api/purchases/smoketest-pur171', { method: 'DELETE' }));
+  }
+
+  // ---- v1.10.85 (#137, #158): barcodes - a USB scanner on New Invoice (the
+  // same code twice = qty 2), and labels from Products and from a purchase.
+  {
+    const modules137 = await page.evaluate(() => localStorage.getItem('gst_enabledModules'));
+    await page.evaluate(() => {
+      const m = JSON.parse(localStorage.getItem('gst_enabledModules') || '{}');
+      localStorage.setItem('gst_enabledModules', JSON.stringify({ ...m, barcodes: true }));
+    });
+    const code137 = `SMK137-${Date.now().toString().slice(-6)}`;
+    await api('/api/products', { id: 'smoketest-bc137', name: 'Smoke Barcode Pen', hsn: '9608', sellingPrice: 25, rate: 25, taxPercent: 18, unit: 'Pcs', stock: 20, barcode: code137 });
+    const toView137 = async (view) => {
+      await page.evaluate((v) => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', v); }, view);
+      await page.reload({ waitUntil: 'networkidle' });
+      await sleep(2500);
+      await dismissFirstRun(page);
+    };
+    await toView137('new');
+    const lines = () => page.evaluate(() => [...document.querySelectorAll('.line-item-row')].map((r) => ({
+      name: r.querySelector('.line-item-name')?.value, qty: r.querySelector('input[type="number"]')?.value, rate: r.querySelector('.line-item-rate')?.value })));
+    const scan = page.getByLabel('Scan barcode');
+    const scanIt = async (code) => { await scan.fill(code); await scan.press('Enter'); await sleep(400); };
+    await scanIt(code137);
+    const once = await lines();
+    await scanIt(code137);
+    const twice = await lines();
+    await scanIt('SMK-NO-SUCH-CODE');
+    const unknownToast = (await page.getByText('No product has the barcode SMK-NO-SUCH-CODE').count()) > 0;
+    check('v85 #137 scanning a barcode on New Invoice adds the product as a line, with its rate',
+      once.length === 1 && once[0].name === 'Smoke Barcode Pen' && Number(once[0].rate) === 25, JSON.stringify(once));
+    check('v85 #137 scanning it again makes qty 2 on the same line; an unknown code says so',
+      twice.length === 1 && Number(twice[0].qty) === 2 && unknownToast, `${JSON.stringify(twice)} toast=${unknownToast}`);
+    // The code typed into an Item box + Enter picks the product too.
+    await page.getByRole('button', { name: 'Add Item' }).click();
+    await sleep(300);
+    const nameBox = page.locator('.line-item-row').nth(1).locator('textarea.line-item-name');
+    await nameBox.fill(code137);
+    await sleep(300);
+    await nameBox.press('Enter');
+    await sleep(400);
+    const typed = await lines();
+    check('v85 #137 a barcode typed in the Item box + Enter fills that line with the product', typed[1]?.name === 'Smoke Barcode Pen', JSON.stringify(typed));
+
+    // Labels from Products: the search finds the barcode; tick, Print labels, 7 of it.
+    await toView137('inventory');
+    await page.locator('input[placeholder^="Search by name"]').fill(code137);
+    await page.locator('input[aria-label="Select Smoke Barcode Pen"]').check();
+    await page.getByRole('button', { name: /Print labels/ }).click();
+    await page.getByLabel('Labels for Smoke Barcode Pen').fill('7');
+    await sleep(1000);
+    const frame = page.frameLocator('iframe.label-preview');
+    const n7 = await frame.locator('.label').count();
+    const digits = await frame.locator('.label .digits').first().innerText().catch(() => '');
+    const bars = await frame.locator('.label .bars svg path').count();
+    check('v85 #158 Products: the search finds the barcode, and Print labels draws 7 labels (bars, digits under them)',
+      n7 === 7 && digits === code137 && bars === 7, `labels=${n7} digits=${digits} bars=${bars}`);
+    await page.getByRole('button', { name: 'Close' }).last().click();
+
+    // Labels for a purchase bill: 4 bought = 4 labels (matched by name).
+    const prof137 = await page.evaluate(async () => (await fetch('/api/profile')).json());
+    await api('/api/purchases', { id: 'smoketest-pur137', date: today, supplierName: 'Smoke Label Supplier', invoiceNumber: 'SMK-LBL-137',
+      paymentStatus: 'Unpaid', interstate: false, ownerGstin: prof137.gstin || '', ownerName: prof137.businessName || '',
+      items: [{ name: 'Smoke Barcode Pen', hsn: '9608', quantity: 4, rate: 20, taxPercent: 18, cessPercent: 0 }], totalAmount: 94.4, totalTax: 14.4, taxableAmount: 80 });
+    await reopenView('Purchases');
+    await page.locator('tr', { hasText: 'SMK-LBL-137' }).first().getByTitle('View details (no download)').click();
+    await page.getByRole('button', { name: /Print labels for this purchase/ }).click();
+    await sleep(1500);
+    const n4 = await page.frameLocator('iframe.label-preview').locator('.label').count();
+    check('v85 #158 a purchase bill: Print labels for this purchase gives one label per piece bought', n4 === 4, `labels=${n4}`);
+    await page.getByRole('button', { name: 'Close' }).last().click();
+    await page.evaluate((m) => {
+      if (m === null) localStorage.removeItem('gst_enabledModules'); else localStorage.setItem('gst_enabledModules', m);
+      sessionStorage.removeItem('gst_invoiceDraft');
+    }, modules137);
+  }
+
+  // ---- v1.10.85 (#175): Bank matching - a made-up DiceCodes statement is
+  // imported, its credit is suggested for the unpaid invoice of that amount,
+  // and Confirm records the payment (bank date, Bank transfer, reference):
+  // the invoice is Paid. The same file again adds nothing.
+  {
+    const get85 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const prof85 = await get85('/api/profile');
+    await api('/api/bills', { id: 'smoketest-bank85', invoiceNumber: 'SMK-BANK-85', invoiceType: 'tax-invoice', clientName: 'DiceCodes Smoke Client',
+      status: 'unpaid', totalAmount: 4720, paidAmount: 0, invoiceDate: today, payments: [], items: [],
+      data: { profile: { gstin: prof85.gstin || '', businessName: prof85.businessName || '' }, client: { name: 'DiceCodes Smoke Client' }, details: {}, totals: { total: 4720 } } });
+    const [y, m, d] = today.split('-');
+    const csv = ['Date,Narration,Chq./Ref.No.,Value Dt,Withdrawal Amt.,Deposit Amt.,Closing Balance',
+      `${d}/${m}/${y.slice(2)},NEFT CR-DICECODES SMOKE CLIENT-SMK-BANK-85,SMKREF85,${d}/${m}/${y.slice(2)},,"4,720.00","14,720.00"`].join('\n');
+    const importCsv = async () => {
+      await page.locator('input[aria-label="Bank statement file"]').setInputFiles({ name: 'dicecodes-smoke.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+      await sleep(2000);
+    };
+    await reopenView('Cash book');
+    await page.getByRole('button', { name: 'Bank matching' }).click();
+    await sleep(1500);
+    await importCsv();
+    const row = page.locator('tr', { hasText: 'SMKREF85' }).first();
+    const rowText = (await row.innerText()).replace(/\s+/g, ' ');
+    check('v85 #175 the imported credit is suggested for the unpaid invoice, saying why (same amount, number in the description)',
+      /SMK-BANK-85/.test(rowText) && /Same amount/.test(rowText) && /SMK-BANK-85 is in the description/.test(rowText), rowText.slice(0, 220));
+    await row.getByRole('button', { name: /^Confirm match for/ }).click();
+    await sleep(2500);
+    const bill85 = (await get85('/api/bills')).find((b) => b.id === 'smoketest-bank85');
+    const pay85 = bill85?.payments?.[0];
+    check('v85 #175 Confirm records the payment on the invoice (bank date, Bank transfer, reference) and the invoice is Paid',
+      bill85?.status === 'paid' && pay85?.amount === 4720 && pay85?.date === today && pay85?.mode === 'bank-transfer' && pay85?.reference === 'SMKREF85',
+      `status=${bill85?.status} payment=${JSON.stringify(pay85 || {}).slice(0, 160)}`);
+    await importCsv();
+    const statements85 = (await get85('/api/bank-statements')).filter((s) => (s.lines || []).some((l) => l.reference === 'SMKREF85'));
+    const line85 = statements85[0]?.lines?.find((l) => l.reference === 'SMKREF85');
+    check('v85 #175 importing the same statement again adds nothing; the line stays matched',
+      statements85.length === 1 && line85?.status === 'matched' && line85?.match?.paymentId === pay85?.id, `statements=${statements85.length} status=${line85?.status}`);
+    await page.evaluate(async ({ ids, receipt }) => {
+      for (const id of ids) await fetch(`/api/bank-statements/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (receipt) await fetch(`/api/receipts/${encodeURIComponent(receipt)}`, { method: 'DELETE' });
+      await fetch('/api/bills/smoketest-bank85?permanent=1', { method: 'DELETE' });
+    }, { ids: statements85.map((s) => s.id), receipt: pay85?.id || '' });
+  }
+
+  // ---- v1.10.85 (#157, #148): the Statement / Aging PDF opens in a preview
+  // (Download, Print, WhatsApp, Email), Show items lists the items on screen
+  // and in the PDF, and the client's payment history. Then New Invoice: a
+  // client on a price level gets the level price, and the credit-limit
+  // warning shows once outstanding + this invoice passes the limit.
+  {
+    const get157 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const prof157 = await get157('/api/profile');
+    const keep157 = await page.evaluate(() => ({ m: localStorage.getItem('gst_enabledModules'), l: localStorage.getItem('gst_priceLevels') }));
+    await page.evaluate(() => {
+      const m = JSON.parse(localStorage.getItem('gst_enabledModules') || '{}');
+      localStorage.setItem('gst_enabledModules', JSON.stringify({ ...m, priceLevels: true }));
+      localStorage.removeItem('gst_priceLevels'); // the default names: Retail, Wholesale, Dealer
+    });
+    const CLIENT = 'Smoke Ledger Client';
+    await api('/api/clients', { id: 'smoketest-cli-157', name: CLIENT, phone: '919800000157', email: 'ledger@dicecodes.example', creditLimit: 1000, priceLevel: '2' });
+    await api('/api/products', { id: 'smoketest-lvl-157', name: 'Smoke Level Widget', hsn: '9608', sellingPrice: 100, rate: 100, taxPercent: 18, unit: 'Nos', levelPrices: { 2: 80 } });
+    // Owes 1180 - 500 = 680 of a 1000 limit.
+    await api('/api/bills', {
+      id: 'smoketest-inv-157', invoiceNumber: 'SMK-157/1', clientName: CLIENT, invoiceDate: today, invoiceType: 'tax-invoice', status: 'partial',
+      totalAmount: 1180, paidAmount: 500, payments: [{ id: 'smoketest-pay-157', amount: 500, date: today, mode: 'upi', note: 'Smoke part payment' }],
+      data: { profile: prof157, client: { name: CLIENT, state: prof157.state, country: 'India' }, details: { invoiceNumber: 'SMK-157/1', invoiceDate: today },
+        invoiceType: 'tax-invoice', invoiceOptions: {}, totals: { total: 1180 },
+        items: [{ id: 'i157', name: 'Smoke Widget', hsn: '9608', quantity: 2, unit: 'Nos', rate: 500, taxPercent: 18, discount: 0 }] },
+    });
+    await page.evaluate(() => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', 'clients'); });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2500);
+    await dismissFirstRun(page);
+    // The screen can still be settling after the reload: open the card until it shows its account.
+    for (let i = 0; i < 4 && !(await page.getByRole('button', { name: /Statement PDF/ }).isVisible()); i += 1) {
+      await page.locator('.client-card-header', { hasText: CLIENT }).first().click();
+      await page.getByRole('button', { name: /Statement PDF/ }).waitFor({ timeout: 4000 }).catch(() => {});
+    }
+    const dialog = page.getByRole('dialog', { name: new RegExp(`^Statement: ${CLIENT}`) });
+    const openStatement = async () => {
+      await page.getByRole('button', { name: /Statement PDF/ }).click();
+      await dialog.waitFor({ timeout: 15000 });
+    };
+    const downloadText = async () => {
+      const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 20000 }), dialog.getByRole('button', { name: 'Download' }).click()]);
+      return { name: dl.suggestedFilename(), text: readFileSync(await dl.path()).toString('latin1') };
+    };
+    await openStatement();
+    const frameSrc = await dialog.locator('iframe').getAttribute('src');
+    const buttons157 = await Promise.all(['WhatsApp', 'Email', 'Download', 'Print'].map((n) => dialog.getByRole('button', { name: n }).count()));
+    const plain = await downloadText();
+    await dialog.getByRole('button', { name: 'Close' }).click();
+    await dialog.waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+    const closed = (await dialog.count()) === 0 && (await page.getByRole('button', { name: /Statement PDF/ }).count()) === 1;
+    check('v85 #157 Statement PDF opens in a preview (the PDF in the app, Download / Print / WhatsApp / Email), Download saves it, closing goes back to the ledger',
+      /^blob:/.test(frameSrc || '') && buttons157.every((n) => n === 1) && /^statement-Smoke-Ledger-Client-.*\.pdf$/.test(plain.name) && closed,
+      `src=${(frameSrc || '').slice(0, 12)} buttons=${buttons157} file=${plain.name} closed=${closed}`);
+
+    await page.getByLabel('Show items').check();
+    const itemLine = await page.locator('.statement-item').first().innerText({ timeout: 5000 }).catch(() => '');
+    await openStatement();
+    const withItems = await downloadText();
+    await dialog.getByRole('button', { name: 'Close' }).click();
+    await dialog.waitFor({ state: 'detached', timeout: 5000 }).catch(() => {});
+    await sleep(500);
+    check('v85 #148 Show items lists the items under the invoice, on screen and in the Statement PDF',
+      /Smoke Widget x 2 Nos/.test(itemLine) && /1,000/.test(itemLine) && withItems.text.includes('Smoke Widget x 2 Nos') && !plain.text.includes('Smoke Widget x 2 Nos'),
+      `screen="${itemLine}" pdf=${withItems.text.includes('Smoke Widget x 2 Nos')} without=${plain.text.includes('Smoke Widget x 2 Nos')}`);
+
+    await page.getByRole('button', { name: /^Payment history \(1\)/ }).click();
+    const history = (await page.getByRole('table', { name: 'Payment history' }).innerText({ timeout: 5000 }).catch(() => '')).replace(/\s+/g, ' ');
+    const lastPaid = (await page.locator('tr', { hasText: 'SMK-157/1' }).first().innerText()).includes('Last paid');
+    check('v85 #157 the client shows a payment history (invoice, amount, mode, note) and the invoice its Last paid date',
+      history.includes('SMK-157/1') && /500/.test(history) && history.includes('UPI') && history.includes('Smoke part payment') && lastPaid, `${history.slice(0, 160)} lastPaid=${lastPaid}`);
+
+    // New Invoice for the Wholesale client.
+    await page.evaluate(() => { sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', 'new'); });
+    await page.reload({ waitUntil: 'networkidle' });
+    await sleep(2500);
+    await dismissFirstRun(page);
+    await page.waitForSelector('#invoice-preview', { timeout: 30000 });
+    await page.locator('input[placeholder="Type client name to search or add new"]').fill('Smoke Ledger');
+    await page.locator('.client-suggestion-item', { hasText: CLIENT }).first().click();
+    await sleep(500);
+    const row157 = page.locator('.line-item-row').first();
+    await row157.locator('textarea.line-item-name').first().fill('Smoke Level');
+    await page.locator('.product-suggestion-item', { hasText: 'Smoke Level Widget' }).first().dispatchEvent('mousedown');
+    await sleep(600);
+    const nums157 = row157.locator('input[type="number"]');
+    const rate157 = await nums157.nth(1).inputValue();
+    check('v85 price levels: a product picked for a Wholesale client comes in at its Wholesale price (80, not the selling price 100)', Number(rate157) === 80, `rate=${rate157}`);
+    await sleep(800);
+    const warnBefore = await page.getByTestId('credit-limit-warning').count();
+    await nums157.nth(0).fill('5'); // 5 x 80 + 18% = 472; 680 + 472 = 1152 > 1000
+    await sleep(1200);
+    const warnText = await page.getByTestId('credit-limit-warning').innerText({ timeout: 5000 }).catch(() => '');
+    check('v85 credit limit: no warning while within the limit; over it, a warning by how much (152) near the totals, and Save is still there',
+      warnBefore === 0 && /Over the credit limit by .*152/.test(warnText) && (await page.getByRole('button', { name: /^Save$/ }).first().isEnabled()),
+      `before=${warnBefore} text="${warnText.replace(/\s+/g, ' ').slice(0, 140)}"`);
+
+    await page.evaluate(async (keep) => {
+      sessionStorage.removeItem('gst_invoiceDraft');
+      sessionStorage.setItem('gst_currentView', 'dashboard');
+      if (keep.m === null) localStorage.removeItem('gst_enabledModules'); else localStorage.setItem('gst_enabledModules', keep.m);
+      if (keep.l === null) localStorage.removeItem('gst_priceLevels'); else localStorage.setItem('gst_priceLevels', keep.l);
+      await fetch('/api/clients/smoketest-cli-157', { method: 'DELETE' });
+    }, keep157);
+  }
+
+  // ---- v1.10.85 (#148, #142): stock - a second unit (Box = 12) on an
+  // invoice, categories and brands as filters, Adjust stock, the serial number
+  // trail, and low stock -> a purchase order.
+  {
+    const get148 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const stock148 = async (id) => (await get148('/api/products')).find((x) => x.id === id)?.stock;
+    const modules148 = await page.evaluate(() => localStorage.getItem('gst_enabledModules'));
+    await page.evaluate(() => {
+      const m = JSON.parse(localStorage.getItem('gst_enabledModules') || '{}');
+      localStorage.setItem('gst_enabledModules', JSON.stringify({ ...m, purchaseOrders: true, inventory: true, purchases: true }));
+    });
+    await api('/api/products', { id: 'smoketest-box148', name: 'Smoke Box Pen', hsn: '9608', sellingPrice: 10, rate: 10, purchasePrice: 6, taxPercent: 18, unit: 'Pcs', stock: 100,
+      altUnit: 'Box', altFactor: 12, category: 'Smoke Stationery > Pens > Gel', brand: 'SmokeBrand' });
+    await api('/api/products', { id: 'smoketest-shirt148', name: 'Smoke Formal Shirt', hsn: '6205', sellingPrice: 800, rate: 800, purchasePrice: 500, taxPercent: 5, unit: 'Pcs', stock: 1,
+      category: 'Smoke Garments > Men > Shirts > Formal', brand: 'SmokeWear' });
+    const toView148 = async (view) => {
+      await page.evaluate((v) => { sessionStorage.removeItem('gst_editingBill'); sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.setItem('gst_currentView', v); }, view);
+      await page.reload({ waitUntil: 'networkidle' });
+      await sleep(2500);
+      await dismissFirstRun(page);
+    };
+
+    // #148 a box on an invoice: rate 12 x 10, and 2 boxes take 24 out of stock.
+    await openDraft({
+      invoiceType: 'tax-invoice',
+      client: { name: 'Smoke Test Client', address: '', city: '', pin: '', state: 'Punjab', gstin: '', country: 'India', email: '', phone: '', isSEZ: false },
+      details: { invoiceDate: today, placeOfSupply: 'Punjab' },
+      items: [{ id: 'box148', productId: 'smoketest-box148', name: 'Smoke Box Pen', hsn: '9608', quantity: 2, rate: 10, taxPercent: 18, discount: 0, unit: 'Pcs' }],
+      taxInclusive: false,
+    });
+    const row148 = page.locator('.line-item-row').first();
+    await row148.locator('label:text("Unit") + select').selectOption('Box');
+    await sleep(600);
+    const rate148 = await row148.locator('.line-item-rate').inputValue();
+    check('v85 #148 picking Box on an invoice line bills by the box: rate 12 x 10 = 120', Number(rate148) === 120, `rate=${rate148}`);
+    await page.getByRole('button', { name: /^Save$/ }).first().click();
+    await sleep(3500);
+    check('v85 #148 saving 2 boxes takes 24 pens out of stock (100 -> 76)', (await stock148('smoketest-box148')) === 76, `stock=${await stock148('smoketest-box148')}`);
+
+    // #142 Products: the category filter takes in the sub-levels; Adjust stock.
+    await toView148('inventory');
+    await page.getByLabel('Category', { exact: true }).selectOption('Smoke Garments');
+    await sleep(400);
+    const shownNames = await page.locator('table.data-table tbody td.font-medium').allInnerTexts();
+    check('v85 #142 Products: category "Smoke Garments" shows the shirt (Garments > Men > Shirts > Formal), not the pen',
+      shownNames.some((t) => t.includes('Smoke Formal Shirt')) && !shownNames.some((t) => t.includes('Smoke Box Pen')), shownNames.join(' | ').slice(0, 200));
+    await page.getByLabel('Category', { exact: true }).selectOption('');
+    await page.getByRole('button', { name: 'Adjust stock of Smoke Box Pen' }).click();
+    await page.locator('#adj-reason').selectOption('damaged');
+    await page.locator('#adj-qty').fill('6');
+    await page.getByRole('button', { name: 'Save adjustment' }).click();
+    await sleep(2000);
+    const adj148 = (await get148('/api/stock-adjustments')).filter((a) => a.productId === 'smoketest-box148');
+    check('v85 Adjust stock: 6 damaged pens are written off (76 -> 70) and kept as their own record',
+      (await stock148('smoketest-box148')) === 70 && adj148.length === 1 && adj148[0].quantity === -6 && adj148[0].reason === 'damaged',
+      `stock=${await stock148('smoketest-box148')} adj=${JSON.stringify(adj148.map((a) => [a.quantity, a.reason]))}`);
+
+    // Low stock -> Make purchase order: the PO form opens with the shirt in it.
+    await page.getByLabel('Low stock only').check();
+    await sleep(300);
+    await page.getByRole('button', { name: /Make purchase order/ }).first().click();
+    await sleep(3500);
+    const poNames = await page.evaluate(() => [...document.querySelectorAll('input[data-list="fgsb-item-history"]')].map((i) => i.value));
+    check('v85 low stock -> Make purchase order opens the PO form with the low product in it', poNames.includes('Smoke Formal Shirt'), JSON.stringify(poNames));
+    await page.getByRole('button', { name: /^Cancel$/ }).first().click().catch(() => {});
+
+    // #142 Reports: a serial number shows where it was bought; the category filter.
+    const prof148 = await get148('/api/profile');
+    await api('/api/purchases', { id: 'smoketest-pur148', date: today, supplierName: 'Smoke Serial Supplier', invoiceNumber: 'SMK-SER-148',
+      paymentStatus: 'Unpaid', interstate: false, ownerGstin: prof148.gstin || '', ownerName: prof148.businessName || '',
+      items: [{ name: 'Smoke Formal Shirt', hsn: '6205', quantity: 1, rate: 500, taxPercent: 5, cessPercent: 0, serialNo: 'SMKSER148001' }], totalAmount: 525, totalTax: 25, taxableAmount: 500 });
+    await toView148('reports');
+    await page.getByRole('button', { name: /Product Performance/ }).click();
+    await sleep(800);
+    await page.getByLabel('Serial number', { exact: true }).fill('SMKSER148');
+    await sleep(800);
+    const trailText = await page.getByLabel('Serial number trail').innerText().catch(() => '');
+    check('v85 #142 Reports: a serial number shows the bill it was bought on', /Smoke Serial Supplier/.test(trailText) && /SMK-SER-148/.test(trailText), trailText.replace(/\s+/g, ' ').slice(0, 200));
+    await page.getByLabel('Serial number', { exact: true }).fill('');
+    await page.getByLabel('Category', { exact: true }).selectOption('Smoke Stationery');
+    await sleep(600);
+    const perf = (await page.locator('.glass-panel', { hasText: 'All products' }).last().innerText().catch(() => '')).replace(/\s+/g, ' ');
+    check('v85 #142 Reports: category "Smoke Stationery" lists the pen, sold 24 (2 boxes in pieces), and not the shirt',
+      /Smoke Box Pen/.test(perf) && /\b24\b/.test(perf) && !/Smoke Formal Shirt/.test(perf), perf.slice(0, 220));
+
+    await page.evaluate(async (m) => {
+      if (m === null) localStorage.removeItem('gst_enabledModules'); else localStorage.setItem('gst_enabledModules', m);
+      sessionStorage.removeItem('fgsb_reorderDraft');
+      for (const a of await (await fetch('/api/stock-adjustments')).json()) {
+        if (String(a.productId).startsWith('smoketest-')) await fetch(`/api/stock-adjustments/${encodeURIComponent(a.id)}`, { method: 'DELETE' });
+      }
+    }, modules148);
+  }
+
+  // ---- v1.10.86 (#189, #194, #175): the MRP column prints a product's MRP;
+  // the supplier statement lists a bill and its payment with what is owed,
+  // and opens its PDF in the preview; a GSTR-2B "2B only" row opens a filled
+  // purchase bill which, once saved, shows as matched.
+  {
+    const get86 = (url) => page.evaluate(async (url) => (await fetch(url)).json(), url);
+    const prof86 = await get86('/api/profile');
+    const owner86 = { ownerGstin: prof86.gstin || '', ownerName: prof86.businessName || '' };
+    const keepOpts86 = await page.evaluate(() => localStorage.getItem('freegstbill_invoiceOptions'));
+    await api('/api/products', { id: 'smoketest-mrp86', name: 'Smoke MRP Pen', hsn: '9608', sellingPrice: 10, rate: 10, mrp: 15, taxPercent: 18, unit: 'Nos' });
+    await page.evaluate(() => {
+      const o = JSON.parse(localStorage.getItem('freegstbill_invoiceOptions') || '{}');
+      localStorage.setItem('freegstbill_invoiceOptions', JSON.stringify({ ...o, showMRP: true }));
+      sessionStorage.removeItem('gst_invoiceDraft'); sessionStorage.removeItem('gst_editingBill');
+    });
+    await page.reload({ waitUntil: 'networkidle' });
+    await reopenView('New Invoice');
+    const name86 = page.locator('.line-item-name').first();
+    await name86.click(); await name86.fill('Smoke MRP P'); await sleep(600);
+    await name86.press('ArrowDown'); await name86.press('Enter'); await sleep(800);
+    const mrp86 = await page.locator('.line-item-mrp').first().inputValue().catch(() => '');
+    const prev86 = (await page.locator('.invoice-preview-container').first().innerText().catch(() => '')).replace(/\s+/g, ' ');
+    check('v86 #189 picking a product brings its MRP onto the line, and the MRP column prints it',
+      mrp86 === '15' && /\bMRP\b/.test(prev86) && /15\.00/.test(prev86), `mrp=${mrp86} ${prev86.slice(0, 200)}`);
+    await page.evaluate((o) => {
+      if (o === null) localStorage.removeItem('freegstbill_invoiceOptions'); else localStorage.setItem('freegstbill_invoiceOptions', o);
+      sessionStorage.removeItem('gst_invoiceDraft');
+    }, keepOpts86);
+    await page.reload({ waitUntil: 'networkidle' });
+
+    await api('/api/purchases', { id: 'smoketest-pur86', ...owner86, date: today, supplierName: 'Smoke Statement Supplier', supplierGstin: '27AAAAA0000A1Z5',
+      invoiceNumber: 'SMK-ST-86', paymentStatus: 'Partial', interstate: true, paidAmount: 500,
+      items: [{ name: 'Smoke Ink', hsn: '3215', quantity: 1, rate: 1000, taxPercent: 18, cessPercent: 0 }], totalAmount: 1180, totalTax: 180, taxableAmount: 1000,
+      payments: [{ id: 'smoketest-pp86', amount: 500, date: today, mode: 'upi', reference: 'SMKUTR86' }] });
+    await reopenView('Purchases');
+    await page.getByRole('button', { name: /Supplier statement/ }).click();
+    await sleep(800);
+    await page.locator('#sst-supplier').selectOption('Smoke Statement Supplier');
+    await sleep(300);
+    const st86 = (await page.locator('.supplier-statement').innerText()).replace(/\s+/g, ' ');
+    check('v86 #194 supplier statement: the bill, the payment and the closing amount owed',
+      /Purchase bill SMK-ST-86/.test(st86) && /Paid \(UPI SMKUTR86\)/.test(st86) && /Closing balance ₹680\.00 you owe/.test(st86), st86.slice(-240));
+    await page.getByRole('button', { name: /Statement PDF/ }).click();
+    await sleep(1500);
+    check('v86 #194 the statement PDF opens in the preview (Download, Print, WhatsApp, Email)',
+      await page.locator('iframe[title="Statement: Smoke Statement Supplier"]').count() === 1 && await page.getByRole('button', { name: /^WhatsApp$/ }).count() > 0);
+    await page.keyboard.press('Escape');
+    await sleep(300);
+    await page.locator('.modal-content').filter({ hasText: 'Supplier statement' }).getByRole('button', { name: 'Close' }).click();
+    await sleep(300);
+
+    const twoB86 = { data: { gstin: prof86.gstin || '', rtnprd: '', docdata: { b2b: [{ ctin: '27AAAAA0000A1Z5', trdnm: 'Smoke 2B Supplier',
+      inv: [{ inum: 'SMK-2B-86', dt: today.split('-').reverse().join('-'), val: 1180, pos: '27', rev: 'N', itcavl: 'Y', items: [{ num: 1, rt: 18, txval: 1000, igst: 180, cess: 0 }] }] }] } } };
+    await reopenView('GST Returns');
+    await page.getByRole('button', { name: /GSTR-2B Reconciliation/ }).click();
+    await sleep(500);
+    await page.locator('input[type=file][accept=".json,application/json"]').setInputFiles({ name: 'smoke-2b.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(twoB86)) });
+    await sleep(800);
+    await page.locator('tr', { hasText: 'SMK-2B-86' }).getByRole('button', { name: 'Add as purchase bill' }).click();
+    await sleep(2500);
+    const form86 = page.locator('.modal-content').filter({ hasText: 'Add Purchase Bill' });
+    const vals86 = await form86.locator('input').evaluateAll((els) => els.map((e) => e.value));
+    check('v86 #175 Add as purchase bill opens the form filled in from 2B (supplier, GSTIN, number, date, one line at 18%)',
+      ['Smoke 2B Supplier', '27AAAAA0000A1Z5', 'SMK-2B-86', today, 'Purchase at 18% GST (from GSTR-2B)', '1000'].every((v) => vals86.includes(v)), JSON.stringify(vals86).slice(0, 240));
+    await form86.getByRole('button', { name: /^Save$/ }).click();
+    await sleep(3000);
+    const row86 = (await page.locator('tr', { hasText: 'SMK-2B-86' }).first().innerText().catch(() => '')).replace(/\s+/g, ' ');
+    const placeholder86 = (await get86('/api/products')).some((p) => /GSTR-2B/.test(p.name || ''));
+    check('v86 #175 after Save it is back on GSTR-2B and the entry is matched; no "(from GSTR-2B)" product was made',
+      /Matched/.test(row86) && !placeholder86, `${row86} placeholder=${placeholder86}`);
+    await page.evaluate(async () => {
+      for (const p of await (await fetch('/api/purchases')).json()) {
+        if (p.invoiceNumber === 'SMK-2B-86') await fetch(`/api/purchases/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+      }
+      sessionStorage.removeItem('fgsb_gstr2bFile');
+    });
+  }
+
+  // v1.10.86 #214 #202 #199 #209 - opening balance, receipt series, purchase line product, Table 14.
+  await runV86bChecks({ page, APP, check, sleep });
 
   // Put the real business details back.
   await page.evaluate(async (prof) => {

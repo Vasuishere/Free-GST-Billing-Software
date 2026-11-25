@@ -1,10 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from 'react';
 import QRCode from 'qrcode';
 import SignatureImages from './SignatureImages';
 import DOMPurify from 'dompurify';
-import { numberToWords, printedSubtotal, formatCurrency, INVOICE_TYPES, getCountryConfig, CURRENCY_NAMES, formatExchangeRateLine, getAccountById, getPaperSize, resolveLineDiscount, htmlHasText, splitNumberedTerms, invoiceOptionOn, DEFAULT_DECLARATION, filledOrderDetails, formatShortDate } from '../utils';
+import { sectionPrint, numberToWords, printedSubtotal, formatCurrency, INVOICE_TYPES, getCountryConfig, CURRENCY_NAMES, formatExchangeRateLine, getAccountById, getPaperSize, resolveLineDiscount, htmlHasText, splitNumberedTerms, invoiceOptionOn, DEFAULT_DECLARATION, filledOrderDetails, formatShortDate, isModuleEnabled, getStateCode, COUNTRIES } from '../utils';
+import { getEnabledModules } from '../store';
 import { getPrintSettings, getLabel, formatCurrencyEx, formatDate } from '../utils/printSettings';
 import InvoiceGridLayout, { HsnSummaryTable } from './InvoiceGridLayout';
+import { exportDeclaration } from '../utils/lut';
+import { purposeCodeText } from '../utils/purposeCodes';
+import { sizeLabel, sizePieces, lineSqft, sizeHasDims, rftLabel } from '../utils/glass';
+import { fitItemTable } from '../utils/invoiceFit';
 
 // v1.10.36 — Optional `previewOnly` prop suppresses the internal
 // `id="invoice-preview"`. The parent's on-screen preview keeps the id
@@ -13,11 +18,19 @@ import InvoiceGridLayout, { HsnSummaryTable } from './InvoiceGridLayout';
 // instance renders with previewOnly=true so it doesn't create a
 // duplicate id on the page — HTML-invalid + could confuse getElementById
 // lookups.
-const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details, items, totals, invoiceType = 'tax-invoice', customTerms, customNotes, extraSections = [], options = {}, previewOnly = false, cancelled = false }, ref) => {
+const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details, items, totals, invoiceType = 'tax-invoice', customTerms, customNotes, extraSections = [], options = {}, previewOnly = false, cancelled = false, einvoice = null }, ref) => {
   // v1.10.76 - the business profile can still be loading on the first render
   // (a page refresh while editing an invoice), and reading a bank field from
   // null blanked the whole app. Empty until it arrives.
   const profile = profileProp || {};
+  // v1.10.86 (#188) - the item table steps down to a tighter size when its
+  // columns need more room than the sheet has (see utils/invoiceFit.js).
+  const sheetRef = useRef(null);
+  const setSheetRef = useCallback((el) => {
+    sheetRef.current = el;
+    if (typeof ref === 'function') ref(el); else if (ref) ref.current = el;
+  }, [ref]);
+  useLayoutEffect(() => { fitItemTable(sheetRef.current); });
   // Interstate detection must match InvoiceGenerator.jsx — it honours
   // details.placeOfSupply (POS override) and client.isSEZ (SEZ supplies
   // are always interstate regardless of physical state). Without this
@@ -64,13 +77,29 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
   // before; users opt INTO hiding fields via Customize.
   const opt = (key, fallback = true) => options[key] !== undefined ? options[key] : fallback;
   const showGST = opt('showGST', typeConfig.showGST);
+  // v1.10.84 (#152) - hides only the per-line tax columns; GST is still
+  // charged and shown in the totals. showGST is what turns GST off.
+  const showTaxCols = showGST && opt('showTaxColumns');
+  const rateBeforeTax = opt('rateBeforeTax', false); // #164, see lineCalc
+  // v1.10.84 (#140) - size lines (glass, mirror) add Size and SQFT columns; the
+  // Qty column then shows their pieces. NA lines (#143) print "-".
+  const hasSize = (items || []).some((i) => i.size);
+  const printedQty = (item) => (item.size ? sizePieces(item)
+    : item.rft ? rftLabel(item) // v1.10.85 - "19.5 sqft" / "27 rft"
+    : item.unit === 'NA' ? '-'
+      : `${item.quantity}${showItemUnit && item.unit ? ` ${item.unit}` : ''}`);
   const showState = opt('showState');
   const showGSTIN = opt('showGSTIN');
   const showPlaceOfSupply = opt('showPlaceOfSupply', showGST);
   const showHSN = opt('showHSN');
+  // v1.10.86 - (#189, #192) MRP column, off unless chosen. Information only:
+  // the rate, tax and totals never use it.
+  const showMRP = opt('showMRP', false);
+  const mrpText = (item) => (Number(item.mrp) > 0 ? fmt(Number(item.mrp)) : '-');
   const showDiscount = opt('showDiscount');
   const showBankDetails = opt('showBankDetails');
-  const showUPI = opt('showUPI');
+  // v1.10.83 - Settings → Features → UPI QR code off hides it on every invoice.
+  const showUPI = opt('showUPI') && isModuleEnabled('upiQr', getEnabledModules());
   const showLogo = opt('showLogo');
   const showSignature = opt('showSignature');
   const showSignatoryText = opt('showSignatoryText');
@@ -102,7 +131,33 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
   // notes carry the same flag, which GSTR-1 reports for them.
   const showReverseChargeLine = isIndia && showGST && (invoiceType === 'tax-invoice' || invoiceType === 'credit-note');
   const reverseChargeText = options.reverseCharge ? 'Yes' : 'No';
+  // v1.10.83 - Rule 46 endorsement on an export / SEZ invoice: under LUT
+  // (no IGST, with the LUT's ARN) or on payment of IGST. '' otherwise.
+  // v1.10.84 - Customize → "Export / LUT declaration" can hide it (on unless turned off).
+  const exportDecl = opt('showExportDeclaration') ? exportDeclaration({ profile, client, details, totals, options, showGST }) : null;
   const currencySymbol = options.currency || 'INR';
+  // v1.10.83 - a services invoice carries SAC codes only.
+  const hsnHeader = (options.invoiceMode || 'goods') === 'services' ? 'SAC' : 'HSN/SAC';
+  // v1.10.83 - a client abroad: their own tax ID label (VAT number, EIN...)
+  // and country are printed, and an export's place of supply is outside
+  // India (GST code 96), not the client's state.
+  const clientCountry = String(client?.country || '').trim();
+  const clientAbroad = !!clientCountry && clientCountry !== (profile?.country || 'India');
+  const clientTaxIdLabel = getCountryConfig(clientAbroad ? clientCountry : profile?.country).taxIdLabel;
+  const isExportSupply = isIndia && clientAbroad && !getStateCode(String(details?.placeOfSupply || '').trim());
+  const placeOfSupplyText = isExportSupply ? `Outside India (${clientCountry})` : (details?.placeOfSupply || client?.state || '');
+  // The invoice in the business's own currency: "1 USD = 84.1000 INR", plus the
+  // rupee total when Print Settings → Dual currency display is on.
+  const baseCurrency = sellerCC.currency;
+  const exchangeRateLine = options.exchangeRate && currencySymbol !== baseCurrency
+    ? formatExchangeRateLine(currencySymbol, options.exchangeRate, baseCurrency, getPrintSettings().dualCurrencyEnabled ? totals.total : null)
+    : '';
+  // A PayPal / Wise / Payoneer link on the payment account, printed on
+  // invoices in a foreign currency (UPI cannot take one).
+  const paymentLink = currencySymbol !== baseCurrency ? String(account?.paymentLink || '').trim() : '';
+  // The RBI purpose code a client abroad quotes on the transfer: the invoice's
+  // own, else the payment account's.
+  const purposeCode = clientAbroad || currencySymbol !== baseCurrency ? String(options.purposeCode || account?.purposeCode || '').trim() : '';
 
   // v1.10.4 — Single read of print settings per render. Prior code
   // called getPrintSettings() at 6 different points, each hitting
@@ -111,6 +166,11 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
   // measurable hot spot. Now: one lookup + downstream aliases keep
   // JSX shape untouched.
   const _ps = getPrintSettings();
+  // Room (px; 794 px = 210 mm) to leave above the e-invoice block so the
+  // PDF's copy label (drawn 4-10 mm from the top) does not cover its QR code.
+  const copyLabelGap = _ps.multiCopyEnabled && Number(_ps.multiCopyCount) > 1
+    ? Math.max(0, Math.round((12 - (Number(_ps.marginTop) || 0)) * 3.78 / Math.max(0.5, Number(_ps.pdfFontScale) || 1)))
+    : 0;
 
   // Print Settings -> Formatting (number grouping, decimals, symbol position,
   // date format) was saved but never used on the invoice. The defaults keep
@@ -182,6 +242,17 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
       .catch(() => setQrDataUrl(''));
   }, [showUPI, upiId, profile?.businessName, upiAmount, details?.invoiceNumber, currencySymbol]);
 
+  // v1.10.83 (#111) - an invoice with an IRN prints the IRN, Ack No, Ack Date
+  // and a QR code of the portal's Signed QR Code: that is what makes the
+  // printed e-invoice valid. Made synchronously (the callback form of
+  // toDataURL runs at once), so a PDF captured right after render has it.
+  const einv = einvoice?.irn ? einvoice : null;
+  const irnQr = useMemo(() => {
+    let url = '';
+    if (einv?.signedQr) QRCode.toDataURL(einv.signedQr, { errorCorrectionLevel: 'L', margin: 1, width: 360 }, (err, u) => { url = err ? '' : u; });
+    return url;
+  }, [einv?.signedQr]);
+
   const accentColors = {
     'tax-invoice': '#1e40af',
     'proforma': '#7c3aed',
@@ -207,7 +278,14 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
   const pdfStyleVariant = pdfStyleRaw; // full value for CSS class targeting
 
   // Check if any item has discount
-  const hasAnyDiscount = showDiscount && items.some(item => (item.discount || 0) > 0);
+  // v1.10.85 (#190) - or a part of a whole-bill discount taken before GST, so
+  // Qty x Rate - Disc. = Amount on every line.
+  const hasAnyDiscount = showDiscount && items.some(item => (item.discount || 0) > 0 || (item.billDiscShare || 0) > 0);
+  // v1.10.85 (#190) - the before-GST bill discount is inside totalDiscount;
+  // printed on its own line, the line discounts on theirs.
+  const tradeDisc = Number(totals?.billDiscountBeforeGst) || 0;
+  const lineDisc = Math.round(((Number(totals?.totalDiscount) || 0) - tradeDisc) * 100) / 100;
+  const tradeDiscLabel = `Trade discount (before GST)${totals?.invoiceDiscountType === 'percent' && totals?.invoiceDiscountValue > 0 ? ` (${totals.invoiceDiscountValue}%)` : ''}`;
 
   // v1.10.73 - one per-line calculation for every design, the item table and
   // the HSN/SAC summary, so they can never disagree with each other.
@@ -219,8 +297,15 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
     const grossAfterDiscount = Math.max(0, (Number(item.quantity) || 0) * (Number(item.rate) || 0) - discount);
     const rate = Number(item.taxPercent) || 0;
     const taxable = inclusive ? grossAfterDiscount / (1 + rate / 100) : grossAfterDiscount;
+    const typedRate = Number(item.rate) || 0;
+    // Zero-rated under a LUT: no tax, so the line prints 0% and no tax.
+    if (totals.lutZeroRated) return { discount, taxable: grossAfterDiscount, tax: 0, rate: 0, shownRate: typedRate, shownDiscount: discount };
     const tax = !showGST ? 0 : (inclusive ? grossAfterDiscount - taxable : taxable * rate / 100);
-    return { discount, taxable, tax, rate };
+    // v1.10.84 (#164) - "Print rates before GST": with prices that include
+    // tax, the Rate (and Disc.) columns print the amount before GST, so
+    // Qty x Rate - Disc. = Amount. Printing only: the totals are unchanged.
+    const exTax = inclusive && rateBeforeTax ? 1 + rate / 100 : 1;
+    return { discount, taxable, tax, rate, shownRate: typedRate / exTax, shownDiscount: discount / exTax };
   };
   // HSN/SAC-wise tax summary (Tally's table under the items). A line counts
   // if it has an HSN/SAC or carries tax; untaxed reimbursements without a
@@ -381,7 +466,8 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
             {showClientAddress && client?.address && <p>{client.address}</p>}
             {showClientAddress && (client?.city || client?.pin) && <p>{[client.city, client.pin].filter(Boolean).join(' - ')}</p>}
             {showState && client?.state && <p>{client.state}</p>}
-            {showGSTIN && client?.gstin && <p>{getCountryConfig(profile?.country).taxIdLabel}: <strong>{client.gstin}</strong></p>}
+            {showClientAddress && clientAbroad && <p>{clientCountry}</p>}
+            {showGSTIN && client?.gstin && <p>{clientTaxIdLabel}: <strong>{client.gstin}</strong></p>}
             {showClientEmail && client?.email && <p>{client.email}</p>}
             {showClientPhone && client?.phone && <p>Ph: {client.phone}</p>}
           </div>
@@ -400,8 +486,9 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
         {showPlaceOfSupply && (
           <div className="inv-party inv-party-right">
             <h4 className="inv-section-label">{getLabel(_ps_labels, 'placeOfSupply')}</h4>
-            <p className="inv-party-name">{details?.placeOfSupply || client?.state || '-'}</p>
-            {showGST && isIndia && isInterstate && <span className="inv-tax-badge">Interstate (IGST)</span>}
+            <p className="inv-party-name">{placeOfSupplyText || '-'}</p>
+            {showGST && isExportSupply && <span className="inv-tax-badge">{totals.lutZeroRated ? 'Export under LUT' : 'Export (IGST)'}</span>}
+            {showGST && isIndia && isInterstate && !isExportSupply && <span className="inv-tax-badge">Interstate (IGST)</span>}
             {showGST && isIndia && !isInterstate && businessState && clientState && <span className="inv-tax-badge inv-tax-badge-green">{totals.isIntraUT ? 'Intra-UT (CGST + UTGST)' : 'Intrastate (CGST + SGST)'}</span>}
             {showGST && !isIndia && <span className="inv-tax-badge inv-tax-badge-green">{taxLabel}</span>}
           </div>
@@ -468,8 +555,11 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
     // Receipts keep their short d/m/yyyy unless a date format was chosen.
     const invoiceDate = !details?.invoiceDate ? ''
       : ((_ps.dateFormat || 'dd-mon-yyyy') !== 'dd-mon-yyyy' ? fmtDate(details.invoiceDate) : new Date(details.invoiceDate).toLocaleDateString('en-IN'));
-    const sellerCurrency = getCountryConfig(profile?.country).currency;
-    const currencySymbol = sellerCurrency === 'INR' ? 'Rs.' : sellerCurrency;
+    // v1.10.83 - the invoice's own currency (a USD bill printed "Rs.").
+    const receiptCurrency = options.currency || getCountryConfig(profile?.country).currency;
+    // A plain-ASCII symbol ($) where there is one: "USD1000.00" did not fit an 80mm line.
+    const asciiSymbol = COUNTRIES.find(c => c.currency === receiptCurrency)?.currencySymbol;
+    const currencySymbol = receiptCurrency === 'INR' ? 'Rs.' : (asciiSymbol && /^[ -~]{1,3}$/.test(asciiSymbol) && asciiSymbol !== receiptCurrency ? asciiSymbol : receiptCurrency);
     const showRoundOff = opt('showRoundOff', false);
     // v1.10.33 — Split the single "isNarrow" threshold into two.
     // Prior code used `widthMm < 80` for everything, but thermal80 has
@@ -618,15 +708,25 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
         <div style={{ padding: secPad, fontSize: '0.95em', fontWeight: baseWeight, ...dashLine }}>
           <div><strong style={{ fontWeight: strongWeight }}>{cap('Invoice #')}: </strong>{cap(invoiceNum)}</div>
           {showReverseChargeLine && <div><strong style={{ fontWeight: strongWeight }}>{cap('Reverse charge')}: </strong>{cap(reverseChargeText)}</div>}
+          {exportDecl && <div style={{ fontSize: '0.85em', marginTop: 2 }}>{cap(exportDecl)}</div>}
           <div><strong style={{ fontWeight: strongWeight }}>{cap('Date')}: </strong>{cap(invoiceDate)}</div>
           {client?.name && (
             <div style={{ marginTop: 3 }}>
               <strong style={{ fontWeight: strongWeight }}>{cap('Bill to')}: </strong>{cap(client.name)}
             </div>
           )}
-          {client?.gstin && <div>{cap('GSTIN: ' + client.gstin)}</div>}
+          {client?.gstin && <div>{cap(`${clientTaxIdLabel}: ${client.gstin}`)}</div>}
           {client?.phone && <div>{cap('Ph: ' + client.phone)}</div>}
         </div>
+
+        {einv && (
+          <div style={{ padding: secPad, fontSize: '0.85em', textAlign: 'center', wordBreak: 'break-all', ...dashLine }}>
+            <div><strong style={{ fontWeight: strongWeight }}>IRN: </strong>{einv.irn}</div>
+            <div><strong style={{ fontWeight: strongWeight }}>{cap('Ack No')}: </strong>{einv.ackNo}</div>
+            <div><strong style={{ fontWeight: strongWeight }}>{cap('Ack Date')}: </strong>{einv.ackDate}</div>
+            {irnQr && <img src={irnQr} alt="E-invoice QR code" style={{ width: 130, maxWidth: '100%', marginTop: 4 }} />}
+          </div>
+        )}
 
         {/* ================= ITEMS =================
              CSS Grid with a FIXED-WIDTH amount column so every amount lines
@@ -652,8 +752,20 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                 const amount = (Number(item.quantity) || 0) * (Number(item.rate) || 0);
                 const qty = Number(item.quantity) || 0;
                 const rate = Number(item.rate) || 0;
-                const tax = showGST && item.taxPercent > 0 ? ` +${item.taxPercent}%` : '';
+                // v1.10.83 - no "+18%" on an export under LUT: no tax is charged.
+                const tax = showTaxCols && item.taxPercent > 0 && !totals?.lutZeroRated ? ` +${item.taxPercent}%` : '';
                 const hsnBit = showHSN && item.hsn && !isVeryNarrow ? '  |  HSN ' + item.hsn : '';
+                // v1.10.86 - (#189) on a receipt the MRP goes on the item's own line.
+                const mrpBit = showMRP && Number(item.mrp) > 0 ? `  |  MRP ${currencySymbol}${Number(item.mrp).toFixed(2)}` : '';
+                // v1.10.83 - the receipt follows Customize → Unit too.
+                const unitBit = opt('showItemUnit') && item.unit ? ' ' + item.unit : '';
+                // #143 - unit NA has no quantity; the receipt shows the rate only.
+                // #140 - a size line: "25 x 30 x 2 = 12.5 sqft" (a manual one has no rate).
+                const qtyBit = item.size
+                  ? `${sizeHasDims(item.size) ? `${sizeLabel(item.size)} x ${sizePieces(item)} = ` : ''}${lineSqft(item)} sqft`
+                  : item.rft ? rftLabel(item)
+                  : item.unit === 'NA' ? '' : `${qty}${unitBit}`;
+                const showLineRate = showRate && !item.size?.manual;
                 return (
                   <div key={idx} style={{ marginBottom: 5, fontSize: '0.95em' }}>
                     <div style={{ fontWeight: strongWeight, wordBreak: 'break-word' }}>
@@ -664,9 +776,9 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                       fontSize: '0.92em', paddingLeft: thermalCompact ? 0 : 8, fontWeight: baseWeight,
                     }}>
                       <span style={{ wordBreak: 'break-word' }}>
-                        {cap(showRate
-                          ? `${qty}${item.unit ? ' ' + item.unit : ''} × ${currencySymbol}${rate.toFixed(2)}${tax}${hsnBit}`
-                          : `${qty}${item.unit ? ' ' + item.unit : ''}${hsnBit}`)}
+                        {cap(showLineRate
+                          ? `${qtyBit ? `${qtyBit} × ` : ''}${currencySymbol}${rate.toFixed(2)}${tax}${hsnBit}${mrpBit}`
+                          : `${qtyBit}${hsnBit}${mrpBit}`.trim())}
                       </span>
                       <span style={{ textAlign: 'right', fontWeight: strongWeight }}>{currencySymbol}{amount.toFixed(2)}</span>
                     </div>
@@ -691,10 +803,16 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                 <span>{cap('Subtotal')}</span>
                 <span style={{ textAlign: 'right' }}>{amt(printedSubtotal(totals))}</span>
               </div>
-              {Number(totals?.totalDiscount) > 0 && (
+              {lineDisc > 0 && (
                 <div style={rowStyle}>
                   <span>{cap('Discount')}</span>
-                  <span style={{ textAlign: 'right' }}>-{amt(totals.totalDiscount)}</span>
+                  <span style={{ textAlign: 'right' }}>-{amt(lineDisc)}</span>
+                </div>
+              )}
+              {tradeDisc > 0 && (
+                <div style={rowStyle}>
+                  <span>{cap(tradeDiscLabel)}</span>
+                  <span style={{ textAlign: 'right' }}>-{amt(tradeDisc)}</span>
                 </div>
               )}
               {showGST && Number(totals?.cgst) > 0 && (
@@ -800,6 +918,12 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
               }</div>
             )}
             {(account?.ifsc || profile?.ifsc) && <div>{cap('IFSC: ' + (account?.ifsc || profile?.ifsc))}</div>}
+          </div>
+        )}
+        {/* v1.10.83 - the online payment link of a foreign-currency bill. */}
+        {paymentLink && (
+          <div style={{ padding: secPad, fontSize: '0.9em', fontWeight: baseWeight, wordBreak: 'break-all', ...dashLine }}>
+            {cap('Pay online: ')}{paymentLink}
           </div>
         )}
 
@@ -984,6 +1108,9 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
     : null;
   const gridNotices = (
     <>
+      {exportDecl && (
+        <div data-pdf-page-boundary="" style={{ margin: '2px 0 6px', fontSize: '0.85em' }}>{exportDecl}</div>
+      )}
       {options.reverseCharge && isIndia && showGST && (
         <div data-pdf-page-boundary="" style={{ margin: '2px 0 6px', fontSize: '0.92em' }}>
           <strong>Reverse Charge applicable.</strong> GST is payable by the recipient under Section 9(3)/9(4) of the CGST Act.
@@ -994,10 +1121,8 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
           &quot;Composition taxable person, not eligible to collect tax on supplies.&quot; (Rule 46A, CGST Rules)
         </div>
       )}
-      {options.exchangeRate && currencySymbol !== 'INR' && (
-        <div data-pdf-page-boundary="" style={{ margin: '2px 0 6px', fontSize: '0.92em' }}>
-          {formatExchangeRateLine(currencySymbol, options.exchangeRate, profile?.country === 'India' || !profile?.country ? 'INR' : sellerCC.currency)}
-        </div>
+      {exchangeRateLine && (
+        <div data-pdf-page-boundary="" style={{ margin: '2px 0 6px', fontSize: '0.92em' }}>{exchangeRateLine}</div>
       )}
     </>
   );
@@ -1011,8 +1136,8 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
     words: (n) => (currencySymbol === 'INR' ? `INR ${numberToWords(n)}` : amountInWords(n)),
     shortDate: formatShortDate,
     isServices: (options.invoiceMode || 'goods') === 'services',
-    docLabel: ({ quotation: 'Quotation', proforma: 'Proforma', 'credit-note': 'Credit Note', 'delivery-challan': 'Challan' })[invoiceType] || 'Invoice',
-    placeOfSupply: details?.placeOfSupply || client?.state || '',
+    docLabel: ({ quotation: 'Quotation', proforma: 'Proforma', 'credit-note': 'Credit Note', 'delivery-challan': 'Challan', 'sales-order': 'Sales Order' })[invoiceType] || 'Invoice',
+    placeOfSupply: placeOfSupplyText, clientAbroad, clientCountry, clientTaxIdLabel, paymentLink, purposeCode,
     shipTo: shipToParty,
     sig: gridSig,
     notices: gridNotices,
@@ -1024,7 +1149,7 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
       businessPhone: showBusinessPhone, businessEmail: showBusinessEmail, gstin: showGSTIN, state: showState,
       clientAddress: showClientAddress, clientPhone: showClientPhone, clientEmail: showClientEmail,
       placeOfSupply: showPlaceOfSupply, invoiceNumber: showInvoiceNumber, invoiceDate: showInvoiceDate, dueDate: showDueDate,
-      hsn: showHSN, itemQty: showItemQty, itemUnit: showItemUnit, rate: showRateColumn,
+      hsn: showHSN, itemQty: showItemQty, itemUnit: showItemUnit, rate: showRateColumn, mrp: showMRP,
     },
   } : null;
 
@@ -1034,7 +1159,7 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
       data-user-colors={_ps_final.userColorsEnabled ? '1' : '0'}
       data-row-density={_ps_final.rowDensity || 'normal'}
       data-header-compact={_ps_final.headerCompact ? '1' : '0'}
-      ref={ref} {...(previewOnly ? {} : { id: 'invoice-preview' })} style={finalContainerStyle}>
+      ref={setSheetRef} {...(previewOnly ? {} : { id: 'invoice-preview' })} style={finalContainerStyle}>
       {cancelled && (
         <div aria-hidden="true" style={{
           position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
@@ -1048,6 +1173,21 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
             border: '6px solid rgba(220, 38, 38, 0.22)', borderRadius: 14,
             padding: '0.3rem 1.6rem',
           }}>CANCELLED</span>
+        </div>
+      )}
+      {/* v1.10.83 (#111) - one block, at the top of every design. */}
+      {/* v1.10.84 - reported (email, Bir Pandey): the copy label ("ORIGINAL
+          FOR RECIPIENT"), stamped on the PDF's top-right corner 4-10 mm from
+          the top, sat on the IRN QR code. With copy labels on, the block
+          starts below the label (about 12 mm, less any top print margin). */}
+      {einv && (
+        <div data-pdf-page-boundary="" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '1rem', padding: '0.6rem 1.25rem', ...(copyLabelGap ? { paddingTop: copyLabelGap } : {}), borderBottom: '1px solid #cbd5e1', fontSize: '0.72rem', color: '#0f172a', lineHeight: 1.6 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 700, letterSpacing: '0.04em', color: '#334155' }}>E-INVOICE</div>
+            <div><strong>IRN:</strong> <span style={{ wordBreak: 'break-all' }}>{einv.irn}</span></div>
+            <div><strong>Ack No:</strong> {einv.ackNo}<span style={{ marginLeft: '1.25rem' }}><strong>Ack Date:</strong> {einv.ackDate}</span></div>
+          </div>
+          {irnQr && <img src={irnQr} alt="E-invoice QR code" style={{ width: 120, height: 120, flexShrink: 0 }} />}
         </div>
       )}
       {isGrid && <InvoiceGridLayout ctx={gridCtx} />}
@@ -1089,14 +1229,17 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
       {/* Items table */}
       <table className="inv-table" style={{ tableLayout: 'auto', ...(pdfStyle === 'modern' ? { margin: '0 2rem', width: 'calc(100% - 4rem)' } : pdfStyle === 'minimal' ? { margin: '0 2rem', width: 'calc(100% - 4rem)', borderTop: 'none' } : {}) }}>
         <thead>
-          {showGST ? (
+          {showTaxCols ? (
             isIndia && isInterstate ? (
               <>
                 <tr>
                   <th className="inv-th" rowSpan="2">#</th>
                   <th className="inv-th" rowSpan="2">Description</th>
-                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">HSN/SAC</th>}
+                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">{hsnHeader}</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">Size</th>}
                   {showItemQty && <th className="inv-th inv-th-center" rowSpan="2">Qty</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">SQFT</th>}
+                  {showMRP && <th className="inv-th inv-th-right" rowSpan="2">MRP</th>}
                   {showRateColumn && <th className="inv-th inv-th-right" rowSpan="2">Rate</th>}
                   {hasAnyDiscount && <th className="inv-th inv-th-right" rowSpan="2">Disc.</th>}
                   <th className="inv-th inv-th-center" colSpan="2" style={{ borderBottom: '1px solid #cbd5e1' }}>IGST</th>
@@ -1112,8 +1255,11 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                 <tr>
                   <th className="inv-th" rowSpan="2">#</th>
                   <th className="inv-th" rowSpan="2">Description</th>
-                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">HSN/SAC</th>}
+                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">{hsnHeader}</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">Size</th>}
                   {showItemQty && <th className="inv-th inv-th-center" rowSpan="2">Qty</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">SQFT</th>}
+                  {showMRP && <th className="inv-th inv-th-right" rowSpan="2">MRP</th>}
                   {showRateColumn && <th className="inv-th inv-th-right" rowSpan="2">Rate</th>}
                   {hasAnyDiscount && <th className="inv-th inv-th-right" rowSpan="2">Disc.</th>}
                   <th className="inv-th inv-th-center" colSpan="2" style={{ borderBottom: '1px solid #cbd5e1' }}>CGST</th>
@@ -1133,8 +1279,11 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                 <tr>
                   <th className="inv-th" rowSpan="2">#</th>
                   <th className="inv-th" rowSpan="2">Description</th>
-                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">HSN/SAC</th>}
+                  {showHSN && <th className="inv-th inv-th-center" rowSpan="2">{hsnHeader}</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">Size</th>}
                   {showItemQty && <th className="inv-th inv-th-center" rowSpan="2">Qty</th>}
+                  {hasSize && <th className="inv-th inv-th-center" rowSpan="2">SQFT</th>}
+                  {showMRP && <th className="inv-th inv-th-right" rowSpan="2">MRP</th>}
                   {showRateColumn && <th className="inv-th inv-th-right" rowSpan="2">Rate</th>}
                   {hasAnyDiscount && <th className="inv-th inv-th-right" rowSpan="2">Disc.</th>}
                   <th className="inv-th inv-th-center" colSpan="2" style={{ borderBottom: '1px solid #cbd5e1' }}>{taxLabel}</th>
@@ -1150,8 +1299,11 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
             <tr>
               <th className="inv-th">#</th>
               <th className="inv-th">Description</th>
-              {showHSN && <th className="inv-th inv-th-center">HSN/SAC</th>}
+              {showHSN && <th className="inv-th inv-th-center">{hsnHeader}</th>}
+              {hasSize && <th className="inv-th inv-th-center">Size</th>}
               {showItemQty && <th className="inv-th inv-th-center">Qty</th>}
+              {hasSize && <th className="inv-th inv-th-center">SQFT</th>}
+              {showMRP && <th className="inv-th inv-th-right">MRP</th>}
               {showRateColumn && <th className="inv-th inv-th-right">Rate</th>}
               {hasAnyDiscount && <th className="inv-th inv-th-right">Disc.</th>}
               <th className="inv-th inv-th-right">Amount</th>
@@ -1161,7 +1313,7 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
         <tbody>
           {items.map((item, index) => {
             // Shared with the grid designs and the HSN summary (lineCalc).
-            const { discount, taxable: afterDiscount, tax: taxAmount, rate: taxRate } = lineCalc(item);
+            const { discount, taxable: afterDiscount, tax: taxAmount, rate: taxRate, shownRate, shownDiscount } = lineCalc(item);
             const halfRate = taxRate / 2;
             const halfTax = taxAmount / 2;
             return (
@@ -1180,10 +1332,13 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                   )}
                 </td>
                 {showHSN && <td className="inv-td inv-td-center inv-td-muted">{item.hsn || '-'}</td>}
-                {showItemQty && <td className="inv-td inv-td-center">{item.quantity}{showItemUnit && item.unit ? ` ${item.unit}` : ''}</td>}
-                {showRateColumn && <td className="inv-td inv-td-right">{fmt(item.rate)}</td>}
-                {hasAnyDiscount && <td className="inv-td inv-td-right">{discount > 0 ? fmt(discount) : '-'}</td>}
-                {showGST && (
+                {hasSize && <td className="inv-td inv-td-center">{sizeLabel(item.size)}</td>}
+                {showItemQty && <td className="inv-td inv-td-center">{printedQty(item)}</td>}
+                {hasSize && <td className="inv-td inv-td-center">{item.size ? lineSqft(item).toFixed(2) : ''}</td>}
+                {showMRP && <td className="inv-td inv-td-right">{mrpText(item)}</td>}
+                {showRateColumn && <td className="inv-td inv-td-right">{item.size?.manual ? '-' : fmt(shownRate)}</td>}
+                {hasAnyDiscount && <td className="inv-td inv-td-right">{discount > 0 ? fmt(shownDiscount) : '-'}</td>}
+                {showTaxCols && (
                   isIndia && isInterstate ? (
                     <>
                       <td className="inv-td inv-td-center">{taxRate}%</td>
@@ -1249,10 +1404,16 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
               <span>{fmt(printedSubtotal(totals))}</span>
             </div>
           )}
-          {totals.totalDiscount > 0 && (
+          {lineDisc > 0 && (
             <div className="inv-total-row" style={{ color: '#dc2626' }}>
               <span>Discount</span>
-              <span>- {fmt(totals.totalDiscount)}</span>
+              <span>- {fmt(lineDisc)}</span>
+            </div>
+          )}
+          {tradeDisc > 0 && (
+            <div className="inv-total-row" style={{ color: '#dc2626' }}>
+              <span>{tradeDiscLabel}</span>
+              <span>- {fmt(tradeDisc)}</span>
             </div>
           )}
           {showGST && (
@@ -1289,7 +1450,7 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
           )}
           {totals.tcsAmount > 0 && (
             <div className="inv-total-row">
-              <span>TCS{options.tcsSection ? ` (${options.tcsSection} @ ${options.tcsRate}%)` : ''}</span>
+              <span>TCS{sectionPrint(options.tcsSection, options.tcsRate)}</span>
               <span>{fmt(totals.tcsAmount)}</span>
             </div>
           )}
@@ -1325,7 +1486,7 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
           {totals.tdsAmount > 0 && (
             <>
               <div className="inv-total-row" style={{ color: '#64748b', fontSize: '0.75rem', marginTop: '0.25rem', borderTop: '1px dashed #e2e8f0', paddingTop: '0.4rem' }}>
-                <span>Less: TDS{options.tdsSection ? ` (${options.tdsSection} @ ${options.tdsRate}%)` : ''}</span>
+                <span>Less: TDS{sectionPrint(options.tdsSection, options.tdsRate)}</span>
                 <span>− {fmt(totals.tdsAmount)}</span>
               </div>
               <div className="inv-total-row" style={{ fontWeight: 600, color: '#0f766e', fontSize: '0.78rem' }}>
@@ -1349,6 +1510,15 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
           )}
         </div>
       ) : null}
+
+      {/* v1.10.83 - export / SEZ endorsement (Rule 46). The wording is the
+          rule's, word for word; how it looks is not, so it is one quiet line
+          ("do we need to write the LUT thing this loud?"). */}
+      {exportDecl && (
+        <div style={{ margin: '0 2rem 0.5rem', fontSize: '0.68rem', lineHeight: 1.45, color: '#475569', fontWeight: 400 }}>
+          {exportDecl}
+        </div>
+      )}
 
       {/* Reverse-charge declaration (India) — printed prominently between the
           tax block and the footer when the seller has flagged this invoice as
@@ -1382,40 +1552,45 @@ const InvoicePreview = React.forwardRef(({ profile: profileProp, client, details
                   Pay via: <strong style={{ color: '#334155' }}>{account.label}</strong>
                 </p>
               )}
-              <div className="inv-footer-details">
-                {/* v1.10.37 — Account Holder Name renders FIRST (above
-                    Bank) because clients doing NEFT/RTGS need it for
-                    beneficiary lookup — printing it prominently
-                    prevents the "name mismatch" payment failures
-                    reported by users. Falls back to businessName when
-                    the field is blank so existing accounts render the
-                    same as before. */}
-                {(account?.accountHolderName || profile?.businessName) && (
-                  <p><span className="inv-detail-label">A/C Name:</span> {account?.accountHolderName || profile.businessName}</p>
-                )}
-                <p><span className="inv-detail-label">Bank:</span> {account?.bankName || profile.bankName}</p>
-                <p><span className="inv-detail-label">A/C No:</span> {account?.accountNumber || profile.accountNumber}
-                  {/* v1.10.37 — Account type appended inline next to
-                      the number so it doesn't add a whole extra row on
-                      the PDF. Uses the human label for CC/OD which
-                      won't parse well as an abbreviation to non-banking
-                      readers. */}
-                  {account?.accountType && (
-                    <span style={{ marginLeft: '0.4rem', fontSize: '0.85em', color: '#64748b' }}>
-                      · {({ savings: 'Savings', current: 'Current', cc: 'Cash Credit', od: 'Overdraft', nre: 'NRE', nro: 'NRO' })[account.accountType] || account.accountType}
-                    </span>
-                  )}
-                </p>
-                {(account?.ifsc || profile.ifsc) && <p><span className="inv-detail-label">{sellerCC.bankLabel || 'IFSC'}:</span> {account?.ifsc || profile.ifsc}</p>}
-                {(account?.swift || profile.swift) && <p><span className="inv-detail-label">SWIFT/BIC:</span> {account?.swift || profile.swift}</p>}
-                {profile.pan && isIndia && <p><span className="inv-detail-label">PAN:</span> {profile.pan}</p>}
+              {/* v1.10.84 - one aligned list: labels in one column, every value
+                  lined up in the next (the values sat at different places when a
+                  label was wider than its space). Holder name first: payers need
+                  it for NEFT / RTGS (v1.10.37). Values stay <p> so each design's
+                  own value style applies. */}
+              <div className="inv-footer-details inv-bank-grid">
+                {[
+                  (account?.accountHolderName || profile?.businessName) && ['A/C Name', account?.accountHolderName || profile.businessName],
+                  ['Bank', account?.bankName || profile.bankName],
+                  ['A/C No', <>{account?.accountNumber || profile.accountNumber}
+                    {account?.accountType && (
+                      <span style={{ marginLeft: '0.4rem', fontSize: '0.85em', color: '#64748b' }}>
+                        · {({ savings: 'Savings', current: 'Current', cc: 'Cash Credit', od: 'Overdraft', nre: 'NRE', nro: 'NRO' })[account.accountType] || account.accountType}
+                      </span>
+                    )}</>],
+                  (account?.ifsc || profile.ifsc) && [sellerCC.bankLabel || 'IFSC', account?.ifsc || profile.ifsc],
+                  (account?.swift || profile.swift) && ['SWIFT/BIC', account?.swift || profile.swift],
+                  account?.iban && ['IBAN', account.iban],
+                  purposeCode && ['Purpose code', purposeCodeText(purposeCode)],
+                  profile.pan && isIndia && ['PAN', profile.pan],
+                ].filter(Boolean).map(([label, value]) => (
+                  <React.Fragment key={label}>
+                    <span className="inv-detail-label">{label}</span>
+                    <p>{value}</p>
+                  </React.Fragment>
+                ))}
               </div>
             </div>
           )}
-          {options.exchangeRate && currencySymbol !== 'INR' && (
+          {paymentLink && (
+            <div className="inv-footer-block">
+              <h4 className="inv-section-label">PAY ONLINE</h4>
+              <p className="inv-terms" style={{ wordBreak: 'break-all' }}>{paymentLink}</p>
+            </div>
+          )}
+          {exchangeRateLine && (
             <div className="inv-footer-block">
               <h4 className="inv-section-label">EXCHANGE RATE</h4>
-              <p className="inv-terms">{formatExchangeRateLine(currencySymbol, options.exchangeRate, profile?.country === 'India' || !profile?.country ? 'INR' : sellerCC.currency)}</p>
+              <p className="inv-terms">{exchangeRateLine}</p>
             </div>
           )}
           {/* Terms and notes accept rich HTML; same DOMPurify sanitization the extraSections

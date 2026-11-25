@@ -3,48 +3,40 @@
 // for features (GitHub issue forms), and "What's new" from the CHANGELOG.md
 // that ships with the app. The changelog is shown as text (changelog.js
 // parses it), never as HTML.
+// v1.10.86 - What's new lists only the main titles, with a link to each
+// version's full notes on GitHub.
+// v1.10.86 - "See what's new" opens the slides shown once after an update.
 import { useEffect, useState } from 'react';
-import { Bug, Lightbulb, CalendarClock, ListChecks, Sparkles } from 'lucide-react';
-import { parseChangelog, inlineParts } from '../utils/changelog';
+import { Bug, Lightbulb, CalendarClock, ListChecks, Sparkles, Play } from 'lucide-react';
+import { parseChangelog, releaseTitles } from '../utils/changelog';
+import HelpButton from './HelpButton';
+import WhatsNewSlides from './WhatsNewSlides';
+import { APP_VERSION } from '../utils/problemLog';
 
 const REPO = 'https://github.com/IamRamgarhia/Free-GST-Billing-Software';
 const CHANGELOG_URL = `${REPO}/blob/main/CHANGELOG.md`;
 const card = { padding: '1.25rem 1.5rem' };
 
-function Inline({ text }) {
-  return inlineParts(text).map((p, i) => {
-    if (p.t === 'b') return <strong key={i}>{p.v}</strong>;
-    if (p.t === 'i') return <em key={i}>{p.v}</em>;
-    if (p.t === 'code') return <code key={i}>{p.v}</code>;
-    if (p.t === 'link') return <a key={i} href={p.href} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)' }}>{p.v}</a>;
-    return <span key={i}>{p.v}</span>;
-  });
-}
+// v1.10.86 - only each version's main titles here (maintainer, 14 Nov: "it
+// looks too big"); "Read the full notes" opens that version on GitHub.
+const notesUrl = (version) => `${REPO}/releases/tag/v${encodeURIComponent(version)}`;
 
 function Release({ entry }) {
   return (
-    <>
-      {entry.summary && <p style={{ margin: '0.35rem 0 0.6rem', fontWeight: 600, lineHeight: 1.5 }}><Inline text={entry.summary} /></p>}
-      {entry.sections.map((s) => (
-        <div key={s.title} style={{ marginBottom: '0.6rem' }}>
-          <div style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--text-muted)', margin: '0.5rem 0 0.25rem' }}>{s.title}</div>
-          <ul style={{ margin: 0, paddingLeft: '1.1rem', fontSize: '0.84rem', lineHeight: 1.55 }}>
-            {s.blocks.map((b, i) => (b.kind === 'para'
-              ? <li key={i} style={{ listStyle: 'none', marginLeft: '-1.1rem' }}><Inline text={b.text} /></li>
-              : (
-                <li key={i} style={{ marginBottom: '0.25rem' }}>
-                  <Inline text={b.text} />
-                  {b.children.length > 0 && (
-                    <ul style={{ margin: '0.2rem 0 0', paddingLeft: '1.1rem' }}>
-                      {b.children.map((c, j) => <li key={j}><Inline text={c} /></li>)}
-                    </ul>
-                  )}
-                </li>
-              )))}
+    <div style={{ fontSize: '0.84rem', lineHeight: 1.5 }}>
+      {releaseTitles(entry).map((s) => (
+        <div key={s.title} style={{ marginTop: '0.45rem' }}>
+          <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)' }}>{s.title}</div>
+          <ul style={{ margin: '0.15rem 0 0', paddingLeft: '1.1rem' }}>
+            {s.items.map((t, i) => <li key={i}>{t}</li>)}
+            {s.more > 0 && <li style={{ listStyle: 'none', marginLeft: '-1.1rem', color: 'var(--text-muted)' }}>and {s.more} more</li>}
           </ul>
         </div>
       ))}
-    </>
+      <a href={notesUrl(entry.version)} target="_blank" rel="noopener noreferrer" style={{ display: 'inline-block', marginTop: '0.5rem', color: 'var(--primary)', fontWeight: 600 }}>
+        Read the full notes
+      </a>
+    </div>
   );
 }
 
@@ -52,6 +44,7 @@ const longDate = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString('en-IN'
 
 export default function WhatsNew() {
   const [entries, setEntries] = useState(null);
+  const [slides, setSlides] = useState(null); // the entry shown as slides
   useEffect(() => {
     let live = true;
     fetch('/api/changelog')
@@ -67,7 +60,7 @@ export default function WhatsNew() {
         <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start', flexWrap: 'wrap' }}>
           <CalendarClock size={26} style={{ color: 'var(--primary)', flexShrink: 0, marginTop: 2 }} />
           <div style={{ flex: '1 1 300px', minWidth: 0 }}>
-            <h3 id="weekly-title" style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>A new update every Saturday</h3>
+            <h3 id="weekly-title" style={{ margin: '0 0 0.35rem', fontSize: '1rem' }}>A new update every Saturday <HelpButton title="A new update every Saturday" doc="support#weekly" size={16} /></h3>
             <p style={{ margin: '0 0 0.5rem', color: 'var(--text-secondary)', lineHeight: 1.6, maxWidth: '72ch' }}>
               Every Saturday we release one update with that week&apos;s fixes and new features. The app tells you when it is
               ready: click <b>Update</b> in the sidebar, and your invoices and settings are kept. Anything urgent, such as the
@@ -105,9 +98,14 @@ export default function WhatsNew() {
 
       {entries && entries.length > 0 && (
         <div id="whats-new" className="glass-panel" style={{ ...card, marginBottom: '1.25rem', scrollMarginTop: '1rem' }} aria-labelledby="whats-new-title">
-          <h3 id="whats-new-title" style={{ margin: '0 0 0.25rem', fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <Sparkles size={18} style={{ color: 'var(--primary)' }} /> What&apos;s new
-          </h3>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '0.25rem' }}>
+            <h3 id="whats-new-title" style={{ margin: 0, fontSize: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <Sparkles size={18} style={{ color: 'var(--primary)' }} /> What&apos;s new <HelpButton title="What's new" doc="support#whats-new" size={16} />
+            </h3>
+            <button type="button" className="btn btn-secondary" onClick={() => setSlides(entries.find((e) => e.version === APP_VERSION) || entries[0])}>
+              <Play size={15} /> See what&apos;s new
+            </button>
+          </div>
           <p style={{ margin: '0 0 0.75rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
             The latest updates. Every version since the first is in the <a href={CHANGELOG_URL} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)' }}>full changelog</a>, and the downloads are on <a href={`${REPO}/releases`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--primary)' }}>GitHub Releases</a>.
           </p>
@@ -121,6 +119,7 @@ export default function WhatsNew() {
           ))}
         </div>
       )}
+      {slides && <WhatsNewSlides entry={slides} onClose={() => setSlides(null)} />}
     </>
   );
 }

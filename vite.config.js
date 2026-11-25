@@ -25,6 +25,11 @@ const readActivePort = () => {
 const activeExpressPort = readActivePort();
 
 export default defineConfig({
+  // v1.10.83 - the Problem log stamps each entry with the version of the
+  // bundle that failed; it must not depend on reaching the server.
+  define: {
+    __APP_VERSION__: JSON.stringify(JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8')).version),
+  },
   // Vite source root lives in src/ rather than the project root. Reason:
   // the project root holds the user-facing Launcher (renamed to index.html
   // so users see ONE html file). Keeping Vite's own index.html inside
@@ -141,10 +146,20 @@ export default defineConfig({
         // below (StaleWhileRevalidate for /assets/), so the FIRST print
         // works offline as long as the user has visited that route at
         // least once. Trims initial precache from 1.63 MiB → ~0.85 MiB.
-        globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+        // v1.10.84 - the page itself (index.html) is no longer kept here: it
+        // came from this cache first on every open, so the window opened on the
+        // previous version and only swapped to the new one seconds later. It is
+        // fetched from the app first now (see 'app-page' below).
+        globPatterns: ['**/*.{js,css,ico,png,svg,woff,woff2}'],
         globIgnores: [
+          // v1.10.83 - the bundled Inter font: only the Latin parts are ever
+          // drawn (the app is in English; ₹ is in Latin-extended), and every
+          // browser that runs the app reads .woff2, never the .woff copy.
+          '**/assets/inter-{cyrillic,cyrillic-ext,greek,greek-ext,vietnamese}-*',
+          '**/assets/*.woff',
           '**/assets/pdf-*.js',
-          '**/assets/qr-*.js',
+          // v1.10.84 - qr-*.js is NOT left out any more: the page loads it at start,
+          // so without it the app could not open while its server was stopped.
           '**/assets/index.es-*.js',
           // v1.10.33 — Tesseract worker + core + traineddata (~22MB total).
           // Excluded from precache — cached on demand by the runtime rule
@@ -157,8 +172,7 @@ export default defineConfig({
         // enter the runtime cache. Workbox's default 2MB cap would
         // silently skip them and offline-second-use OCR would break.
         maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
-        navigateFallback: '/index.html',
-        navigateFallbackDenylist: [/^\/api\//],
+        navigateFallback: null,
         // v1.10.33 — Was `false` on both. Kept the prompt-mode reload
         // deferral in main.jsx but flipped these to true because:
         //   1. skipWaiting=true lets the new SW take over on install
@@ -174,7 +188,22 @@ export default defineConfig({
         skipWaiting: true,
         clientsClaim: true,
         cleanupOutdatedCaches: true,
+        // v1.10.83 - a new version reloads open windows of the old one, which
+        // can be stuck blank after an update (public/sw-reload.js).
+        importScripts: ['sw-reload.js'],
         runtimeCaching: [
+          // v1.10.84 - opening the app: the page from the app first, so it always
+          // opens on the newest version; the last copy only when the app's server
+          // does not answer (it then shows "Needs a Quick Start" and waits).
+          {
+            urlPattern: ({ request, url }) => request.mode === 'navigate' && !url.pathname.startsWith('/api/'),
+            handler: 'NetworkFirst',
+            options: {
+              cacheName: 'app-page',
+              networkTimeoutSeconds: 4,
+              cacheableResponse: { statuses: [200] },
+            },
+          },
           // v1.10.2 — /api/* runtime cache. Missing this rule meant the
           // "offline billing counter" promise was broken: fetch() throws
           // TypeError as soon as the network drops. NetworkFirst means
@@ -198,29 +227,12 @@ export default defineConfig({
           // are NOT precached but are cached on first use so the second
           // print offline works.
           {
-            urlPattern: /\/assets\/(pdf|qr|index\.es)-[A-Za-z0-9]+\.js$/,
+            // v1.10.84 - [\w-]: chunk names can contain - and _ (qr-DgLtAz-0.js never matched).
+            urlPattern: /\/assets\/(pdf|qr|index\.es)-[\w-]+\.js$/,
             handler: 'StaleWhileRevalidate',
             options: {
               cacheName: 'lazy-chunks-cache',
               expiration: { maxEntries: 20, maxAgeSeconds: 60 * 60 * 24 * 30 },
-            },
-          },
-          {
-            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'google-fonts-cache',
-              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 365 },
-              cacheableResponse: { statuses: [0, 200] },
-            },
-          },
-          {
-            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
-            handler: 'CacheFirst',
-            options: {
-              cacheName: 'gstatic-fonts-cache',
-              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 365 },
-              cacheableResponse: { statuses: [0, 200] },
             },
           },
           {

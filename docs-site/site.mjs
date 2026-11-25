@@ -9,7 +9,7 @@ export const SITE = {
   // social previews and llms.txt, which all need full addresses.
   url: 'https://dicecodes.com/free-gst-software-documentation/',
   publisher: { name: 'DiceCodes', url: 'https://dicecodes.com' },
-  version: '1.10.82',
+  version: '1.10.86',
   repo: 'https://github.com/IamRamgarhia/Free-GST-Billing-Software',
   // Always the newest release: GitHub resolves this to the latest release's
   // file of exactly this name (see docs/RELEASE_CHECKLIST.md, step 4b).
@@ -46,11 +46,11 @@ export const SEO = {
 };
 
 export const NAV = [
-  { title: 'Start here', pages: ['index', 'install', 'install-mac', 'install-linux', 'update', 'first-run', 'first-invoice'] },
+  { title: 'Start here', pages: ['index', 'install', 'install-mac', 'install-linux', 'update', 'first-run', 'first-invoice', 'gst-basics', 'security'] },
   { title: 'Invoicing', pages: ['invoices', 'invoice-options', 'thermal-printing', 'dashboard'] },
-  { title: 'Clients, stock and payments', pages: ['clients', 'products', 'receipts', 'recurring'] },
+  { title: 'Clients, stock and payments', pages: ['clients', 'products', 'receipts', 'cash-book', 'recurring'] },
   { title: 'Buying', pages: ['purchases', 'expenses'] },
   { title: 'Tax and reports', pages: ['gst-returns', 'reports', 'income-tax'] },
-  { title: 'Setting up', pages: ['settings', 'print-settings', 'backup', 'control-panel'] },
+  { title: 'Setting up', pages: ['settings', 'print-settings', 'backup', 'control-panel', 'phone'] },
   { title: 'Help', pages: ['shortcuts', 'troubleshooting', 'terminal', 'limitations', 'glossary', 'support'] },
 ];

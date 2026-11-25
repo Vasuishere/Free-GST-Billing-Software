@@ -14,8 +14,13 @@
 // Every block and every table row here carries data-pdf-page-boundary, so a
 // page can end between rows or blocks but never cuts through one.
 import React from 'react';
-import { filledOrderDetails, getStateCode, printedSubtotal, roundQty } from '../utils';
+import { filledOrderDetails, getStateCode, printedSubtotal, roundQty, sectionPrint } from '../utils';
 import SignatureImages from './SignatureImages';
+import { purposeCodeText } from '../utils/purposeCodes';
+import { sizeLabel, sizePieces, lineSqft, sizeHasDims } from '../utils/glass';
+
+// #140 - the size of a glass / mirror line, under its name in the grid designs.
+const sizeLine = (item) => `Size ${sizeLabel(item.size)} in, ${sizePieces(item)} pcs = ${lineSqft(item).toFixed(2)} sq.ft`;
 
 const LINE = '#1f2937';
 const B = `1px solid ${LINE}`;
@@ -45,7 +50,7 @@ function Signature({ ctx, align = 'right' }) {
       {sig.show && (
         <div style={{ margin: '4px 0' }}>
           <SignatureImages sigImg={sig.sigImg} stampImg={sig.stampImg} sigHeight={sig.sigHeight} stampHeight={sig.stampHeight}
-            layout={sig.layout} align={align} gap={6} sigMaxWidth={160} stampMaxWidth={110} />
+            layout={sig.layout} align={align} gap={6} sigMaxWidth={160} stampMaxWidth={110} spaceBelow={0} />
         </div>
       )}
       {ctx.showSignatoryText && <div>Authorised Signatory</div>}
@@ -77,7 +82,7 @@ function taxRows(ctx) {
     } else rows.push([taxLabel, (totals.cgst || 0) + (totals.sgst || 0) + (totals.igst || 0)]);
   }
   if (totals.cess > 0) rows.push(['Cess', totals.cess]);
-  if (totals.tcsAmount > 0) rows.push([`TCS${options.tcsSection ? ` (${options.tcsSection} @ ${options.tcsRate}%)` : ''}`, totals.tcsAmount]);
+  if (totals.tcsAmount > 0) rows.push([`TCS${sectionPrint(options.tcsSection, options.tcsRate)}`, totals.tcsAmount]);
   if (totals.invoiceDiscountAmount > 0) rows.push(['Less : Discount on total', -totals.invoiceDiscountAmount]);
   if (totals.roundOff) rows.push([totals.roundOff < 0 ? 'Less : Round Off' : 'Round Off', totals.roundOff]);
   return rows;
@@ -142,6 +147,8 @@ function BankLines({ ctx, tally }) {
     ['A/c No.', account?.accountNumber || profile.accountNumber],
     [tally ? `Branch & ${sellerCC.bankLabel || 'IFS Code'}` : (sellerCC.bankLabel || 'IFSC'), [account?.branch, account?.ifsc || profile.ifsc].filter(Boolean).join(' & ')],
     ['SWIFT', account?.swift || profile.swift],
+    ['IBAN', account?.iban],
+    ['Purpose code', ctx.purposeCode && purposeCodeText(ctx.purposeCode)],
   ].filter(([, v]) => v);
   return (
     <div {...blockProps}>
@@ -156,6 +163,9 @@ function BankLines({ ctx, tally }) {
 }
 
 function UpiQr({ ctx }) {
+  // v1.10.83 - an invoice in a foreign currency has no UPI QR; its online
+  // payment link (PayPal, Wise...) takes the place.
+  if (ctx.paymentLink) return <div {...blockProps} style={{ marginTop: 6 }}><div style={label}>Pay online</div><div style={{ wordBreak: 'break-all' }}>{ctx.paymentLink}</div></div>;
   if (!ctx.qrDataUrl) return null;
   return (
     <div {...blockProps} style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
@@ -193,7 +203,8 @@ function PartyBlock({ ctx, heading, party, withContact }) {
       <div style={{ fontWeight: 800 }}>{party.name || 'Client Name'}</div>
       {t.clientAddress && party.address && <div style={{ whiteSpace: 'pre-line' }}>{party.address}</div>}
       {t.clientAddress && (party.city || party.pin) && <div>{[party.city, party.pin].filter(Boolean).join(' - ')}</div>}
-      {t.gstin && party.gstin && <div>{sellerCC.taxIdLabel || 'GSTIN'}/UIN : <strong>{party.gstin}</strong></div>}
+      {withContact && t.clientAddress && ctx.clientAbroad && <div>{ctx.clientCountry}</div>}
+      {t.gstin && party.gstin && <div>{withContact && ctx.clientAbroad ? ctx.clientTaxIdLabel : `${sellerCC.taxIdLabel || 'GSTIN'}/UIN`} : <strong>{party.gstin}</strong></div>}
       {t.state && party.state && <div>State Name : {stateWithCode(party.state)}</div>}
       {withContact && t.clientPhone && party.phone && <div>Ph: {party.phone}</div>}
       {withContact && t.clientEmail && party.email && <div>E-Mail : {party.email}</div>}
@@ -223,6 +234,7 @@ function TallyLayout({ ctx }) {
     t.dueDate && details?.dueDate && ['Due Date', ctx.shortDate(details.dueDate)],
     ctx.showReverseChargeLine && ['Reverse Charge', ctx.reverseChargeText],
     t.placeOfSupply && ctx.placeOfSupply && ['Place of Supply', stateWithCode(ctx.placeOfSupply)],
+    ...filledOrderDetails(details).filter((f) => f.custom).map((f) => [f.label, f.value]), // #126
   ].filter(Boolean);
   const refCell = (k, v) => (
     <td style={{ ...cell, width: '25%', height: 34 }}>
@@ -235,7 +247,10 @@ function TallyLayout({ ctx }) {
   const totalQty = roundQty(items.reduce((s, i) => s + (Number(i.quantity) || 0), 0)); // #96: 0.1 + 0.2 printed as 0.30000000000000004
   const showQtyTotal = units.length === 1 && t.itemQty;
   // Sl No + Description + Amount, plus the optional columns.
-  const colCount = 3 + (t.hsn ? 1 : 0) + (t.itemQty ? 1 : 0) + (t.rate ? 2 : 0) + (ctx.hasAnyDiscount ? 1 : 0);
+  // v1.10.83 - the "per" (unit) column goes with the unit option.
+  const perCol = t.rate && t.itemUnit;
+  // v1.10.86 - (#189, #192) MRP column (Customize), off unless chosen.
+  const colCount = 3 + (t.hsn ? 1 : 0) + (t.itemQty ? 1 : 0) + (t.mrp ? 1 : 0) + (t.rate ? 1 : 0) + (perCol ? 1 : 0) + (ctx.hasAnyDiscount ? 1 : 0);
   const spacer = Math.max(0, 260 - items.length * 26 - rows.length * 20);
 
   return (
@@ -282,10 +297,11 @@ function TallyLayout({ ctx }) {
           <tr>
             <th style={{ ...th, width: 28 }}>Sl No.</th>
             <th style={th}>Description of {ctx.isServices ? 'Services' : 'Goods'}</th>
-            {t.hsn && <th style={th}>HSN/SAC</th>}
+            {t.hsn && <th style={th}>{ctx.isServices ? 'SAC' : 'HSN/SAC'}</th>}
             {t.itemQty && <th style={th}>Quantity</th>}
+            {t.mrp && <th style={th}>MRP</th>}
             {t.rate && <th style={th}>Rate</th>}
-            {t.rate && <th style={th}>per</th>}
+            {perCol && <th style={th}>per</th>}
             {ctx.hasAnyDiscount && <th style={th}>Disc.</th>}
             <th style={th}>Amount</th>
           </tr>
@@ -296,15 +312,17 @@ function TallyLayout({ ctx }) {
             return (
               <tr key={item.id || i}>
                 <td style={{ ...vc, ...center }}>{i + 1}</td>
-                <td style={vc}>
+                <td className="grid-desc" style={vc}>
                   <strong>{item.name || '-'}</strong>
                   {item.description && <div style={{ ...small, whiteSpace: 'pre-wrap' }}>{item.description}</div>}
+                  {item.size && sizeHasDims(item.size) && <div style={small}>{sizeLine(item)}</div>}
                 </td>
                 {t.hsn && <td style={{ ...vc, ...center }}>{item.hsn || ''}</td>}
-                {t.itemQty && <td style={{ ...vc, ...right }}><strong>{item.quantity}{t.itemUnit && item.unit ? ` ${item.unit}` : ''}</strong></td>}
-                {t.rate && <td style={{ ...vc, ...right }}>{num(item.rate)}</td>}
-                {t.rate && <td style={{ ...vc, ...center }}>{item.unit || ''}</td>}
-                {ctx.hasAnyDiscount && <td style={{ ...vc, ...right }}>{l.discount > 0 ? num(l.discount) : ''}</td>}
+                {t.itemQty && <td style={{ ...vc, ...right }}><strong>{item.unit === 'NA' ? '-' : `${item.quantity}${t.itemUnit && item.unit ? ` ${item.unit}` : ''}`}</strong></td>}
+                {t.mrp && <td style={{ ...vc, ...right }}>{Number(item.mrp) > 0 ? num(Number(item.mrp)) : ''}</td>}
+                {t.rate && <td style={{ ...vc, ...right }}>{num(l.shownRate)}</td>}
+                {perCol && <td style={{ ...vc, ...center }}>{item.unit || ''}</td>}
+                {ctx.hasAnyDiscount && <td style={{ ...vc, ...right }}>{l.discount > 0 ? num(l.shownDiscount) : ''}</td>}
                 <td style={{ ...vc, ...right }}><strong>{num(l.taxable)}</strong></td>
               </tr>
             );
@@ -332,8 +350,9 @@ function TallyLayout({ ctx }) {
             <td style={{ ...cell, ...right }}>Total</td>
             {t.hsn && <td style={cell} />}
             {t.itemQty && <td style={{ ...cell, ...right }}>{showQtyTotal ? `${totalQty}${t.itemUnit && units[0] ? ` ${units[0]}` : ''}` : ''}</td>}
+            {t.mrp && <td style={cell} />}
             {t.rate && <td style={cell} />}
-            {t.rate && <td style={cell} />}
+            {perCol && <td style={cell} />}
             {ctx.hasAnyDiscount && <td style={cell} />}
             <td style={{ ...cell, ...right, fontSize: '1.08em' }}>{fmt(totals.total)}</td>
           </tr>
@@ -348,7 +367,7 @@ function TallyLayout({ ctx }) {
       </div>
       {totals.tdsAmount > 0 && (
         <div {...blockProps} style={{ ...cell, borderTop: 'none', ...small }}>
-          Less: TDS{ctx.options.tdsSection ? ` (${ctx.options.tdsSection} @ ${ctx.options.tdsRate}%)` : ''} {fmt(totals.tdsAmount)} · Net Receivable <strong>{fmt(totals.netReceivable)}</strong>
+          Less: TDS{sectionPrint(ctx.options.tdsSection, ctx.options.tdsRate)} {fmt(totals.tdsAmount)} · Net Receivable <strong>{fmt(totals.netReceivable)}</strong>
         </div>
       )}
 
@@ -405,7 +424,9 @@ function BoxedLayout({ ctx }) {
   ].filter(Boolean);
   const rows = taxRows(ctx);
   const filler = Math.max(0, BOXED_MIN_ROWS - items.length);
-  const colCount = 3 + (t.hsn ? 1 : 0) + (t.itemQty ? 2 : 0) + (t.rate ? 1 : 0) + (ctx.hasAnyDiscount ? 1 : 0);
+  // v1.10.83 - the UNIT column goes with the unit option.
+  const unitCol = t.itemQty && t.itemUnit;
+  const colCount = 3 + (t.hsn ? 1 : 0) + (t.itemQty ? 1 : 0) + (unitCol ? 1 : 0) + (t.mrp ? 1 : 0) + (t.rate ? 1 : 0) + (ctx.hasAnyDiscount ? 1 : 0);
   const shipTo = ctx.shipTo;
 
   return (
@@ -453,8 +474,9 @@ function BoxedLayout({ ctx }) {
               <th style={{ ...th, borderLeft: 'none', width: 30 }}>SI</th>
               <th style={th}>Description</th>
               {t.hsn && <th style={th}>{ctx.isServices ? 'SAC' : 'HSN/SAC'}</th>}
-              {t.itemQty && <th style={th}>UNIT</th>}
+              {unitCol && <th style={th}>UNIT</th>}
               {t.itemQty && <th style={th}>QTY</th>}
+              {t.mrp && <th style={th}>MRP</th>}
               {t.rate && <th style={th}>Rate</th>}
               {ctx.hasAnyDiscount && <th style={th}>Disc.</th>}
               <th style={{ ...th, borderRight: 'none' }}>Amount</th>
@@ -466,15 +488,17 @@ function BoxedLayout({ ctx }) {
               return (
                 <tr key={item.id || i}>
                   <td style={{ ...cell, ...center, borderLeft: 'none' }}>{i + 1}</td>
-                  <td style={cell}>
+                  <td className="grid-desc" style={cell}>
                     {item.name || '-'}
                     {item.description && <div style={{ ...small, whiteSpace: 'pre-wrap' }}>{item.description}</div>}
+                  {item.size && sizeHasDims(item.size) && <div style={small}>{sizeLine(item)}</div>}
                   </td>
                   {t.hsn && <td style={{ ...cell, ...center }}>{item.hsn || ''}</td>}
-                  {t.itemQty && <td style={{ ...cell, ...center }}>{item.unit || ''}</td>}
-                  {t.itemQty && <td style={{ ...cell, ...center }}>{item.quantity}</td>}
-                  {t.rate && <td style={{ ...cell, ...right }}>{num(item.rate)}</td>}
-                  {ctx.hasAnyDiscount && <td style={{ ...cell, ...right }}>{l.discount > 0 ? num(l.discount) : ''}</td>}
+                  {unitCol && <td style={{ ...cell, ...center }}>{item.unit || ''}</td>}
+                  {t.itemQty && <td style={{ ...cell, ...center }}>{item.unit === 'NA' ? '-' : item.quantity}</td>}
+                  {t.mrp && <td style={{ ...cell, ...right }}>{Number(item.mrp) > 0 ? num(Number(item.mrp)) : ''}</td>}
+                  {t.rate && <td style={{ ...cell, ...right }}>{num(l.shownRate)}</td>}
+                  {ctx.hasAnyDiscount && <td style={{ ...cell, ...right }}>{l.discount > 0 ? num(l.shownDiscount) : ''}</td>}
                   <td style={{ ...cell, ...right, borderRight: 'none' }}>{num(l.taxable)}</td>
                 </tr>
               );

@@ -1,12 +1,31 @@
 import { useState, useEffect } from 'react';
-import { Wallet, Plus, Edit3, Trash2, Search, X, Save, Calendar } from 'lucide-react';
+import { Wallet, Plus, Edit3, Trash2, Search, X, Save, Calendar, CheckCircle } from 'lucide-react';
 import { getAllExpenses, saveExpense, deleteExpense, getProfile } from '../store';
 import { formatCurrency, getFYOptions, belongsToProfile, isUnassignedToBusiness } from '../utils';
 import UnassignedBanner from './UnassignedBanner';
 import { toast } from './Toast';
+import { EXPENSE_PAYMENT, expenseStatus, expensePaid, expenseDue } from '../utils/expensePayment';
 import { confirmAction } from './ConfirmModal';
 import HelpButton from './HelpButton';
+import PageHeader from './PageHeader';
 import TableExport from './TableExport';
+import ActionsMenu from './ActionsMenu';
+import { useCostCentres } from './useCostCentres';
+import { CostCentreSelect, CostCentreFilter } from './CostCentrePicker';
+import { matchesCentre, centreFields, centreLabel, UNTAGGED } from '../utils/costCentres';
+// v1.10.86 - sort by a column header, remembered in this browser.
+import { useListSort, sortRows } from '../utils/listPrefs';
+import SortTh from './SortTh';
+
+const SORT_GETTERS = {
+  date: (e) => e.date,
+  description: (e) => e.description,
+  category: (e) => e.category,
+  vendor: (e) => e.vendorName,
+  amount: (e) => Number(e.amount) || 0,
+  gst: (e) => Number(e.gstAmount) || 0,
+  payment: (e) => expenseDue(e),
+};
 
 // Each category is tagged with its ITR (Income Tax Return) head so the
 // v1.7.0+ ITR Filing Summary can auto-aggregate expenses under the correct
@@ -66,7 +85,13 @@ const emptyForm = {
   vendorGstin: '',
   invoiceNo: '',
   paymentMode: 'Bank Transfer',
+  // v1.10.85 (#165) - Paid / Unpaid / Partly paid (utils/expensePayment.js)
+  paymentStatus: 'paid',
+  paidAmount: '',
   note: '',
+  // v1.10.83 (#112) - optional; see utils/costCentres.js
+  costCentre: '',
+  costCentreName: '',
 };
 
 // v1.10.6 — audit L4: local copy removed, imported from utils above.
@@ -81,6 +106,9 @@ export default function ExpenseTracker() {
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState({ ...emptyForm });
+  const [centreFilter, setCentreFilter] = useState('');
+  const [payFilter, setPayFilter] = useState('all'); // v1.10.85 (#165): 'all' | 'due'
+  const { on: ccOn, centres } = useCostCentres(ownerProfile);
 
   const fyOptions = getFYOptions();
   const defaultFy = fyOptions[0]?.value || '';
@@ -125,6 +153,7 @@ export default function ExpenseTracker() {
           !(exp.invoiceNo || '').toLowerCase().includes(q)) return false;
     }
     if (categoryFilter !== 'all' && exp.category !== categoryFilter) return false;
+    if (!matchesCentre(exp, centreFilter)) return false;
     if (fyFilter) {
       const fy = fyOptions.find(f => f.value === fyFilter);
       if (fy && exp.date) {
@@ -136,6 +165,19 @@ export default function ExpenseTracker() {
 
   const totalAmount = filtered.reduce((s, e) => s + (e.amount || 0), 0);
   const totalGST = filtered.reduce((s, e) => s + (e.gstAmount || 0), 0);
+  // v1.10.85 (#165) - still to pay on the expenses shown.
+  const totalDue = filtered.reduce((s, e) => s + expenseDue(e), 0);
+  const { sort, toggle: toggleSort } = useListSort('expenses', Object.keys(SORT_GETTERS));
+  const shown = sortRows(payFilter === 'due' ? filtered.filter((e) => expenseDue(e) > 0) : filtered, sort, SORT_GETTERS);
+
+  // Mark an Unpaid / Partly paid expense as fully paid.
+  const markPaid = async (exp) => {
+    try {
+      await saveExpense({ ...exp, paymentStatus: 'paid', paidAmount: Number(exp.amount) || 0 });
+      toast('Marked as paid', 'success');
+      loadExpenses();
+    } catch { toast('Failed to save expense', 'error'); }
+  };
 
   const openAdd = () => {
     setForm({ ...emptyForm, date: localToday() });
@@ -155,8 +197,12 @@ export default function ExpenseTracker() {
       vendorGstin: exp.vendorGstin || '',
       invoiceNo: exp.invoiceNo || '',
       paymentMode: exp.paymentMode || 'Bank Transfer',
+      paymentStatus: expenseStatus(exp),
+      paidAmount: expenseStatus(exp) === 'partial' ? String(exp.paidAmount ?? '') : '',
       interstate: !!exp.interstate,
       note: exp.note || '',
+      costCentre: exp.costCentre || '',
+      costCentreName: exp.costCentreName || '',
     });
     setEditingId(exp.id);
     setShowForm(true);
@@ -174,6 +220,11 @@ export default function ExpenseTracker() {
     // v1.10.74 - GST % must be 0 to 100 (40% is a real rate, so no 28 cap).
     const gstPct = form.gstPercent === '' ? 0 : parseFloat(form.gstPercent);
     if (!(gstPct >= 0 && gstPct <= 100)) { toast('GST % must be between 0 and 100', 'warning'); return; }
+    const amountNum = parseFloat(form.amount);
+    const paidNum = form.paymentStatus === 'partial' ? parseFloat(form.paidAmount) : NaN;
+    if (form.paymentStatus === 'partial' && !(paidNum > 0 && paidNum < amountNum)) {
+      toast('For Partly paid, enter the amount paid so far (more than 0 and less than the amount)', 'warning'); return;
+    }
     try {
       const expense = {
         ...(editingId ? { id: editingId } : {}),
@@ -187,6 +238,8 @@ export default function ExpenseTracker() {
         vendorGstin: form.vendorGstin.trim(),
         invoiceNo: form.invoiceNo.trim(),
         paymentMode: form.paymentMode,
+        paymentStatus: form.paymentStatus,
+        paidAmount: form.paymentStatus === 'partial' ? paidNum : form.paymentStatus === 'unpaid' ? 0 : amountNum,
         interstate: !!form.interstate,
         note: form.note.trim(),
         // Stamp the business this expense belongs to. `vendorGstin` above is
@@ -194,6 +247,7 @@ export default function ExpenseTracker() {
         // exactly backwards, so the owner is kept in its own field.
         ownerGstin: ownerProfile?.gstin || '',
         ownerName: ownerProfile?.businessName || '',
+        ...centreFields(form.costCentre, form.costCentreName),
       };
       await saveExpense(expense);
       toast(editingId ? 'Expense updated' : 'Expense added', 'success');
@@ -246,30 +300,18 @@ export default function ExpenseTracker() {
   const statementPeriod = [
     fyOptions.find(f => f.value === fyFilter)?.label || 'all years',
     categoryFilter !== 'all' ? categoryFilter : '',
+    centreFilter ? (centreFilter === UNTAGGED ? 'no cost centre' : centreLabel(centres.find(c => c.id === centreFilter))) : '',
     search.trim() ? `matching "${search.trim()}"` : '',
   ].filter(Boolean).join(', ');
 
   return (
     <div className="dashboard-container">
-      <div className="page-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <div>
-            <h1 className="page-title">Expenses</h1>
-            <p className="page-subtitle">Track business expenses for P&L and ITC claims</p>
-          </div>
-          <HelpButton title="Expenses — how to use" doc="expenses">
-            <ul style={{ paddingLeft: '1.1rem', margin: 0 }}>
-              <li>For costs that are not stock: rent, electricity, internet, software, travel, fees.</li>
-              <li><strong>Amount</strong> is what you paid, including GST. Enter the <strong>GST %</strong> and the GST inside it is worked out and counted as input tax credit.</li>
-              <li>Tick <strong>Inter-state expense</strong> when the vendor charged IGST.</li>
-              <li><strong>Print / PDF</strong>, <strong>Excel</strong> and <strong>CSV</strong> above the list give your CA the expense statement for the year, category and search shown, with a total.</li>
-            </ul>
-          </HelpButton>
-        </div>
-        <div className="flex gap-2">
-          <button className="btn btn-primary" onClick={openAdd}><Plus size={18} /> Add Expense</button>
-        </div>
-      </div>
+      <PageHeader
+        title="Expenses"
+        help={{ title: 'Expenses — how to use', doc: 'expenses' }}
+        subtitle="Track business expenses for P&L and ITC claims"
+        primary={<button className="btn btn-primary" onClick={openAdd}><Plus size={18} /> Add Expense</button>}
+      />
 
       <UnassignedBanner
         count={unassignedExpenses.length}
@@ -279,7 +321,14 @@ export default function ExpenseTracker() {
       />
 
       {/* Stats */}
-      <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+      <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(200px, 100%), 1fr))' }}>
+        {/* v1.10.85 (#165) - what is still to pay on the expenses shown; click to list them */}
+        <button type="button" className="stat-card" onClick={() => setPayFilter(payFilter === 'due' ? 'all' : 'due')}
+          title={payFilter === 'due' ? 'Show all expenses' : 'Show only Unpaid and Partly paid expenses'}
+          style={{ textAlign: 'left', cursor: 'pointer', border: payFilter === 'due' ? '1px solid #d97706' : undefined }}>
+          <div className="stat-icon stat-icon-amber"><Wallet size={22} /></div>
+          <div><p className="stat-label">Outstanding</p><h2 className="stat-value stat-value-amber">{formatCurrency(totalDue)}</h2></div>
+        </button>
         <div className="stat-card">
           <div className="stat-icon stat-icon-purple"><Wallet size={22} /></div>
           <div><p className="stat-label">Total Expenses</p><h2 className="stat-value stat-value-purple">{formatCurrency(totalAmount)}</h2></div>
@@ -312,8 +361,13 @@ export default function ExpenseTracker() {
             {fyOptions.map(fy => <option key={fy.value} value={fy.value}>{fy.label}</option>)}
           </select>
           {/* v1.10.74 - Clear filters also puts the FY back to the current one. */}
-          {(search || categoryFilter !== 'all' || fyFilter !== defaultFy) && (
-            <button className="icon-btn icon-btn-red" onClick={() => { setSearch(''); setCategoryFilter('all'); setFyFilter(defaultFy); }} title="Clear filters" aria-label="Clear filters"><X size={15} /></button>
+          <select className="filter-select" value={payFilter} onChange={e => setPayFilter(e.target.value)} aria-label="Payment">
+            <option value="all">Paid and unpaid</option>
+            <option value="due">Unpaid / Partly paid</option>
+          </select>
+          {ccOn && <CostCentreFilter centres={centres} value={centreFilter} onChange={setCentreFilter} />}
+          {(search || categoryFilter !== 'all' || fyFilter !== defaultFy || centreFilter || payFilter !== 'all') && (
+            <button className="icon-btn icon-btn-red" onClick={() => { setSearch(''); setCategoryFilter('all'); setFyFilter(defaultFy); setCentreFilter(''); setPayFilter('all'); }} title="Clear filters" aria-label="Clear filters"><X size={15} /></button>
           )}
         </div>
       </div>
@@ -322,7 +376,7 @@ export default function ExpenseTracker() {
       {showForm && (
         <div className="modal-overlay" onClick={closeForm}>
           <div className="modal-content" onClick={e => e.stopPropagation()} style={{ maxWidth: '620px' }}>
-            <h3 className="section-title">{editingId ? 'Edit Expense' : 'Add Expense'}</h3>
+            <h3 className="section-title">{editingId ? 'Edit Expense' : 'Add Expense'} <HelpButton title="Adding an expense" doc="expenses#add-expense" size={16} /></h3>
             <div className="grid grid-cols-2 gap-4">
               <div className="form-group">
                 <label className="form-label">Date *</label>
@@ -372,6 +426,29 @@ export default function ExpenseTracker() {
                   {PAYMENT_MODES.map(m => <option key={m} value={m}>{m}</option>)}
                 </select>
               </div>
+              <div className="form-group">
+                <label className="form-label" htmlFor="expense-payment">Payment</label>
+                <select id="expense-payment" className="form-input" value={form.paymentStatus} onChange={e => updateField('paymentStatus', e.target.value)}>
+                  {EXPENSE_PAYMENT.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                </select>
+              </div>
+              {form.paymentStatus === 'partial' && (
+                <div className="form-group">
+                  <label className="form-label" htmlFor="expense-paid">Paid so far</label>
+                  <input id="expense-paid" type="number" className="form-input" value={form.paidAmount} min="0"
+                    onChange={e => updateField('paidAmount', e.target.value)} placeholder="0.00" />
+                  {Number(form.amount) > 0 && Number(form.paidAmount) > 0 && (
+                    <p className="field-hint">Still to pay: {formatCurrency(Math.max(0, Number(form.amount) - Number(form.paidAmount)))}</p>
+                  )}
+                </div>
+              )}
+              {ccOn && (
+                <div className="form-group">
+                  <label className="form-label" htmlFor="cost-centre">Cost centre</label>
+                  <CostCentreSelect centres={centres} value={form.costCentre} name={form.costCentreName}
+                    onChange={(id, name) => setForm(prev => ({ ...prev, costCentre: id, costCentreName: name }))} />
+                </div>
+              )}
               <div className="form-group" style={{ gridColumn: 'span 2' }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.82rem', cursor: 'pointer' }}>
                   <input type="checkbox" checked={!!form.interstate}
@@ -402,16 +479,16 @@ export default function ExpenseTracker() {
       {/* Expense Table */}
       <div className="glass-panel">
         <div className="table-header" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
-          <h3>Expense Records</h3>
+          <h3>Expense Records <HelpButton title="Expense Records" doc="expenses#expense-list" size={16} /></h3>
           <TableExport title="Expense statement" filename={`Expenses-${statementPeriod}`} landscape
             subtitle={[ownerProfile?.businessName, statementPeriod].filter(Boolean).join(', ')}
             headers={['Date', 'Description', 'Category', 'Amount', 'GST Amount', 'GST %', 'Vendor', 'Vendor GSTIN', 'Invoice No', 'Payment Mode', 'Inter-state', 'Note']}
             rows={statementRows} />
         </div>
-        {filtered.length === 0 ? (
+        {shown.length === 0 ? (
           <div className="empty-state">
             <Wallet size={48} />
-            <p>{expenses.length === 0 ? 'No expenses recorded yet.' : 'No expenses match your filters.'}</p>
+            <p>{expenses.length === 0 ? 'No expenses recorded yet.' : payFilter === 'due' ? 'Nothing outstanding: every expense shown is paid.' : 'No expenses match your filters.'}</p>
             {expenses.length === 0 && <button className="btn btn-primary" onClick={openAdd}><Plus size={18} /> Add Expense</button>}
           </div>
         ) : (
@@ -419,18 +496,19 @@ export default function ExpenseTracker() {
             <table className="data-table" style={{ minWidth: '800px' }}>
               <thead>
                 <tr>
-                  <th>Date</th>
-                  <th>Description</th>
-                  <th>Category</th>
-                  <th>Vendor</th>
-                  <th style={{ textAlign: 'right' }}>Amount</th>
-                  <th style={{ textAlign: 'right' }}>GST</th>
+                  <SortTh col="date" label="Date" sort={sort} onSort={toggleSort} />
+                  <SortTh col="description" label="Description" sort={sort} onSort={toggleSort} />
+                  <SortTh col="category" label="Category" sort={sort} onSort={toggleSort} />
+                  <SortTh col="vendor" label="Vendor" sort={sort} onSort={toggleSort} />
+                  <SortTh col="amount" label="Amount" style={{ textAlign: 'right' }} sort={sort} onSort={toggleSort} />
+                  <SortTh col="gst" label="GST" style={{ textAlign: 'right' }} sort={sort} onSort={toggleSort} />
                   <th>Mode</th>
+                  <SortTh col="payment" label="Payment" sort={sort} onSort={toggleSort} />
                   <th className="col-center">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(exp => (
+                {shown.map(exp => (
                   <tr key={exp.id}>
                     <td className="text-muted">{exp.date ? new Date(exp.date).toLocaleDateString('en-IN') : ''}</td>
                     <td className="font-medium">{exp.description}</td>
@@ -440,9 +518,22 @@ export default function ExpenseTracker() {
                     <td style={{ textAlign: 'right' }} className="text-muted">{exp.gstAmount ? formatCurrency(exp.gstAmount) : '-'}</td>
                     <td className="text-muted">{exp.paymentMode}</td>
                     <td>
+                      {expenseStatus(exp) === 'paid' ? <span className="text-muted">Paid</span> : (
+                        <span style={{ color: '#d97706', fontWeight: 600 }} title={`Paid ${formatCurrency(expensePaid(exp))} of ${formatCurrency(exp.amount)}`}>
+                          {expenseStatus(exp) === 'unpaid' ? 'Unpaid' : 'Partly paid'} · {formatCurrency(expenseDue(exp))} due
+                        </span>
+                      )}
+                    </td>
+                    <td>
                       <div className="table-actions">
-                        <button className="icon-btn icon-btn-blue" onClick={() => openEdit(exp)} title="Edit"><Edit3 size={15} /></button>
-                        <button className="icon-btn icon-btn-red" onClick={() => handleDelete(exp.id)} title="Delete"><Trash2 size={15} /></button>
+                        {/* v1.10.86 - the same order as every list: (View) · Edit · Payment · More. */}
+                        <button className="icon-btn icon-btn-blue" onClick={() => openEdit(exp)} title="Edit" aria-label={`Edit expense: ${exp.description || exp.category || ''}`}><Edit3 size={15} /></button>
+                        {expenseDue(exp) > 0 && (
+                          <button className="icon-btn icon-btn-green" onClick={() => markPaid(exp)} title="Mark as paid" aria-label="Mark as paid"><CheckCircle size={15} /></button>
+                        )}
+                        <ActionsMenu label="More actions for this expense" items={[
+                          { label: 'Delete', icon: Trash2, tone: 'danger', onClick: () => handleDelete(exp.id) },
+                        ]} />
                       </div>
                     </td>
                   </tr>
@@ -453,7 +544,9 @@ export default function ExpenseTracker() {
                   <td colSpan={4}>Total</td>
                   <td style={{ textAlign: 'right' }}>{formatCurrency(totalAmount)}</td>
                   <td style={{ textAlign: 'right' }}>{formatCurrency(totalGST)}</td>
-                  <td colSpan={2}></td>
+                  <td></td>
+                  <td>{totalDue > 0 ? `${formatCurrency(totalDue)} due` : ''}</td>
+                  <td></td>
                 </tr>
               </tfoot>
             </table>

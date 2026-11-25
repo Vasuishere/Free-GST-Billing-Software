@@ -1,13 +1,20 @@
 import { useState, useEffect } from 'react';
-import { TrendingUp, TrendingDown, Wallet, BarChart3, Clock, Search, X, Users, Package, Boxes } from 'lucide-react';
-import { getAllBills, getAllExpenses, getProfile } from '../store';
-import { formatCurrency, getFYOptions, belongsToProfile, isCancelledBill, salesSign, countsAsSales, calculateLineItemTax, roundQty, parseLocalDate, amountDue } from '../utils';
+import { TrendingUp, TrendingDown, Wallet, BarChart3, Clock, Search, X, Users, Package, Boxes, Building2, Percent } from 'lucide-react';
+import { getAllBills, getAllExpenses, getAllProducts, getProfile, getAllPurchases } from '../store';
+import { costOfGoodsSold, costOfGoodsSoldIn } from '../utils/products';
+import { formatCurrency, getFYOptions, belongsToProfile, isCancelledBill, salesSign, countsAsSales, parseLocalDate, amountDue } from '../utils';
 import { toast } from './Toast';
 import HelpButton from './HelpButton';
+import PageHeader from './PageHeader';
 import PartyOutstandingReport from './PartyOutstandingReport';
 import StockReport from './StockReport';
 import TableExport from './TableExport';
 import { billCurrency } from '../utils/partyOutstanding';
+import { billsInInr, baseCurrencyOf, billRate } from '../utils/fx';
+import CostCentreReport from './CostCentreReport';
+import { costCentresOn } from './useCostCentres';
+import TdsTcsReport from './TdsTcsReport';
+import { productSales, categoryOptions, brandOptions, serialTrail } from '../utils/stock';
 
 const MONTHS = [
   'January', 'February', 'March', 'April', 'May', 'June',
@@ -17,18 +24,42 @@ const MONTHS = [
 // v1.10.6 — audit L4: local copy removed, imported from utils above.
 
 const getBillCurrency = billCurrency;
+// v1.10.83 - "All, in ₹": every invoice, a foreign-currency one at the
+// exchange rate saved on it. The default for an Indian business that bills in
+// more than one currency (export income is income).
+const ALL_INR = 'ALL_INR';
+
+// The ? at the end of the tab row opens the guide at the tab on screen.
+const TAB_HELP = {
+  pl: ['Profit & Loss', 'reports#profit-loss'],
+  aging: ['Outstanding & Aging', 'reports#outstanding'],
+  party: ['Party Outstanding', 'reports#party-outstanding'],
+  clients: ['Client Analytics', 'reports#clients'],
+  products: ['Product Performance', 'reports#products'],
+  stock: ['Stock', 'reports#stock'],
+  costcentres: ['By cost centre', 'reports#cost-centres'],
+  tds: ['TDS & TCS', 'reports#tds-tcs'],
+};
 
 export default function ReportsView() {
   const [bills, setBills] = useState([]);
   const [expenses, setExpenses] = useState([]);
+  const [products, setProducts] = useState([]);
   const [activeTab, setActiveTab] = useState('pl');
   const [filterMode, setFilterMode] = useState('fy');
   const [fyFilter, setFyFilter] = useState('');
   const [monthFilter, setMonthFilter] = useState('');
   const [yearFilter, setYearFilter] = useState('');
   const [agingSearch, setAgingSearch] = useState('');
-  const [currencyFilter, setCurrencyFilter] = useState('INR');
+  const [currencyFilter, setCurrencyFilter] = useState(ALL_INR);
   const [businessName, setBusinessName] = useState('');
+  // v1.10.83 (#112) - the By cost centre tab needs the business itself.
+  const [ownerProfile, setOwnerProfile] = useState(null);
+  const [ccOn] = useState(costCentresOn);
+  // v1.10.85 (#142) - Product Performance filters, and the purchases a serial
+  // number is looked up in (every business's: products are shared).
+  const [prodFilter, setProdFilter] = useState({ item: '', category: '', brand: '', serial: '' });
+  const [purchases, setPurchases] = useState([]);
 
   const fyOptions = getFYOptions();
   const currentYear = new Date().getFullYear();
@@ -37,9 +68,11 @@ export default function ReportsView() {
 
   const loadData = async () => {
     try {
-      const [billData, expData, prof] = await Promise.all([
-        getAllBills(), getAllExpenses(), getProfile().catch(() => null),
+      const [billData, expData, prof, productData] = await Promise.all([
+        getAllBills(), getAllExpenses(), getProfile().catch(() => null), getAllProducts().catch(() => []),
       ]);
+      setProducts(productData || []);
+      getAllPurchases().then((p) => setPurchases(p || [])).catch(() => {});
       // v1.10.64 (#55) — reports are per business. Mixing two companies'
       // turnover into one profit figure is simply a wrong number.
       // v1.10.67 (#66 item 12) — cancelled invoices earned nothing.
@@ -48,6 +81,7 @@ export default function ReportsView() {
       // company's expenses in each company's profit and loss.
       setExpenses((expData || []).filter(e => belongsToProfile(e, prof)));
       setBusinessName(prof?.businessName || '');
+      setOwnerProfile(prof);
     } catch {
       toast('Failed to load data', 'error');
     }
@@ -81,27 +115,45 @@ export default function ReportsView() {
   // Prior code left this unfiltered, so USD-invoice revenue got INR
   // expenses subtracted → nonsense net profit. Expenses without a
   // `currency` field are assumed INR (legacy records).
-  const filteredExpenses = expenses.filter(exp =>
-    filterByPeriod(exp.date) && ((exp.currency || 'INR') === currencyFilter));
-
   // All distinct currencies in the filtered period
   const allCurrencies = [...new Set(allFilteredBills.map(getBillCurrency))].sort();
+  const allInInrOffered = allCurrencies.length > 1 && (ownerProfile?.country || 'India') === 'India';
+  const currencyChoices = allInInrOffered ? [ALL_INR, ...allCurrencies] : allCurrencies;
   // Set currency filter to first available if current selection not in list
   useEffect(() => {
-    if (allCurrencies.length > 0 && !allCurrencies.includes(currencyFilter)) {
-      setCurrencyFilter(allCurrencies[0]);
+    if (currencyChoices.length > 0 && !currencyChoices.includes(currencyFilter)) {
+      setCurrencyFilter(currencyChoices[0]);
     }
-  }, [allCurrencies.join(',')]);
+  }, [currencyChoices.join(',')]);
+  const allInInr = currencyFilter === ALL_INR;
+  // The currency amounts are shown in.
+  const shownCurrency = allInInr ? 'INR' : currencyFilter;
+  const converted = allInInr ? billsInInr(allFilteredBills) : null;
+  const filteredExpenses = expenses.filter(exp =>
+    filterByPeriod(exp.date) && ((exp.currency || 'INR') === shownCurrency));
+  // The invoices of the chosen currency (all of them, in rupees, for ALL_INR).
+  const billsShown = allInInr ? converted.bills : allFilteredBills.filter(b => getBillCurrency(b) === currencyFilter);
 
   // v1.10.77 (#85) - the period in words, for exported reports.
   const periodLabel = filterMode === 'fy'
     ? (fyOptions.find(f => f.value === fyFilter)?.label || '')
     : `${MONTHS[parseInt(monthFilter)] || ''} ${yearFilter}`;
+  // The same period as dates, both days included (By cost centre).
+  const periodRange = (() => {
+    if (filterMode === 'fy') {
+      const fy = fyOptions.find(f => f.value === fyFilter);
+      return fy ? { from: fy.from, to: fy.to } : { from: '', to: '' };
+    }
+    const y = parseInt(yearFilter), m = parseInt(monthFilter) + 1;
+    if (!y || !m) return { from: '', to: '' };
+    const mm = String(m).padStart(2, '0');
+    return { from: `${y}-${mm}-01`, to: `${y}-${mm}-${String(new Date(y, m, 0).getDate()).padStart(2, '0')}` };
+  })();
   const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-  const exportSubtitle = (extra = '') => [businessName, periodLabel, currencyFilter !== 'INR' ? currencyFilter : '', extra].filter(Boolean).join(', ');
+  const exportSubtitle = (extra = '') => [businessName, periodLabel, allInInr ? 'all currencies in INR' : (currencyFilter !== 'INR' ? currencyFilter : ''), extra].filter(Boolean).join(', ');
 
   // Bills for P&L — only selected currency
-  const plBills = allFilteredBills.filter(b => getBillCurrency(b) === currencyFilter);
+  const plBills = billsShown;
 
   // P&L
   // TCS on an invoice is collected for the government, like GST: it is in the
@@ -113,21 +165,34 @@ export default function ReportsView() {
   const totalExpenseAmount = filteredExpenses.reduce((s, e) => s + (e.amount || 0), 0);
   const totalExpenseGST = filteredExpenses.reduce((s, e) => s + (e.gstAmount || 0), 0);
   const expenseExGST = totalExpenseAmount - totalExpenseGST;
-  const netProfit = revenueExTax - expenseExGST;
+  // v1.10.84 (#146) - the cost of the goods sold (quantity x Purchase price,
+  // utils/products.js) is subtracted too; profit used to be sales minus
+  // Expenses only. Purchase prices are in the business's own currency, so the
+  // cost is worked out only when the report is shown in that currency.
+  // v1.10.85 - shown in another currency: each invoice's cost at the exchange
+  // rate saved on it (an invoice with no rate is counted apart, see noRate).
+  const cogsShown = shownCurrency === baseCurrencyOf(ownerProfile);
+  const cogsOf = (list) => (cogsShown
+    ? costOfGoodsSold(list, products)
+    : costOfGoodsSoldIn(list, products, baseCurrencyOf(ownerProfile), billRate));
+  const cogs = cogsOf(plBills);
+  const grossProfit = revenueExTax - cogs.cost;
+  const netProfit = grossProfit - expenseExGST;
 
   // Monthly breakdown — per selected currency
   const monthlyPL = {};
   plBills.forEach(b => {
     if (!b.invoiceDate) return;
     const key = b.invoiceDate.substring(0, 7);
-    if (!monthlyPL[key]) monthlyPL[key] = { revenue: 0, tax: 0, expense: 0, expGst: 0 };
+    if (!monthlyPL[key]) monthlyPL[key] = { revenue: 0, tax: 0, expense: 0, expGst: 0, cogs: 0 };
+    monthlyPL[key].cogs += cogsOf([b]).cost;
     monthlyPL[key].revenue += salesSign(b) * (b.totalAmount || 0);
     monthlyPL[key].tax += salesSign(b) * ((b.totalTaxAmount || 0) + tcsOf(b));
   });
   filteredExpenses.forEach(e => {
     if (!e.date) return;
     const key = e.date.substring(0, 7);
-    if (!monthlyPL[key]) monthlyPL[key] = { revenue: 0, tax: 0, expense: 0, expGst: 0 };
+    if (!monthlyPL[key]) monthlyPL[key] = { revenue: 0, tax: 0, expense: 0, expGst: 0, cogs: 0 };
     monthlyPL[key].expense += e.amount || 0;
     monthlyPL[key].expGst += e.gstAmount || 0;
   });
@@ -184,23 +249,11 @@ export default function ReportsView() {
 
   return (
     <div className="dashboard-container">
-      <div className="page-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <div>
-            <h1 className="page-title">Reports</h1>
-            <p className="page-subtitle">Financial reports and receivables analysis</p>
-          </div>
-          <HelpButton title="Reports — how to use" doc="reports">
-            <ul style={{ paddingLeft: '1.1rem', margin: 0 }}>
-              <li><strong>Profit &amp; Loss</strong>: sales against expenses, without GST, by year or month.</li>
-              <li><strong>Outstanding &amp; Aging</strong>: who owes you and how late, in 30-day groups.</li>
-              <li><strong>Party Outstanding</strong>: what each party owes, month by month (April-March or January-December), with totals. Print or CSV.</li>
-              <li><strong>Client Analytics</strong> and <strong>Product Performance</strong>: your best clients and items.</li>
-              <li>Only real sales count: estimates, challans and cancelled invoices are left out, credit notes are subtracted.</li>
-            </ul>
-          </HelpButton>
-        </div>
-      </div>
+      <PageHeader
+        title="Reports"
+        help={{ title: 'Reports — how to use', doc: 'reports' }}
+        subtitle="Financial reports and receivables analysis"
+      />
 
       {/* Tab Selector — v1.9.5 adds Client + Product tabs */}
       <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.25rem', flexWrap: 'wrap' }}>
@@ -228,11 +281,22 @@ export default function ReportsView() {
           onClick={() => setActiveTab('stock')}>
           <Boxes size={16} /> Stock
         </button>
+        <button className={`btn ${activeTab === 'tds' ? 'btn-primary' : 'btn-secondary'}`}
+          onClick={() => setActiveTab('tds')}>
+          <Percent size={16} /> TDS &amp; TCS
+        </button>
+        {ccOn && (
+          <button className={`btn ${activeTab === 'costcentres' ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setActiveTab('costcentres')}>
+            <Building2 size={16} /> By cost centre
+          </button>
+        )}
+        <HelpButton title={TAB_HELP[activeTab][0]} doc={TAB_HELP[activeTab][1]} size={16} style={{ alignSelf: 'center' }} />
       </div>
 
       {/* v1.10.74 - Period + Currency Selector, shared by P&L, Client Analytics
           and Product Performance (they all read the same period/currency). */}
-      {activeTab !== 'aging' && activeTab !== 'party' && activeTab !== 'stock' && (
+      {activeTab !== 'aging' && activeTab !== 'party' && activeTab !== 'stock' && activeTab !== 'tds' && (
           <div className="glass-panel" style={{ padding: '1.25rem', marginBottom: '1.5rem' }}>
             <div style={{ display: 'flex', gap: '1rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
               <div className="form-group" style={{ margin: 0 }}>
@@ -269,10 +333,11 @@ export default function ReportsView() {
                 <div className="form-group" style={{ margin: 0 }}>
                   <label className="form-label">Currency</label>
                   <select className="form-input" value={currencyFilter} onChange={e => setCurrencyFilter(e.target.value)}>
-                    {allCurrencies.map(c => <option key={c} value={c}>{c}</option>)}
+                    {currencyChoices.map(c => <option key={c} value={c}>{c === ALL_INR ? 'All, in ₹' : c}</option>)}
                   </select>
                 </div>
               )}
+              <HelpButton title="Period and currency" doc="reports#period" size={16} style={{ marginBottom: 7 }} />
             </div>
           </div>
       )}
@@ -280,14 +345,18 @@ export default function ReportsView() {
       {activeTab === 'pl' && (
         <>
           {/* P&L Summary Cards */}
-          <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginBottom: '1.5rem' }}>
+          <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(190px, 100%), 1fr))', marginBottom: '1.5rem' }}>
             <div className="stat-card">
               <div className="stat-icon stat-icon-green"><TrendingUp size={22} /></div>
-              <div><p className="stat-label">Revenue (ex. tax)</p><h2 className="stat-value stat-value-green">{formatCurrency(revenueExTax, currencyFilter)}</h2></div>
+              <div><p className="stat-label">Revenue (ex. tax)</p><h2 className="stat-value stat-value-green">{formatCurrency(revenueExTax, shownCurrency)}</h2></div>
+            </div>
+            <div className="stat-card">
+              <div className="stat-icon stat-icon-amber"><Package size={22} /></div>
+              <div><p className="stat-label">Cost of goods sold</p><h2 className="stat-value">{formatCurrency(cogs.cost, shownCurrency)}</h2></div>
             </div>
             <div className="stat-card">
               <div className="stat-icon stat-icon-purple"><TrendingDown size={22} /></div>
-              <div><p className="stat-label">Expenses (ex. GST)</p><h2 className="stat-value stat-value-purple">{formatCurrency(expenseExGST, currencyFilter)}</h2></div>
+              <div><p className="stat-label">Expenses (ex. GST)</p><h2 className="stat-value stat-value-purple">{formatCurrency(expenseExGST, shownCurrency)}</h2></div>
             </div>
             <div className="stat-card">
               <div className="stat-icon" style={{ background: netProfit >= 0 ? 'var(--success-light)' : 'var(--danger-light)', color: netProfit >= 0 ? 'var(--success)' : 'var(--danger)' }}>
@@ -296,22 +365,23 @@ export default function ReportsView() {
               <div>
                 <p className="stat-label">Net {netProfit >= 0 ? 'Profit' : 'Loss'}</p>
                 {/* v1.10.74 - a loss shows a minus sign, not just red colour */}
-                <h2 className="stat-value" style={{ color: netProfit >= 0 ? 'var(--success)' : 'var(--danger)' }}>{formatCurrency(netProfit, currencyFilter)}</h2>
+                <h2 className="stat-value" style={{ color: netProfit >= 0 ? 'var(--success)' : 'var(--danger)' }}>{formatCurrency(netProfit, shownCurrency)}</h2>
+                {/* v1.10.84 - the margin moved here to make room for Cost of goods sold */}
+                <p className="text-muted" style={{ margin: 0, fontSize: '0.78rem' }}>Margin {revenueExTax > 0 ? Math.round((netProfit / revenueExTax) * 100) : 0}%</p>
               </div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-icon stat-icon-blue"><BarChart3 size={22} /></div>
-              <div><p className="stat-label">Margin</p><h2 className="stat-value">{revenueExTax > 0 ? Math.round((netProfit / revenueExTax) * 100) : 0}%</h2></div>
             </div>
           </div>
 
           {/* P&L Statement */}
           <div className="glass-panel" style={{ marginBottom: '1.5rem' }}>
             <div className="table-header">
-              <h3>Profit & Loss Statement</h3>
+              <h3>Profit & Loss Statement<HelpButton title="Profit & Loss Statement" doc="reports#pl-statement" size={16} /></h3>
               {allCurrencies.length > 1 && (
                 <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)', fontWeight: 400 }}>
-                  Showing {currencyFilter} invoices only
+                  {allInInr ? 'All invoices, in ₹ at each invoice\'s exchange rate' : `Showing ${currencyFilter} invoices only`}
+                  {allInInr && converted.missing.length > 0 && (
+                    <span style={{ color: 'var(--warn-text, #b45309)' }}> · ⚠ {converted.missing.length} left out, no exchange rate: {converted.missing.slice(0, 3).map(b => b.invoiceNumber).join(', ')}</span>
+                  )}
                 </span>
               )}
             </div>
@@ -320,34 +390,57 @@ export default function ReportsView() {
                 <tbody>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 500, color: 'var(--text-secondary)' }}>Total Revenue</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 600 }}>{formatCurrency(totalRevenue, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 600 }}>{formatCurrency(totalRevenue, shownCurrency)}</td>
                   </tr>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 500, color: 'var(--text-secondary)' }}>Less: GST Collected</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', color: '#dc2626' }}>-{formatCurrency(totalTaxCollected, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', color: '#dc2626' }}>-{formatCurrency(totalTaxCollected, shownCurrency)}</td>
                   </tr>
                   <tr style={{ borderBottom: '2px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 700 }}>Net Revenue</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 700 }}>{formatCurrency(revenueExTax, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 700 }}>{formatCurrency(revenueExTax, shownCurrency)}</td>
+                  </tr>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    <td style={{ padding: '0.6rem 0', fontWeight: 500, color: 'var(--text-secondary)' }}>
+                      Less: Cost of goods sold
+                      <div style={{ fontSize: '0.75rem', fontWeight: 400, color: 'var(--text-muted)' }}>
+                        {cogsShown ? 'Quantity sold x Purchase price (Products page), less goods returned on credit notes' : `Quantity sold x Purchase price, from ${baseCurrencyOf(ownerProfile)} at the exchange rate saved on each invoice`}
+                      </div>
+                      {cogs.noRate > 0 && (
+                        <div style={{ fontSize: '0.75rem', fontWeight: 400, color: 'var(--warn-text, #b45309)' }}>
+                          ⚠ {cogs.noRate} invoice{cogs.noRate !== 1 ? 's have' : ' has'} no exchange rate, so {cogs.noRate !== 1 ? 'their' : 'its'} cost is left out. Open the invoice and add the exchange rate next to its currency.
+                        </div>
+                      )}
+                      {cogs.missing.length > 0 && (
+                        <div style={{ fontSize: '0.75rem', fontWeight: 400, color: 'var(--warn-text, #b45309)' }}>
+                          ⚠ {cogs.missing.length} item{cogs.missing.length !== 1 ? 's' : ''} sold with no purchase price, counted at 0: {cogs.missing.slice(0, 3).join(', ')}{cogs.missing.length > 3 ? ` +${cogs.missing.length - 3} more` : ''}. Fill in the Purchase price on the Products page.
+                        </div>
+                      )}
+                    </td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', color: '#dc2626', verticalAlign: 'top' }}>-{formatCurrency(cogs.cost, shownCurrency)}</td>
+                  </tr>
+                  <tr style={{ borderBottom: '2px solid var(--border)' }}>
+                    <td style={{ padding: '0.6rem 0', fontWeight: 700 }}>Gross Profit</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 700 }}>{formatCurrency(grossProfit, shownCurrency)}</td>
                   </tr>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 500, color: 'var(--text-secondary)' }}>Total Expenses</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 600 }}>{formatCurrency(totalExpenseAmount, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 600 }}>{formatCurrency(totalExpenseAmount, shownCurrency)}</td>
                   </tr>
                   <tr style={{ borderBottom: '1px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 500, color: 'var(--text-secondary)' }}>Less: GST on Expenses (ITC)</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', color: '#059669' }}>-{formatCurrency(totalExpenseGST, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', color: '#059669' }}>-{formatCurrency(totalExpenseGST, shownCurrency)}</td>
                   </tr>
                   <tr style={{ borderBottom: '2px solid var(--border)' }}>
                     <td style={{ padding: '0.6rem 0', fontWeight: 700 }}>Net Expenses</td>
-                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 700 }}>{formatCurrency(expenseExGST, currencyFilter)}</td>
+                    <td style={{ padding: '0.6rem 0', textAlign: 'right', fontWeight: 700 }}>{formatCurrency(expenseExGST, shownCurrency)}</td>
                   </tr>
                   <tr>
                     <td style={{ padding: '1rem 0', fontWeight: 800, fontSize: '1.1rem' }}>
                       Net {netProfit >= 0 ? 'Profit' : 'Loss'}
                     </td>
                     <td style={{ padding: '1rem 0', textAlign: 'right', fontWeight: 800, fontSize: '1.25rem', color: netProfit >= 0 ? '#059669' : '#dc2626' }}>
-                      {formatCurrency(netProfit, currencyFilter)}
+                      {formatCurrency(netProfit, shownCurrency)}
                     </td>
                   </tr>
                 </tbody>
@@ -359,16 +452,16 @@ export default function ReportsView() {
           {monthlyKeys.length > 0 && (
             <div className="glass-panel">
               <div className="table-header" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
-                <h3>Monthly Breakdown</h3>
+                <h3>Monthly Breakdown<HelpButton title="Monthly Breakdown" doc="reports#monthly-breakdown" size={16} /></h3>
                 <TableExport title="Profit and loss by month" filename={`Profit-and-loss-${periodLabel}`} subtitle={exportSubtitle('before tax, GST left out')}
-                  headers={['Month', 'Revenue', 'Expenses', 'Profit/Loss']}
+                  headers={['Month', 'Revenue', 'Cost of goods sold', 'Expenses', 'Profit/Loss']}
                   rows={[
                     ...monthlyKeys.map(key => {
                       const m = monthlyPL[key];
                       const [y, mo] = key.split('-');
-                      return [`${MONTHS[parseInt(mo) - 1]} ${y}`, r2(m.revenue - m.tax), r2(m.expense - m.expGst), r2((m.revenue - m.tax) - (m.expense - m.expGst))];
+                      return [`${MONTHS[parseInt(mo) - 1]} ${y}`, r2(m.revenue - m.tax), r2(m.cogs), r2(m.expense - m.expGst), r2((m.revenue - m.tax) - m.cogs - (m.expense - m.expGst))];
                     }),
-                    ['Total', r2(revenueExTax), r2(expenseExGST), r2(netProfit)],
+                    ['Total', r2(revenueExTax), r2(cogs.cost), r2(expenseExGST), r2(netProfit)],
                   ]} />
               </div>
               <div className="table-scroll">
@@ -376,6 +469,7 @@ export default function ReportsView() {
                   <thead><tr>
                     <th>Month</th>
                     <th style={{ textAlign: 'right' }}>Revenue</th>
+                    <th style={{ textAlign: 'right' }}>Cost of goods sold</th>
                     <th style={{ textAlign: 'right' }}>Expenses</th>
                     <th style={{ textAlign: 'right' }}>Profit/Loss</th>
                   </tr></thead>
@@ -384,15 +478,16 @@ export default function ReportsView() {
                       const m = monthlyPL[key];
                       const rev = m.revenue - m.tax;
                       const exp = m.expense - m.expGst;
-                      const pl = rev - exp;
+                      const pl = rev - m.cogs - exp;
                       const [y, mo] = key.split('-');
                       return (
                         <tr key={key}>
                           <td className="font-medium">{MONTHS[parseInt(mo) - 1]} {y}</td>
-                          <td style={{ textAlign: 'right' }}>{formatCurrency(rev, currencyFilter)}</td>
-                          <td style={{ textAlign: 'right' }}>{formatCurrency(exp, currencyFilter)}</td>
+                          <td style={{ textAlign: 'right' }}>{formatCurrency(rev, shownCurrency)}</td>
+                          <td style={{ textAlign: 'right' }}>{formatCurrency(m.cogs, shownCurrency)}</td>
+                          <td style={{ textAlign: 'right' }}>{formatCurrency(exp, shownCurrency)}</td>
                           <td style={{ textAlign: 'right', fontWeight: 700, color: pl >= 0 ? '#059669' : '#dc2626' }}>
-                            {formatCurrency(pl, currencyFilter)}
+                            {formatCurrency(pl, shownCurrency)}
                           </td>
                         </tr>
                       );
@@ -407,7 +502,15 @@ export default function ReportsView() {
 
       {activeTab === 'party' && <PartyOutstandingReport bills={bills} businessName={businessName} />}
 
+      {activeTab === 'costcentres' && ccOn && (
+        <CostCentreReport bills={bills} expenses={expenses} profile={ownerProfile}
+          from={periodRange.from} to={periodRange.to} currency={shownCurrency}
+          subtitle={exportSubtitle('before tax, GST left out')} periodLabel={periodLabel} />
+      )}
+
       {activeTab === 'stock' && <StockReport businessName={businessName} />}
+
+      {activeTab === 'tds' && <TdsTcsReport bills={bills} businessName={businessName} onBillsChanged={loadData} />}
 
       {activeTab === 'aging' && (
         <>
@@ -417,7 +520,7 @@ export default function ReportsView() {
               {agingCurrencies.length > 1 && (
                 <p style={{ fontSize: '0.78rem', fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '0.5rem' }}>{cur}</p>
               )}
-              <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(5, 1fr)' }}>
+              <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(190px, 100%), 1fr))' }}>
                 <div className="stat-card">
                   <div className="stat-icon stat-icon-blue"><Wallet size={22} /></div>
                   <div><p className="stat-label">Total Outstanding</p><h2 className="stat-value">{formatCurrency(agingByCurrency[cur].total, cur)}</h2></div>
@@ -438,7 +541,7 @@ export default function ReportsView() {
             </div>
           ))}
           {agingCurrencies.length === 0 && (
-            <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(5, 1fr)', marginBottom: '1.5rem' }}>
+            <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(190px, 100%), 1fr))', marginBottom: '1.5rem' }}>
               {['Total Outstanding', 'Current (0-30d)', '31-60 days', '61-90 days', '90+ days'].map(label => (
                 <div key={label} className="stat-card">
                   <div><p className="stat-label">{label}</p><h2 className="stat-value">{formatCurrency(0)}</h2></div>
@@ -460,7 +563,7 @@ export default function ReportsView() {
           {/* Aging Table */}
           <div className="glass-panel">
             <div className="table-header" style={{ flexWrap: 'wrap', gap: '0.5rem' }}>
-              <h3>Outstanding Receivables</h3>
+              <h3>Outstanding Receivables<HelpButton title="Outstanding Receivables" doc="reports#outstanding-receivables" size={16} /></h3>
               <TableExport title="Outstanding receivables" filename="Outstanding-receivables" landscape
                 subtitle={[businessName, `unpaid as on ${today.toLocaleDateString('en-IN')}`].filter(Boolean).join(', ')}
                 headers={['Client', 'Invoice No', 'Date', 'Due date', 'Currency', 'Amount', 'Paid', 'Outstanding', 'Days overdue']}
@@ -519,7 +622,7 @@ export default function ReportsView() {
       {/* v1.9.5 — CLIENT ANALYTICS (revenue by client, aging, retention) */}
       {/* ============================================================ */}
       {activeTab === 'clients' && (() => {
-        const filteredBills = allFilteredBills.filter(b => getBillCurrency(b) === currencyFilter);
+        const filteredBills = billsShown;
         // Aggregate revenue + outstanding + count per client
         const byClient = {};
         filteredBills.forEach(b => {
@@ -542,7 +645,7 @@ export default function ReportsView() {
         return (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: '1rem' }}>
             <div className="glass-panel" style={{ padding: '1.25rem' }}>
-              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>🏆 Top clients by revenue</h3>
+              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>🏆 Top clients by revenue<HelpButton title="Top clients by revenue" doc="reports#top-clients" size={16} /></h3>
               {topByRevenue.length === 0 ? <p className="text-muted">No client data for this period.</p> : (
                 <table className="data-table" style={{ marginBottom: 0 }}>
                   <thead><tr><th>Client</th><th style={{ textAlign: 'right' }}>Revenue</th><th style={{ textAlign: 'right' }}>Invoices</th></tr></thead>
@@ -550,7 +653,7 @@ export default function ReportsView() {
                     {topByRevenue.map((c, i) => (
                       <tr key={i}>
                         <td className="font-medium">{c.name}</td>
-                        <td style={{ textAlign: 'right', color: '#059669', fontWeight: 600 }}>{formatCurrency(c.revenue, currencyFilter)}</td>
+                        <td style={{ textAlign: 'right', color: '#059669', fontWeight: 600 }}>{formatCurrency(c.revenue, shownCurrency)}</td>
                         <td style={{ textAlign: 'right' }}>{c.count}</td>
                       </tr>
                     ))}
@@ -560,7 +663,7 @@ export default function ReportsView() {
             </div>
 
             <div className="glass-panel" style={{ padding: '1.25rem' }}>
-              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>⚠️ Highest outstanding (worst payers)</h3>
+              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>⚠️ Highest outstanding (worst payers)<HelpButton title="Highest outstanding" doc="reports#worst-payers" size={16} /></h3>
               {worstPayers.length === 0 ? <p className="text-muted">Everyone is up to date. 🎉</p> : (
                 <table className="data-table" style={{ marginBottom: 0 }}>
                   <thead><tr><th>Client</th><th style={{ textAlign: 'right' }}>Outstanding</th><th style={{ textAlign: 'right' }}>% Unpaid</th></tr></thead>
@@ -568,7 +671,7 @@ export default function ReportsView() {
                     {worstPayers.map((c, i) => (
                       <tr key={i}>
                         <td className="font-medium">{c.name}</td>
-                        <td style={{ textAlign: 'right', color: '#dc2626', fontWeight: 700 }}>{formatCurrency(c.outstanding, currencyFilter)}</td>
+                        <td style={{ textAlign: 'right', color: '#dc2626', fontWeight: 700 }}>{formatCurrency(c.outstanding, shownCurrency)}</td>
                         <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{c.revenue > 0 ? `${Math.round((c.outstanding / c.revenue) * 100)}%` : '—'}</td>
                       </tr>
                     ))}
@@ -579,7 +682,7 @@ export default function ReportsView() {
 
             <div className="glass-panel" style={{ padding: '1.25rem', gridColumn: '1 / -1' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem' }}>
-                <h3 style={{ margin: 0, fontSize: '1rem' }}>📊 All clients breakdown ({clientArr.length})</h3>
+                <h3 style={{ margin: 0, fontSize: '1rem' }}>📊 All clients breakdown ({clientArr.length})<HelpButton title="All clients breakdown" doc="reports#all-clients" size={16} /></h3>
                 <TableExport title="Client analytics" filename={`Clients-${periodLabel}`} subtitle={exportSubtitle()}
                   headers={['Client', 'Invoices', 'Revenue', 'Paid', 'Outstanding', 'Last invoice']}
                   rows={[...clientArr].sort((a, b) => b.revenue - a.revenue).map(c => [c.name, c.count, r2(c.revenue), r2(c.paid), r2(c.outstanding), c.lastInvoiceDate || ''])} />
@@ -599,10 +702,10 @@ export default function ReportsView() {
                       <tr key={i}>
                         <td className="font-medium">{c.name}</td>
                         <td style={{ textAlign: 'right' }}>{c.count}</td>
-                        <td style={{ textAlign: 'right' }}>{formatCurrency(c.revenue, currencyFilter)}</td>
-                        <td style={{ textAlign: 'right', color: '#059669' }}>{formatCurrency(c.paid, currencyFilter)}</td>
+                        <td style={{ textAlign: 'right' }}>{formatCurrency(c.revenue, shownCurrency)}</td>
+                        <td style={{ textAlign: 'right', color: '#059669' }}>{formatCurrency(c.paid, shownCurrency)}</td>
                         <td style={{ textAlign: 'right', color: c.outstanding > 0 ? '#dc2626' : 'var(--text-muted)', fontWeight: c.outstanding > 0 ? 600 : 400 }}>
-                          {c.outstanding > 0 ? formatCurrency(c.outstanding, currencyFilter) : '—'}
+                          {c.outstanding > 0 ? formatCurrency(c.outstanding, shownCurrency) : '—'}
                         </td>
                         <td className="text-muted">{c.lastInvoiceDate ? new Date(c.lastInvoiceDate).toLocaleDateString('en-IN') : '—'}</td>
                       </tr>
@@ -619,37 +722,50 @@ export default function ReportsView() {
       {/* v1.9.5 — PRODUCT PERFORMANCE (best sellers, revenue per SKU) */}
       {/* ============================================================ */}
       {activeTab === 'products' && (() => {
-        const filteredBills = allFilteredBills.filter(b => getBillCurrency(b) === currencyFilter);
-        // Aggregate quantity + revenue + last-sold per unique item name
-        const byProduct = {};
-        filteredBills.forEach(b => {
-          (b.data?.items || []).forEach(item => {
-            if (item.isCharge) return; // v1.10.77 (#87) - delivery charges are not a product
-            const name = (item.name || item.description || 'Unnamed').trim();
-            if (!name || name === 'Unnamed') return;
-            if (!byProduct[name]) byProduct[name] = { name, hsn: item.hsn || '', qty: 0, revenue: 0, txns: 0, lastSold: '' };
-            // A credit note takes returned quantities back off.
-            const qty = salesSign(b) * (Number(item.quantity) || 0);
-            // v1.10.74 - revenue is the line's taxable value (after discount,
-            // tax backed out of tax-inclusive prices) so it matches the invoices.
-            // totals.taxInclusive is set only when GST was charged: a bill of
-            // supply's prices have no tax in them to back out.
-            const { afterDiscount } = calculateLineItemTax(item, !!(b.data?.totals?.taxInclusive ?? b.data?.taxInclusive));
-            byProduct[name].qty += qty;
-            byProduct[name].revenue += salesSign(b) * afterDiscount;
-            byProduct[name].txns += 1;
-            if (!byProduct[name].lastSold || b.invoiceDate > byProduct[name].lastSold) byProduct[name].lastSold = b.invoiceDate;
-            if (item.hsn && !byProduct[name].hsn) byProduct[name].hsn = item.hsn;
-          });
-        });
-        // #96 - quantities rounded once, after adding up (6356.959999 -> 6356.96).
-        const productArr = Object.values(byProduct).map((p) => ({ ...p, qty: roundQty(p.qty) }));
+        // v1.10.85 (#142) - worked out in utils/stock.js productSales: quantity
+        // (in the base unit, #148), revenue before tax (credit notes take off),
+        // filtered by item, category (with its sub-levels) and brand.
+        const productArr = productSales(billsShown, products, prodFilter);
+        const cats = categoryOptions(products);
+        const brands = brandOptions(products);
+        const setPF = (k, v) => setProdFilter((prev) => ({ ...prev, [k]: v }));
+        const trail = serialTrail(prodFilter.serial, purchases, bills);
+        const day = (d) => (d ? new Date(d).toLocaleDateString('en-IN') : '-');
         const bestSellers = [...productArr].sort((a, b) => b.revenue - a.revenue).slice(0, 10);
         const mostSoldByUnits = [...productArr].sort((a, b) => b.qty - a.qty).slice(0, 10);
         return (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(400px, 1fr))', gap: '1rem' }}>
+            <div className="glass-panel" style={{ padding: '0.75rem 1rem', gridColumn: '1 / -1', display: 'flex', gap: '0.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              <input type="text" className="form-input" style={{ width: 200 }} aria-label="Item" placeholder="Item name..." value={prodFilter.item} onChange={(e) => setPF('item', e.target.value)} />
+              {cats.length > 0 && (
+                <select className="form-input" style={{ width: 'auto', maxWidth: 260 }} aria-label="Category" value={prodFilter.category} onChange={(e) => setPF('category', e.target.value)}>
+                  <option value="">All categories</option>
+                  {cats.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              )}
+              {brands.length > 0 && (
+                <select className="form-input" style={{ width: 'auto' }} aria-label="Brand" value={prodFilter.brand} onChange={(e) => setPF('brand', e.target.value)}>
+                  <option value="">All brands</option>
+                  {brands.map((b) => <option key={b} value={b}>{b}</option>)}
+                </select>
+              )}
+              <input type="text" className="form-input" style={{ width: 210 }} aria-label="Serial number" placeholder="Serial no. / IMEI..." value={prodFilter.serial} onChange={(e) => setPF('serial', e.target.value)} />
+              <HelpButton title="Filtering the product report" doc="reports#product-filters" size={16} />
+            </div>
+            {prodFilter.serial.trim().length >= 3 && (
+              <div className="glass-panel" style={{ padding: '1rem 1.25rem', gridColumn: '1 / -1' }} aria-label="Serial number trail">
+                <h3 style={{ marginTop: 0, fontSize: '1rem' }}>Serial number {prodFilter.serial.trim()}</h3>
+                {!trail.bought.length && !trail.sold.length ? <p className="text-muted" style={{ margin: 0 }}>Not found on any purchase bill or invoice.</p> : (
+                  <ul style={{ margin: 0, paddingLeft: '1.1rem', fontSize: '0.88rem' }}>
+                    {trail.bought.map((t, i) => <li key={`b${i}`}>Bought {day(t.date)} from <strong>{t.supplierName || '-'}</strong>, bill {t.invoiceNumber || '-'} ({t.name}; S/N {t.serialNo})</li>)}
+                    {trail.sold.map((t, i) => <li key={`s${i}`}>{t.creditNote ? 'Returned on credit note' : 'Sold'} {day(t.date)} to <strong>{t.clientName || '-'}</strong>, {t.invoiceNumber} ({t.name})</li>)}
+                    {!trail.sold.length && <li className="text-muted">No invoice line names it yet.</li>}
+                  </ul>
+                )}
+              </div>
+            )}
             <div className="glass-panel" style={{ padding: '1.25rem' }}>
-              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>💰 Top revenue producers</h3>
+              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>💰 Top revenue producers<HelpButton title="Top revenue producers" doc="reports#top-products" size={16} /></h3>
               {bestSellers.length === 0 ? <p className="text-muted">No product data for this period.</p> : (
                 <table className="data-table" style={{ marginBottom: 0 }}>
                   <thead><tr><th>Product</th><th style={{ textAlign: 'right' }}>Revenue</th><th style={{ textAlign: 'right' }}>Qty sold</th></tr></thead>
@@ -657,7 +773,7 @@ export default function ReportsView() {
                     {bestSellers.map((p, i) => (
                       <tr key={i}>
                         <td className="font-medium" title={p.hsn ? `HSN ${p.hsn}` : ''}>{p.name}</td>
-                        <td style={{ textAlign: 'right', color: '#059669', fontWeight: 600 }}>{formatCurrency(p.revenue, currencyFilter)}</td>
+                        <td style={{ textAlign: 'right', color: '#059669', fontWeight: 600 }}>{formatCurrency(p.revenue, shownCurrency)}</td>
                         <td style={{ textAlign: 'right' }}>{p.qty}</td>
                       </tr>
                     ))}
@@ -667,7 +783,7 @@ export default function ReportsView() {
             </div>
 
             <div className="glass-panel" style={{ padding: '1.25rem' }}>
-              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>📦 Most units sold</h3>
+              <h3 style={{ marginTop: 0, fontSize: '1rem' }}>📦 Most units sold<HelpButton title="Most units sold" doc="reports#most-units" size={16} /></h3>
               {mostSoldByUnits.length === 0 ? <p className="text-muted">No product data.</p> : (
                 <table className="data-table" style={{ marginBottom: 0 }}>
                   <thead><tr><th>Product</th><th style={{ textAlign: 'right' }}>Qty sold</th><th style={{ textAlign: 'right' }}>Txns</th></tr></thead>
@@ -686,7 +802,7 @@ export default function ReportsView() {
 
             <div className="glass-panel" style={{ padding: '1.25rem', gridColumn: '1 / -1' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem' }}>
-                <h3 style={{ margin: 0, fontSize: '1rem' }}>📋 All products ({productArr.length})</h3>
+                <h3 style={{ margin: 0, fontSize: '1rem' }}>📋 All products ({productArr.length})<HelpButton title="All products" doc="reports#all-products" size={16} /></h3>
                 <TableExport title="Product performance" filename={`Products-sold-${periodLabel}`} subtitle={exportSubtitle('revenue before tax')}
                   headers={['Product', 'HSN', 'Qty sold', 'Revenue', 'Avg rate', 'Txns', 'Last sold']}
                   rows={[...productArr].sort((a, b) => b.revenue - a.revenue).map(p => [p.name, p.hsn || '', p.qty, r2(p.revenue), p.qty > 0 ? r2(p.revenue / p.qty) : 0, p.txns, p.lastSold || ''])} />
@@ -707,8 +823,8 @@ export default function ReportsView() {
                         <td className="font-medium">{p.name}</td>
                         <td className="text-muted" style={{ fontSize: '0.78rem' }}>{p.hsn || '—'}</td>
                         <td style={{ textAlign: 'right' }}>{p.qty}</td>
-                        <td style={{ textAlign: 'right' }}>{formatCurrency(p.revenue, currencyFilter)}</td>
-                        <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{p.qty > 0 ? formatCurrency(p.revenue / p.qty, currencyFilter) : '—'}</td>
+                        <td style={{ textAlign: 'right' }}>{formatCurrency(p.revenue, shownCurrency)}</td>
+                        <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>{p.qty > 0 ? formatCurrency(p.revenue / p.qty, shownCurrency) : '—'}</td>
                         <td style={{ textAlign: 'right' }}>{p.txns}</td>
                         <td className="text-muted">{p.lastSold ? new Date(p.lastSold).toLocaleDateString('en-IN') : '—'}</td>
                       </tr>

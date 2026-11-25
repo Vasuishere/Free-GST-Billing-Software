@@ -8,8 +8,13 @@ import {
   getCountriesForRegion,
   PAPER_SIZES,
   decodeGstin,
+  COUNTRIES,
+  localToday,
 } from '../utils';
-import { getRegionMode } from '../store';
+import { fyStartDate, openingFields } from '../utils/clientLedger';
+import { getRegionMode, activePriceLevels } from '../store';
+import { PriceLevelSelect } from './PriceLevelFields';
+import HelpButton from './HelpButton';
 
 const makeAddrId = () => 'addr_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
 
@@ -30,6 +35,7 @@ const emptyShipping = (country) => ({
 
 /** Normalise a legacy (flat) or v2 client object into the modal form state. */
 function normaliseClient(client, fallbackCountry) {
+  const defaultOpeningDate = fyStartDate(localToday());
   if (client?.billingAddress) {
     const shipping = (client.shippingAddresses || []).map((a) => ({
       ...emptyShipping(fallbackCountry),
@@ -41,9 +47,16 @@ function normaliseClient(client, fallbackCountry) {
       email: client.email || '',
       phone: client.phone || '',
       isSEZ: !!client.isSEZ,
+      isDeemedExport: !!client.isDeemedExport,
       preferredPaperSize: client.preferredPaperSize || '',
       preferredCurrency: client.preferredCurrency || '',
       autoPrint: !!client.autoPrint,
+      creditLimit: client.creditLimit || '',
+      priceLevel: client.priceLevel || '',
+      openingBalance: client.openingBalance || '',
+      openingBalanceDate: client.openingBalanceDate || defaultOpeningDate,
+      openingBalanceType: client.openingBalanceType === 'advance' ? 'advance' : 'receivable',
+      openingBalanceBusiness: client.openingBalanceBusiness || '',
       billingAddress: { ...emptyAddress(fallbackCountry), ...client.billingAddress },
       shippingAddresses: shipping,
       sameAsBilling: shipping.length === 0,
@@ -55,9 +68,16 @@ function normaliseClient(client, fallbackCountry) {
     email: client?.email || '',
     phone: client?.phone || '',
     isSEZ: !!client?.isSEZ,
+    isDeemedExport: !!client?.isDeemedExport,
     preferredPaperSize: client?.preferredPaperSize || '',
     preferredCurrency: client?.preferredCurrency || '',
     autoPrint: !!client?.autoPrint,
+    creditLimit: client?.creditLimit || '',
+    priceLevel: client?.priceLevel || '',
+    openingBalance: client?.openingBalance || '',
+    openingBalanceDate: client?.openingBalanceDate || defaultOpeningDate,
+    openingBalanceType: client?.openingBalanceType === 'advance' ? 'advance' : 'receivable',
+    openingBalanceBusiness: client?.openingBalanceBusiness || '',
     billingAddress: {
       address: client?.address || '',
       city: client?.city || '',
@@ -161,7 +181,8 @@ function AddressFields({ addr, onChange, countryConfig, stateOptions, label }) {
   );
 }
 
-export default function ClientModal({ show, onClose, onSave, client, isEditing, defaultCountry }) {
+// v1.10.86 (#214) - businessKey: the business an opening balance typed here is with.
+export default function ClientModal({ show, onClose, onSave, client, isEditing, defaultCountry, businessKey = '' }) {
   // Country defaults: explicit prop (active business profile) -> browser locale -> 'India'.
   const fallbackCountry = defaultCountry || detectCountryFromBrowser();
   const [form, setForm] = useState(() => normaliseClient(null, fallbackCountry));
@@ -181,11 +202,10 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
 
   const billingCc = getCountryConfig(form.billingAddress.country);
   const billingStates = getStatesForCountry(form.billingAddress.country);
+  const abroad = !!form.billingAddress.country && form.billingAddress.country !== (defaultCountry || 'India');
+  const currencyCodes = [...new Set(COUNTRIES.map((c) => c.currency))];
+  const levels = activePriceLevels();
 
-  // v1.10.68 (#68, idea from @deppen12) — a GSTIN already says which state the
-  // client is registered in and carries a checksum, so fill the state in and
-  // catch a typo here, offline. The state drives place of supply, so a wrong
-  // one silently swaps CGST + SGST for IGST on every invoice to this client.
   const handleTaxIdBlur = () => {
     const result = validateTaxId(form.billingAddress.country, form.gstin);
     setTaxIdWarning(result.ok ? '' : result.message);
@@ -256,15 +276,20 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
     if (shippingList.length > 0 && !shippingList.some((a) => a.isDefault)) {
       shippingList[0] = { ...shippingList[0], isDefault: true };
     }
+    const limit = Number(form.creditLimit);
     onSave({
       name: form.name,
       gstin: form.gstin,
       email: form.email,
       phone: form.phone,
       isSEZ: form.isSEZ,
+      isDeemedExport: form.isDeemedExport,
       preferredPaperSize: form.preferredPaperSize,
       preferredCurrency: form.preferredCurrency,
       autoPrint: form.autoPrint,
+      creditLimit: Number.isFinite(limit) && limit > 0 ? Math.round(limit * 100) / 100 : '',
+      priceLevel: form.priceLevel,
+      ...openingFields(form, businessKey, localToday()),
       // Backward-compat flat fields kept for existing invoice/statement/GSTR consumers
       address: form.billingAddress.address,
       city: form.billingAddress.city,
@@ -345,19 +370,34 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
           </div>
 
           {form.billingAddress.country === 'India' && (
-            <div className="form-group" style={{ gridColumn: 'span 2' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={!!form.isSEZ}
-                  onChange={(e) => setForm((prev) => ({ ...prev, isSEZ: e.target.checked }))}
-                  style={{ width: 16, height: 16, accentColor: 'var(--primary)' }}
-                />
-                <span>
-                  <strong>SEZ unit / Developer</strong> — supplies will be charged IGST regardless of state (Section 16, IGST Act).
-                </span>
-              </label>
-            </div>
+            <>
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={!!form.isSEZ}
+                    onChange={(e) => setForm((prev) => ({ ...prev, isSEZ: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: 'var(--primary)' }}
+                  />
+                  <span>
+                    <strong>SEZ unit / Developer</strong> — supplies will be charged IGST regardless of state (Section 16, IGST Act).
+                  </span>
+                </label>
+              </div>
+              <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={!!form.isDeemedExport}
+                    onChange={(e) => setForm((prev) => ({ ...prev, isDeemedExport: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: 'var(--primary)' }}
+                  />
+                  <span>
+                    <strong>Deemed export</strong> — EOU / EPCG / notified supply (Section 147, CGST Act).
+                  </span>
+                </label>
+              </div>
+            </>
           )}
 
           {/* Billing Address */}
@@ -520,9 +560,78 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
             )}
           </div>
 
-          {/* v1.9.1 — per-client print preferences. All optional; leave blank
-              to use the app-wide defaults from Settings. When set, they
-              auto-apply the next time an invoice is created for this client. */}
+          {/* Credit limit & Price level (v1.10.85) */}
+          <div className="form-group" style={{ gridColumn: 'span 2', display: 'grid', gridTemplateColumns: levels.length ? '1fr 1fr' : '1fr', gap: '0.6rem', paddingTop: '0.5rem', borderTop: '1px solid var(--border)' }}>
+            <div>
+              <label htmlFor="client-credit-limit" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, marginBottom: 3 }}>
+                Credit limit (optional)
+              </label>
+              <input
+                id="client-credit-limit"
+                type="number"
+                min="0"
+                step="any"
+                className="form-input"
+                style={{ fontSize: '0.8rem', padding: '0.35rem' }}
+                value={form.creditLimit}
+                placeholder="No limit"
+                onChange={(e) => setForm((prev) => ({ ...prev, creditLimit: e.target.value }))}
+                title="New Invoice warns when what they owe plus the new invoice goes over this. It never stops you."
+              />
+            </div>
+            <PriceLevelSelect levels={levels} value={form.priceLevel} onChange={(v) => setForm((prev) => ({ ...prev, priceLevel: v }))} />
+          </div>
+
+          {/* Opening balance (v1.10.86 #214) */}
+          <div className="form-group" style={{ gridColumn: 'span 2', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.6rem' }}>
+            <div>
+              <label htmlFor="client-opening" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, marginBottom: 3 }}>
+                Opening balance (optional) <HelpButton title="Opening balance" doc="clients#opening-balance" size={14} />
+              </label>
+              <input
+                id="client-opening"
+                type="number"
+                min="0"
+                step="any"
+                className="form-input"
+                style={{ fontSize: '0.8rem', padding: '0.35rem' }}
+                value={form.openingBalance}
+                placeholder="0"
+                onChange={(e) => setForm((prev) => ({ ...prev, openingBalance: e.target.value }))}
+                title="What this client owed you, or had paid you in advance, when you started using this app."
+              />
+            </div>
+            <div>
+              <label htmlFor="client-opening-date" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, marginBottom: 3 }}>
+                As on
+              </label>
+              <input
+                id="client-opening-date"
+                type="date"
+                className="form-input"
+                style={{ fontSize: '0.8rem', padding: '0.35rem' }}
+                value={form.openingBalanceDate}
+                onChange={(e) => setForm((prev) => ({ ...prev, openingBalanceDate: e.target.value }))}
+              />
+            </div>
+            <div>
+              <label htmlFor="client-opening-type" style={{ display: 'block', fontSize: '0.75rem', fontWeight: 600, marginBottom: 3 }}>
+                It is
+              </label>
+              <select
+                id="client-opening-type"
+                className="form-input"
+                style={{ fontSize: '0.8rem', padding: '0.35rem' }}
+                value={form.openingBalanceType}
+                onChange={(e) => setForm((prev) => ({ ...prev, openingBalanceType: e.target.value }))}
+              >
+                <option value="receivable">Owed to you</option>
+                <option value="advance">Their advance</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Print preferences */}
           <div
             className="form-group"
             style={{
@@ -542,7 +651,7 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
                 marginBottom: '0.35rem',
               }}
             >
-              Print preferences (optional)
+              Print preferences (optional) <HelpButton title="Client print preferences" doc="clients#client-print-prefs" size={16} />
             </div>
             <p style={{ fontSize: '0.72rem', color: 'var(--text-muted)', margin: '0 0 0.5rem' }}>
               Auto-applied when you create a new invoice for this client. Leave blank to use app-wide defaults.
@@ -576,14 +685,12 @@ export default function ClientModal({ show, onClose, onSave, client, isEditing, 
                   value={form.preferredCurrency}
                   onChange={(e) => setForm((prev) => ({ ...prev, preferredCurrency: e.target.value }))}
                 >
-                  <option value="">Use invoice default</option>
-                  <option value="INR">INR (₹)</option>
-                  <option value="USD">USD ($)</option>
-                  <option value="EUR">EUR (€)</option>
-                  <option value="GBP">GBP (£)</option>
-                  <option value="AED">AED (د.إ)</option>
-                  <option value="SGD">SGD (S$)</option>
-                  <option value="AUD">AUD (A$)</option>
+                  <option value="">{abroad ? "Their country's currency" : 'Use invoice default'}</option>
+                  {currencyCodes.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
                 </select>
               </div>
               <label

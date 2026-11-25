@@ -86,7 +86,7 @@ If you are comfortable with a terminal, this does all of the above by itself.
 It needs no admin rights and writes nothing outside your own user folder:
 
 ```powershell
-irm https://raw.githubusercontent.com/IamRamgarhia/Free-GST-Billing-Software/main/install.ps1 | iex
+[Net.ServicePointManager]::SecurityProtocol='Tls12'; irm https://raw.githubusercontent.com/IamRamgarhia/Free-GST-Billing-Software/main/install.ps1 | iex
 ```
 
 It installs to `%LOCALAPPDATA%\Programs\Free GST Billing`. To pick your own
@@ -109,7 +109,7 @@ npm start          # builds, then serves on http://localhost:47371
 Open <http://localhost:47371> in your browser.
 
 **Updating on Linux or a NAS.** If you installed from the release ZIP, use
-*Control Panel → Update Now* (v1.10.66 and later). It backs up your data first,
+*Settings → App & updates → Update Now* (v1.10.66 and later; the Control Panel until v1.10.85). It backs up your data first,
 downloads the latest release, and puts the previous version back if anything
 fails. It needs `unzip` (or python3): `sudo apt install unzip` on Debian /
 Ubuntu, `apk add unzip` on Alpine. Restart the app — or its container —
@@ -319,8 +319,8 @@ your unit name. It's saved on this device and shows up everywhere.
 A: Open *Bills*, find the invoice and press the red **Cancel invoice** button.
 The invoice keeps its number and stays in the list marked *Cancelled*, prints
 with **CANCELLED** across it, and stops counting in your totals, reports and GST
-returns. Any stock on it is put back. Changed your mind? Pick another status
-(for example *Unpaid*) from the status dropdown on that row.
+returns. Any stock on it is put back. Changed your mind? Click the **Undo
+cancel** arrow among that row's actions.
 
 Invoice numbers must run without gaps for GST, which is why a saved invoice is
 cancelled rather than deleted.
@@ -336,7 +336,7 @@ in the address bar and Windows treats it like any other desktop app —
 appears in Start Menu, has its own window, no browser chrome.
 
 **Q: How do I update to a new version?**
-A: In the app, **⚙ Control Panel → Update Now** — or **Update Software** in
+A: In the app, **Settings → App & updates → Update Now** — or **Update Software** in
 the launcher. Either one backs your data up first, then fetches the latest
 release. Your invoices, clients and settings are not touched.
 

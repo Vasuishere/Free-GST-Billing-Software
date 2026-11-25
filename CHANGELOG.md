@@ -7,9 +7,1011 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.10.83] - unreleased
+## [1.10.86] - 2026-11-21
+
+### How to update
+
+**Current version:** 1.10.85  →  **New version:** 1.10.86
+
+#### If the in-app Update button works for you (1.10.73 and later)
+1. Open the app and click **Update to v1.10.86** in the menu, or
+   **Settings → App & updates → Update Now** (in 1.10.85: Control Panel →
+   **Update Software**).
+2. A progress screen shows while it updates. When it says it is done, reload
+   the page.
+
+#### Installed with the Windows Setup
+Click **Update Now** in the app (or right-click the icon near the clock →
+**Check for updates**). Nothing to download by hand.
+
+#### On 1.10.72 or older
+Use the launcher: **More options → Update to the latest version**, then
+**Open App**.
+
+#### If that does not work (or you are unsure)
+1. Download `Free-GST-Billing.zip` from the
+   [Releases page](https://github.com/IamRamgarhia/Free-GST-Billing-Software/releases/latest).
+2. Close the app (Control Panel → **Stop Server** in 1.10.85, or the launcher's
+   **More options → Stop the app**).
+3. **Right-click the ZIP → Extract All.** Do not open anything while still inside the ZIP.
+4. Extract over your existing Free GST Billing folder, replacing files when asked.
+5. Double-click **Free GST Billing - WINDOWS**.
+
+#### Mac
+Use the **Update** button in the app. **Never drag the new folder over the
+old one on a Mac**: Finder's Replace swaps the whole folder, including
+`_system/data` with your invoices. Step by step:
+[Updating on a Mac](https://dicecodes.com/free-gst-software-documentation/update.html#mac).
+
+#### Linux / NAS
+Run `update-unix.sh` from the `_system` folder, or extract the new ZIP over
+the old folder. Restart the app afterwards. The `.deb` and the AppImage:
+download the new file and install or use it instead of the old one.
+**Docker:** put `1.10.86` in the `image:` line of your `docker-compose.yml`,
+then `docker compose pull` and `docker compose up -d` (start it with compose,
+not Docker Desktop's Run button).
+
+Your invoices, clients, products and settings are never touched by an update;
+a backup is made first.
+
+The next update is planned for **Saturday 28 November 2026**.
 
 ### Added
+- **Update the products you have from a CSV** (thanks @happy-in, #208, #215):
+  Products → **Import product updates** (in the top bar). Export your products,
+  change purchase and selling prices, HSN/SAC and, only if you switch it on,
+  stock in a spreadsheet, and upload it: every change is shown old → new before
+  you confirm. A blank cell changes nothing; invoices already made keep their
+  prices; a failed save puts everything back.
+- **Terms for a restaurant and a repair shop**: choosing Restaurant / cafe or
+  Service / repair shop as the business type starts new invoices with short
+  terms of their own (no refund once served; repair warranty, uncollected items),
+  and both are in Settings → Terms templates → Quick Start.
+- **Hide or show the preview with Ctrl+Shift+F** on New Invoice (#211), like
+  the Hide Preview button; it is remembered and listed under Keyboard shortcuts.
+- **Discount on the whole purchase bill** (thanks @npadhya, #196): under the
+  items of **Add Purchase Bill**, type a discount in **Discount on whole
+  bill**, as **₹** or **%**. It is taken before GST (a trade discount): shared
+  over the items by their value, with GST and cess worked out on what is left,
+  so a bill with items at different GST rates gets the right input tax credit.
+  The totals, the view and the PDF show it on its own line; GSTR-3B, GSTR-2B
+  matching, Owed to suppliers, TDS and the products' purchase price use the
+  value after it, and a return takes its part back. It cannot change once
+  goods on the bill have gone back on a debit note.
+- **GSTR-1 Table 14: sales through Flipkart, Amazon and other e-commerce
+  operators** (#209): a new **E-commerce operator GSTIN** box under **More
+  invoice details** (not printed). The GSTR-1 tab adds up these sales per
+  operator, less credit notes, and the JSON file carries them for Table 14;
+  they also stay in B2B and B2C. Type **Flipkart's GSTIN** once in Settings ->
+  Company (GSTR filing details) and the Flipkart orders import fills the box on
+  every invoice; a credit note made by scanning a return label keeps it.
+- **MRP on products and on the invoice** (#189, #192): an optional MRP on
+  each product (form, list, CSV / Excel import and export). It comes onto the
+  invoice line when you pick the product, and you can change it there; on a
+  line sold in the second unit (Box = 12 Pcs) it is the piece MRP x 12. A new
+  **MRP column** switch in Customize (off to start) prints it in all five
+  designs, and on the item line of thermal receipts. It never changes the
+  rate, GST or total.
+- **Supplier statement** (#148, #194): on Purchases, a supplier's bills,
+  payments, TDS kept back and returns for any dates, with a running balance
+  and what you still owe, as a PDF with Download, Print, WhatsApp and Email.
+- **GSTR-2B: Add as purchase bill** (#175): on entries that are in 2B but not
+  in your books. It opens a purchase bill filled in from 2B for you to check
+  and save; it then shows as matched.
+- **Reverse charge on purchase bills**: tick **Reverse charge** for a
+  transporter (GTA), an advocate or other reverse-charge purchases. GSTR-3B
+  shows the tax in 3.1(d), adds it to the cash to pay, and gives it back as
+  credit in 4(A)(3). The supplier is owed the bill without its GST. GSTR-2B
+  **Add as purchase bill** ticks it from 2B.
+- **You can see an update running**: Update Now (Control Panel, Settings ->
+  Updates, or the update window) shows a window in the middle of the app with
+  a progress bar and what it is doing, reloads on the new version by itself,
+  and says what went wrong if it could not finish.
+- **A phone button at the top** of every screen shows the QR code to pair a
+  phone or tablet (or says what to turn on first). It can be hidden in
+  Settings -> Features.
+- **Pairing a phone is easier**: the QR code first opens a simple page that
+  shows where to tap when the browser warns "Your connection is not private"
+  (Chrome and Safari) and the PC's security code; Continue then opens the
+  encrypted pairing page. The PIN is typed only once when pairing, and the PC
+  shows "Paired: <name>" at once.
+- **The menu in groups you can customise**: the sidebar's screens are in
+  three groups (Sales, Stock & buying, Money & reports) that open and close
+  with a click. The pencil next to your business name opens **Customise
+  menu**: move items and groups, choose which groups start open, take items
+  out of the menu (the screen stays on and search still finds it), and
+  **Reset menu**. **Edit business details** is now in the list under your
+  business name.
+- **Red dots in the menu** when something needs you: overdue invoices
+  (Dashboard), recurring invoices due (Recurring), low stock (Products), a GST
+  return due in the next 10 days (GST Returns), an update (Settings), and
+  "New" on screens with something new. A closed group, the slim icon menu and
+  the phone's menu button show it too. They agree with the bell (Mark all as
+  read clears both); turn them off in Settings -> Appearance.
+- **Search answers "How do I…" questions** (Ctrl+K or the search box at the
+  top): 87 answers, everyday words and spelling mistakes work too ("credit
+  note", "add my logo", "bill kaise banaye"). Click to go straight to the
+  screen or Settings box (it is outlined), or **Guide** to read that part of
+  the online guide. The guide's pages are searchable too.
+- **New Invoice is shorter and shows the total** (#147, #189): items come
+  right under the customer; address, GSTIN, ship-to, order details, terms and
+  notes open on click and say what is in them when closed. Items, GST, total,
+  received and balance stay on screen next to Save. The document type is one
+  drop-down that starts as the type you used last, and the preview opens
+  fitted to its space.
+- **Add a client in one click**: a blue **New client** button next to Client
+  Name on New Invoice opens the client window, and **Add Client** is the
+  main button on the Clients screen again. Invoice Details uses both
+  columns: Due Date, Currency and Place of Supply sit on one row, and the client's
+  Country, City and State share a row with PIN and GSTIN below. Boxes in
+  More invoice details no longer touch side by side.
+- **Invoice number limit for GST**: with a GSTIN, the Invoice Number box on a
+  tax invoice or credit note takes at most 16 characters (letters, digits,
+  - and /) and shows a 12/16 count, so GSTR-1 never refuses the number.
+- **New Invoice cards you can close and move**: Document type, Billed To,
+  Line Items, Invoice Details and Terms & notes open and close from their
+  title, and a closed card shows one line of what is in it ("2 items ·
+  ₹6,372.00"). Drag a card by its ⋮⋮ grip, or use ⋯ -> Move up / Move down,
+  to put them in your order; **Reset layout** puts them back. Saving with
+  something missing opens the right card and puts the cursor in the box.
+  **Customize invoice** now sits in the Document type card. Each item row
+  shows its amount next to its delete button, and **Add Item** is clearer.
+- **New invoice starts with** (Settings -> Company): document type, due in,
+  GST %, how "Received now" was paid, goods or services.
+- **Client quick actions**: New invoice, Record payment and Send reminder on a
+  client's account.
+- **Customise Dashboard**: hide, show or move its blocks, and choose where the
+  app opens (Dashboard, New Invoice or the invoice list).
+- **Sort by column** on the Dashboard, Purchases, Expenses and Products (click
+  a column heading; each list remembers), and **Sort by** for Clients.
+- **Saved filters** on the Dashboard: the last filters come back, and **Save
+  these filters** makes a named button.
+- **Scan a returned parcel to make its credit note** (#197): scan the label's
+  barcode (or type the order ID, AWB or invoice number) in the Dashboard
+  search; the invoice shows with **Return / credit note**, which opens a
+  credit note with the same items. Saving puts the stock back.
+- **WhatsApp sends the PDF from the PC too**: the app copies the invoice PDF
+  and opens the client's chat; press Ctrl+V (Mac: Cmd+V), then Send. On a
+  phone the Share sheet attaches it. Works on the invoice screen, the invoice
+  list, a client's account, statements and purchase orders. The invoice
+  screen's WhatsApp button saves the invoice first, like Save PDF.
+- **What's new after an update**: the first time the app opens after an
+  update, a few slides show what is new, once. See them again from Support &
+  About.
+- **Settings -> Appearance**: choose the app's colour, the text size of the
+  screens (Smaller to Largest), compact lists, and the red dots. Invoices and
+  PDFs keep their own look.
+- **Forgot PIN?** shows numbered steps with the exact folder, **Open the
+  folder**, and a button that opens the app as soon as the RESET-PIN file is
+  there.
+- **Windows: install with one command**, `winget install DiceCodes.FreeGSTBilling`
+  (once Microsoft has listed it).
+- **Opening balance for clients** (#214): on the client form, what a client
+  owed you (or paid in advance) when you started, with its "as on" date (1
+  April to start). It counts in their Outstanding, the Statement PDF (first
+  row), ageing and reminders, the credit limit warning and the Dashboard's
+  Outstanding. A receipt on no invoice (Record payment, Against Invoice left
+  blank) pays it off. Clients CSV import reads an optional Opening Balance
+  column.
+- **Every receipt in one number series** (#202): payments recorded on the
+  Dashboard, with Received now on New Invoice, or from a bank statement match
+  now get the next RCP number (RCP/2026-27/0013), the same series as the
+  Receipts page. Older receipts keep their numbers.
+
+### Changed
+- **Product suggestions on New Invoice show MRP and stock** (#219), and
+  "Out of stock" in red, so products with similar names are easy to tell apart.
+- **One backup button**: Settings → Data & Backups no longer has a separate
+  Move to Another PC card. Create Backup makes the same ZIP: copy it to the new
+  computer and use Restore Backup there. The launcher keeps its Move option.
+- **The Dashboard says when the list is filtered**: the filters are remembered,
+  so a bar above the list reads "Showing only: Overdue (4)" with Show all.
+- **The Windows Setup says "Updating"** when it updates the installed app
+  (window title, pages and the Update button), instead of "Installing".
+- **A shorter What's new** on Support & About: only the main titles of each
+  version, with **Read the full notes** for the full list on GitHub.
+- **One setup when you start**: the welcome asks what kind of business you
+  run (the second "Step 1 of 3" window is gone). Your business type also puts
+  matching terms on your bills (a shop no longer prints software-agency
+  terms), sets the print style, and starts shop and restaurant invoices with
+  "Cash Sale". Typing your GSTIN fills in your state and PAN.
+- **Same words and buttons everywhere**: View, Edit, Payment and More (…) in
+  the same order on every list; "Import / export CSV", "Purchases", "Add
+  Purchase Bill", "New Receipt"; one Business type picker (Settings ->
+  Company). A search box sits at the top of every screen, and **?** lists the
+  keyboard shortcuts.
+- **White suggestion lists**: Cash book name and category, supplier, item,
+  unit, client, category, brand, return reason and purpose code show the
+  app's own list (dark in dark mode) instead of the browser's black one, with
+  a search at the top when long.
+- **Edit in a window**: the Cash book's and cost centres' pencil opens a small
+  Edit window.
+- **A tidier Dashboard**: Totals for sits next to the title; the invoice
+  filters fit one line (dates and cost centre under **Dates & more**, Quick
+  print is one **Print** menu); the total cards line up.
+- **Free forever** sits under the app name in the menu; one **Lock** button
+  (on the Dashboard); the Control Panel says how the app was installed and
+  keeps Node.js, port and folders under Technical details.
+- **Node.js 26** (long-term support) for the Windows Setup, the Linux
+  packages, Docker and the Mac / Linux install line; Macs before macOS 13.5,
+  32-bit Windows and 32-bit ARM keep Node.js 22.
+- **Hide for 7 days** on the support card (was 30).
+- **One line at the top of every screen**: the page name, its (?) and count,
+  the screen's own choices (Totals for, Year, the GST period), the search
+  box, the screen's buttons and the app's small buttons share one row, so the
+  page starts higher. The main button keeps its words (New Invoice, Add
+  Product…); the others are small icons (point at one to see its name). In a
+  narrower window the search becomes a magnifying glass and the icons move
+  into a ⋯ button. The line that used to sit under a page's name now shows
+  when you point at its (?).
+- **The Control Panel is now part of Settings**: Update, Restart, Stop and
+  Remove are in **Settings -> App & updates**; Backup ZIP, Restore, Move to
+  another PC and the Open folder buttons are in **Settings -> Data & Backups
+  -> Backup files (ZIP)**. One Check for Updates and one Update Now. The menu
+  is one item shorter; an old bookmark to the Control Panel opens App &
+  updates, and the guide's Control Panel page says where each button went.
+- **Packages**: DOMPurify 3.4.18, Vite 7.3.8.
+
+### Fixed
+- **Linux: Node.js 26 on systems without libatomic**: the .deb and the
+  AppImage carry the small libatomic library Node.js 26 needs, and the one-line
+  install uses Node.js 22 on a computer that lacks it, so minimal Debian /
+  Ubuntu systems install and start as before.
+- **Settings no longer shows "Internal server error"** (#217) when the starting
+  terms could not be saved (a folder locked by OneDrive or antivirus): the
+  default terms are shown and saving is tried again next time.
+- **Docker: the app could not be opened** when the container was started
+  with Docker Desktop's Run button or without a PIN (#207). The log now says
+  what is missing and which address to open (https://127.0.0.1:47443 on the
+  same PC), Docker shows the container as unhealthy until it can be reached,
+  and the guide covers Docker Desktop on Windows and Mac.
+- **No error reports from the developer server** (#204): its live-reload
+  connection is not a problem in the app.
+- **Purchases no longer make duplicate products** (#199): each line on a bill
+  remembers the product it is, so renaming a line while editing a bill, an
+  extra space in a name, or a name from GSTR-2B or a photo no longer makes a
+  second product. A name with no product is matched by its barcode before a
+  new product is made, and the line says "New product" so you can pick the
+  one you have instead. Stock on edit, delete and returns follows the same
+  product. Old bills still match by name.
+- **Importing a file that gives nothing now says why** (#213): a Flipkart
+  report whose orders have no invoice number yet, a file where every invoice
+  is cancelled, another marketplace's orders file (use the Template), or a
+  cell with an unclosed quote. A purchase file with negative quantities says
+  to record returns with Return to supplier on the bill.
+- **The Returns tab is always on Purchases** (#213): with no returns yet, it
+  says how to make one (a purchase bill's ⋯ menu, Return to supplier).
+- **One client, one account** (#202): a bill typed as "abc traders" or with
+  extra spaces no longer makes a second card on the Clients screen; it is in
+  the saved client's account. Typing a saved client's name on a new invoice
+  saves it under that client, as if picked from the list.
+- **Editing a receipt no longer pays the invoice twice** (#202): editing, on
+  the Receipts page, a payment recorded on the Dashboard used to add a second
+  payment to the invoice. Editing an older payment on the Dashboard no longer
+  leaves its old receipt behind.
+- **Update Now on the ZIP copy no longer stays on "Updating..." for ever**
+  (ERR-089): the update finishes and the app restarts on the new version.
+  Restore no longer hangs the same way.
+- **An invoice no longer runs wider than A4** (#188): a long word with no
+  spaces (a code, email or web address) breaks inside its box, and with every
+  column on and large amounts the item table steps down to a smaller size
+  instead of running off the page.
+- PDF pages no longer end through a line of text (Boxed design: bank details
+  / totals) or through the table's column titles.
+- PDF font scale above 100% no longer cuts off both sides of the invoice.
+- Dashboard and Purchases: large totals (Rs 10 lakh and up) no longer make
+  the screen scroll sideways on a 1366 px laptop.
+- On a phone: New Invoice scrolls as one page, the Save / PDF / Print buttons
+  sit in one row, buttons and help icons are big enough to tap, and Clients,
+  the invoice list and Income Tax fit the screen.
+- More space between boxes, notices and rows of buttons, so they no longer
+  look joined. Settings -> Use on phone or tablet: the switch, the Windows
+  note and the Pair button no longer touch.
+- **A duplicated invoice keeps its currency** (ERR-088).
+- Every drop-down's arrow has room on the right instead of sitting on the
+  edge; the Dashboard's Invoices / Cancelled / Trash tabs no longer touch the
+  line above them.
+- The thank-you and support cards no longer flash up and vanish when the
+  Dashboard loads.
+- The **⋯** menus on list rows were hard to read in dark mode.
+- On a phone: the menu button is no longer squeezed by the buttons at the
+  top, and the Customise menu and Edit windows open as a sheet at the bottom.
+
+---
+
+## [1.10.85] - 2026-11-14
+
+### How to update
+
+**Current version:** 1.10.84  →  **New version:** 1.10.85
+
+#### If the in-app Update button works for you (1.10.73 and later)
+1. Open the app and click **Update to v1.10.85** in the menu, or
+   **Settings → Updates → Update Now**.
+2. Wait about a minute, then reload the page.
+
+#### Installed with the Windows Setup
+Click **Update Now** in the app (or right-click the icon near the clock →
+**Check for updates**). Nothing to download by hand.
+
+#### On 1.10.72 or older
+Use the launcher: **More options → Update to the latest version**, then
+**Open App**.
+
+#### If that does not work (or you are unsure)
+1. Download `Free-GST-Billing.zip` from the
+   [Releases page](https://github.com/IamRamgarhia/Free-GST-Billing-Software/releases/latest).
+2. Close the app (Control Panel → **Stop Server**, or the launcher's
+   **More options → Stop the app**).
+3. **Right-click the ZIP → Extract All.** Do not open anything while still inside the ZIP.
+4. Extract over your existing Free GST Billing folder, replacing files when asked.
+5. Double-click **Free GST Billing - WINDOWS**.
+
+#### Mac
+Use the **Update** button in the app. **Never drag the new folder over the
+old one on a Mac**: Finder's Replace swaps the whole folder, including
+`_system/data` with your invoices. Step by step:
+[Updating on a Mac](https://dicecodes.com/free-gst-software-documentation/update.html#mac).
+
+#### Linux / NAS
+Run `update-unix.sh` from the `_system` folder, or extract the new ZIP over
+the old folder. Restart the app afterwards. The `.deb` and the AppImage:
+download the new file and install or use it instead of the old one.
+**Docker:** download the new `docker-compose.yml` (it changed: put your PIN
+in `FGSB_PIN`), put the new version in its `image:` line and run
+`docker compose up -d`.
+
+Your invoices, clients, products and settings are never touched by an update;
+a backup is made first.
+
+### Added
+- **Use the app on a phone or tablet** on the same Wi-Fi as your PC
+  (Settings → Privacy & Security → **Use on phone or tablet**). Off until you
+  turn it on, and a PIN must be set first. Click **Pair a phone or tablet**,
+  scan the QR code with the phone, and type the app's PIN there. The
+  connection is encrypted (HTTPS, with your PC's own certificate), so the
+  phone's browser warns once that the connection is "not private": the PC and
+  the phone show the same security code to compare, then tap Advanced →
+  Proceed (Chrome) or Show Details → visit this website (Safari). Each QR code
+  works once, for 10 minutes. The PC lists the paired devices with
+  **Remove**, which cuts a device off at once; unticking the switch cuts every
+  phone off at once. Only devices on your own network are answered, never the
+  internet. Windows asks once whether to allow Node.js on networks: choose
+  **Private networks**. The Control Panel and phone access itself stay on the
+  PC. Guide: [Use on a phone or tablet](https://dicecodes.com/free-gst-software-documentation/phone.html).
+- **NAS / Docker image with secure access**: every phone, tablet or PC pairs
+  the same way (a one-time code from `docker logs free-gst-billing` for the
+  first one, and the PIN from `FGSB_PIN`), over HTTPS on port 47443. Nothing
+  on the network gets in without pairing.
+  Guide: [On a NAS: Docker](https://dicecodes.com/free-gst-software-documentation/install-linux.html#nas-docker).
+- **Import Flipkart orders** (#172, #179): choose Flipkart Seller Hub's orders
+  report in *CSV import / export* on the Dashboard, as it is. Each order becomes
+  a tax invoice with Flipkart's invoice number and date, the buyer, HSN,
+  quantity, GST and the amount billed; the **order ID** and the **tracking ID
+  (AWB)** go into the order details, so the Invoices search finds them. Returned
+  orders are counted so you can record each as a Credit Note. Any sales CSV now
+  also reads *Order ID*, *AWB* and *Courier* columns.
+- **Paid, Unpaid or Partly paid expenses** (#165): a bill you still owe (rent
+  due, a repair not yet paid) shows as **Outstanding**; click it to list only
+  those, and *Mark as paid* when you pay. The Cash book counts only what was
+  paid in cash. Expenses entered before are Paid, as they were.
+- **Sales orders, with a dispatch status** (#135, #112, #115): the order
+  between the quotation and the invoice. Turn it on in **Settings → Features
+  → Sales orders** (already on for the Wholesale, Manufacturing and Everything
+  business types). Make one with **New Invoice → Sales Order**, or from an
+  accepted quotation (**⋯ → Make sales order**); it has its own numbers
+  (`SO/2026-27/0001`) and prints and shares like a quotation, but it is never
+  counted as a sale, never in GST returns and never moves stock. The
+  Dashboard gets a **Sales orders** tab beside Invoices, Cancelled and Trash:
+  each order shows **Open**, **Partly dispatched**, **Dispatched** or
+  **Invoiced**, how much has gone ("4 of 10 sent") and its challans and
+  invoices. The truck button makes a **delivery challan** for some or all of
+  what is left to send; the green button **invoices the rest** in one go
+  (challans not yet invoiced are taken in, so their goods leave stock only
+  once). The challan or invoice carries the order number (Buyer's Order No).
+- **Purchase returns: debit notes** (#168): on a purchase bill, the new
+  return button (**Return to supplier**) lets you pick the items and
+  quantities going back, and makes a **Debit Note** (`DN/26-27/0001`) against
+  that bill, with its number and date, to download or print for the supplier.
+  The goods go out of stock, the bill's balance (and Party Outstanding) goes
+  down, the Purchases totals and cost-centre and income-tax purchase figures
+  are less the return, and **GSTR-3B Table 4(A)(5)** input tax credit is
+  reduced by the GST on it in the month of the debit note (as GSTR-2B nets off
+  the supplier's credit note). A **Returns** tab on Purchases lists them;
+  **Cancel debit note** (or Delete) undoes all of it. GSTR-2B matching is
+  unchanged.
+- **Discount on purchase bill lines** (#171): tick **Discount column** above
+  the items and enter a discount per line, as a **%** or a **₹** amount, as on
+  the supplier's bill. It comes off before GST and cess, so the bill total,
+  input tax credit (GSTR-3B), GSTR-2B matching, cost-centre and income-tax
+  purchases all use the discounted value; the product's purchase price is the
+  cost of one unit after the discount, and a return of a discounted line goes
+  back at the discounted value. Bills without a discount add up exactly as
+  before.
+- **Serial number / IMEI on purchase bill lines** (#160): tick **Serial No.
+  column** above the items and type the serial numbers or IMEIs of the pieces.
+  They show in the bill's view and PDF, and the Purchases search finds a bill
+  by any of them. Both columns stay hidden until you tick them (remembered).
+- **Alternate units: Box = 12 Pcs** (#148): in the product form, **+ Also
+  sold or bought in a second unit** sets one (and, if you like, a price per
+  box). On an invoice, choose **Box** in the line's Unit: the rate becomes the
+  box price, or 12 x the piece price. Purchase bill lines of such a product get
+  a Unit box too (12 x the purchase price). Stock always counts pieces (2
+  boxes sold = 24 out), and the GSTR-1 HSN summary reports the quantity in
+  pieces. Old products, invoices and bills are unchanged.
+- **Categories and brands** (#142, #148): an optional **Category** on each
+  product, a main category and up to 3 levels under it (Garments > Men >
+  Shirts > Formal), and a **Brand**. They are the "stock groups": one tree.
+  Products, **Reports → Product Performance** and **Reports → Stock** filter
+  by them (a category takes in everything under it) and by item name. The CSV
+  import and export carry both columns.
+- **Serial number lookup** (#142, #160): in **Reports → Product
+  Performance**, type a serial number or IMEI to see the purchase bill it was
+  bought on, and any invoice whose line names it.
+- **Adjust stock** on Products (the sliders button in a row): add or remove
+  goods damaged, lost, found, used in the shop or an opening correction, with
+  its date and a note. Each one is kept, listed in **Reports → Stock** for its
+  month (delete puts the stock back), counted on earlier dates, included in
+  backups, and locked with the rest once the books are closed.
+- **Low stock to a purchase order**: with purchase orders on, **Make purchase
+  order** on the Dashboard's low-stock strip, or on Products with **Low stock
+  only** ticked, opens a new purchase order with those products (enough to
+  reach twice the low-stock level, at the purchase price) for you to pick the
+  supplier, check and save.
+
+- **Rft lines for glass shops** (#140): polish, aluminium channel and other
+  work charged on the glass already on the bill. With **Size billing** on,
+  pick the unit **Rft** on a line and choose what it counts: the **sq.ft** of
+  the glass lines, or their **edges** in running feet (2 x (length + width)
+  / 12 x pieces, after rounding), for all glass lines, the lines you tick, or
+  a value you type. The quantity follows the glass lines as you change them,
+  and prints as *19.5 sqft* or *27 rft*.
+- **Dashboard totals for a chosen period**: **Totals for** above the four
+  cards shows them for this month, last month, any month you pick, or a
+  financial year. All time is still the default.
+- **Barcodes** (#137, #158): a **Barcode** box on each product (optional).
+  Scan the code on the pack into it, or click **Make one** for goods without
+  one (the shop's own codes, 20000001, 20000002, ...). A code another product
+  already has is refused. The products search finds it, and the CSV import and
+  export carry it. On **New Invoice**, a **Scan barcode** box above the line
+  items takes a USB scanner: the product goes on with its rate, HSN, GST and
+  unit, and the same code again adds 1 to its quantity. A code scanned or
+  typed into an item's name box (also on purchase bills) and Enter works too.
+  **Barcode labels**: tick products on Products and click **Print labels**, or
+  open a purchase bill and click **Print labels for this purchase** (one label
+  per piece bought). Each label has the item name, the barcode (Code 128) with
+  its digits, and if wanted the business name and the price or MRP. A4 sheets
+  of 65, 40 or 24 labels, or a 50 x 25 mm thermal roll; printed from the
+  browser's print window. On to start (nothing shows on invoices until a
+  product has a barcode); turn it off in **Settings → Features → Barcodes**.
+  Choosing a business type turns it on for Retail, Wholesale, Manufacturing
+  and Everything, and off for the others.
+
+- **Profit & Loss in another currency shows the cost of goods too** (idea from
+  PR #178): each invoice's cost is converted from rupees at the exchange rate
+  saved on it. Invoices with no rate are counted apart and named in a warning.
+- **The app window's title bar turns dark** with the app's dark theme
+  (Windows Setup).
+- **Bank matching** (#175): **Cash book → Bank matching**. Import your bank
+  statement (CSV or Excel .xlsx from SBI, HDFC, ICICI, Axis, Kotak, PNB or
+  Yes Bank, or any statement with Debit and Credit columns or one Amount
+  column; the bank is found from the file, or choose it) and each line is
+  matched to your books: money in to a payment already recorded on an invoice
+  or to an unpaid invoice of that amount; money out to a supplier payment, an
+  unpaid purchase bill or an expense (never one paid in cash). A suggestion
+  needs the same amount (or within ₹1 of round-off) and a close date, and
+  comes first when the client or supplier name or the invoice number is in
+  the bank's description; each one says why. **Confirm** marks the line matched, and for an unpaid invoice or
+  bill also records the payment (bank date, Bank transfer, the bank's
+  reference), so the balance and status follow. Pick a different match by
+  hand, **Ignore** a line (bank charges, your own transfers) or add it as an
+  expense; **Undo** takes any of these back. The cards on top show the lines
+  matched and still to match, with the totals. Importing a statement again
+  adds nothing twice (same date, amount and reference). Kept per business and
+  in your backups (with Expenses). Guide: [Bank matching](https://dicecodes.com/free-gst-software-documentation/cash-book.html#bank-matching).
+
+- **Hide a business behind its own PIN** (#125): **Settings -> Profiles ->
+  Hide with PIN** leaves a business out of the company list until its PIN is
+  typed (**Open a hidden company...** in the list at the top of the sidebar).
+  It hides again when you switch to another business or open the app again.
+  It hides from view; it does not encrypt (the App lock guards the whole app).
+
+- **TDS and TCS under the Income-tax Act, 2025** (#180, part 1): invoices
+  dated from 1 April 2026 offer the new sections with their Table numbers, as
+  the TDS / TCS returns now need them: **393(1) Table Sl. 6(i)** (contract
+  work, was 194C), **Sl. 6(iii)** (professional and technical fees, was 194J),
+  **Sl. 2(ii)** (rent, was 194-I), **Sl. 1(ii)** (commission, was 194H),
+  **Sl. 8(ii)** (purchase of goods, was 194Q, still only above Rs 50 lakh),
+  **Sl. 8(v)** (e-commerce, was 194O), **393(2) Sl. 17** (non-residents, was
+  195), and TCS under **394(1)** at the Finance Act 2026 rates (liquor,
+  tendu leaves, timber, scrap, coal: 2%; motor vehicles above Rs 10 lakh:
+  1%). A new invoice moves an old section to its new place by itself;
+  invoices you saved keep theirs. The invoice prints the short form, for
+  example *TDS (393(1) Sl. 6(iii) @ 10%)*. The quick-start Terms templates
+  quote the new sections and Form 131 (was 16A). TDS on a purchase bill and
+  recurring invoices follow the same date rule, and a rate you typed (a
+  lower-deduction certificate) is kept. Part 2 (working TDS out from
+  the payee and the thresholds, and the return exports) comes later.
+
+- **Close the books** (Settings -> Data & Backups): after filing a month's GST
+  returns, close the books up to its last day. Invoices, purchases, expenses,
+  debit notes, stock adjustments and cash book entries dated then can no
+  longer be added, deleted, or changed in their date, number, items, amounts,
+  GST or cancellation; recording a payment or a receipt against them still
+  works. The server checks every save, so no screen or phone can get round
+  it. **Open the books** (on the PC, with the app's PIN when the App lock is
+  on) to correct a filed month.
+- **Edit history**: every invoice, purchase, expense, receipt, debit note and
+  cash book entry added, changed or deleted, with the time, its number, date
+  and amount before and after (Settings -> Data & Backups -> Show the edit
+  history). It starts with this version.
+
+- **Preview the Statement and Aging PDFs** (#157): on a client's account,
+  **Statement PDF** and **Aging PDF** open in the app first instead of
+  downloading at once, with **Download**, **Print**, **WhatsApp** and
+  **Email** at the bottom (as for invoices: a phone shares the PDF itself; on
+  a PC it downloads and the chat or mail opens with a short message, ready to
+  attach it). Close it to get back to the account.
+- **Payment history on each client** (#157): **Payment history** under their
+  invoices lists every payment with its date, invoice number, amount, mode
+  and note, newest first: the payments recorded on invoices and the receipts
+  made on the Receipts page (an advance on no invoice too). Each invoice row
+  shows **Last paid** with the date of its latest payment.
+- **Items on the client statement** (#148): tick **Show items** on a client's
+  account (off to start) and each invoice lists its items, name x quantity
+  and the line amount, under it, on screen and in the Statement PDF.
+- **Credit limit for a client**: an optional **Credit limit** on the client
+  form. On New Invoice a warning shows under the items when what the client
+  owes your business plus this invoice goes over it (you can still save), and
+  the Clients list marks them **Over credit limit**. Only real sales of the
+  business you are working in count, less payments, TDS and credit notes.
+- **Price levels**: **Settings → Features → Price levels** (off to start).
+  Name up to 3 levels (Retail, Wholesale, Dealer to start); give a product a
+  price for each level besides its selling price, and a client a level. On a
+  new invoice, a product picked for that client takes its level price, or the
+  selling price when it has none. The Products CSV import and export carry a
+  column per level (such as *Wholesale price*).
+- **Payment received while making the invoice** (#185, #187): a cash sale
+  no longer needs a second step on the Dashboard. Under the items on New
+  Invoice (tax invoice, bill of supply, composition bill), type the amount in
+  **Received now** or click **Full** for the balance, and choose how it was
+  paid (Cash, UPI, Bank transfer, Cheque, Card, Other). Saving records it on
+  the invoice as the Dashboard's ₹ button does, with its receipt, and the
+  invoice turns Paid or Partly paid; a Cash payment reaches the Cash book.
+  Saving again (auto-save too) changes that one payment, never adds another,
+  and clearing the amount removes it and its receipt. An invoice that already
+  has payments shows **Paid so far** instead.
+- **Whole-bill discount before GST** (#190): beside **Discount on total**
+  on New Invoice, choose **After GST (cash discount)**, as before and still
+  the default, or **Before GST (trade discount)**. Before GST shares the
+  discount over the lines in proportion to their value and works out GST on
+  what is left, so the taxable value, CGST/SGST or IGST, cess, GSTR-1 and the
+  HSN summary all follow it. The invoice shows each line's part in its Disc.
+  column and a **Trade discount (before GST)** line in the totals. Invoices
+  saved before are unchanged. The sales CSV import takes an optional
+  **Bill Discount Before GST** column (Yes/No).
+- **Profit on this bill** (#189, #147): New Invoice shows the bill's profit
+  and margin under the totals, from each product's Purchase price. On screen
+  only, never printed; **Hide** it when the customer can see your screen.
+- **Start with "Cash Sale"** (#147): a switch in **Settings → Features** so
+  every new invoice starts with the customer *Cash Sale*, for counter sales.
+
+### Fixed
+- **Duplicate** keeps the invoice's currency: a copy of a USD invoice opened
+  in INR. Client list totals of bills in another currency are counted in
+  rupees; the Reports summary cards fit narrow screens; and the Purchases and
+  GST Returns tables fit a 1366 px screen (the Purchases action buttons stay
+  in view).
+- Purchase returns: editing a bill can no longer cut a returned line below
+  what went back, or rename or remove it; **Paid** on such a bill records the
+  balance less the returns; a bill returned in full owes nothing, round-off
+  included; the debit note date cannot be before the bill's date; a debit
+  note can no longer be saved twice when its stock change failed (it says so
+  instead); debit notes of bills with no business follow the bill to its
+  business; returns on reverse-charge bills also come off GSTR-3B 3.1(d); a
+  returned item that matches no product is named; and a debit note number
+  already in use (after restoring an older backup) is skipped.
+- Sales orders: cancelling or deleting an invoice that took in a sales
+  order's delivery challans lets those challans count again (undoing the
+  cancel takes them back in); a challan that could not be marked converted
+  now says so; a business that already numbered with the prefix SO or DN keeps
+  its settings, with a warning.
+- **Marking an invoice or purchase bill Paid now asks how it was paid**
+  (#184): Cash, UPI, Bank transfer, Cheque, Card or Other (your last answer
+  comes first). A cash payment now shows in the **Cash book**; it used to be
+  recorded as "Other", so nothing marked Paid ever reached the Cash book.
+- **A non-GST invoice stays without GST as a credit note** (#186): switching
+  the document type, or making a credit note from an invoice, turned GST (and
+  the CGST/SGST columns) back on.
+- **Item suggestions show up to 50 matches** (#182), in a scrolling list that
+  the arrow keys move through; names that start with what you typed come
+  first. It used to show only the first 5.
+- **An item that is not in your Products says so** (#183), with **Save it to
+  Products** under the item box. One-off items are still allowed.
+
+### Changed
+- The invoice screen's **Save & Download** button is now **Save PDF** (it
+  still saves the invoice and downloads its PDF).
+- Docker: `FGSB_ALLOW_UNSAFE_LAN` is gone. The plain connection answers only
+  inside the container; other devices use the paired HTTPS connection.
+
+- TDS on invoices dated before 1 April 2026: 194H (commission) now starts at
+  2% and 194O (e-commerce) at 0.1%, the rates since 1 October 2024 (they
+  started at 5% and 1%). Saved invoices keep their rate.
+
+### Security
+- The phone connection checks every request: a local-network address, the
+  PC's own address or name (stops "DNS rebinding" tricks by websites), changes
+  only from the app's own page, and a paired device's key (a long random
+  cookie the page cannot read; the PC keeps only its hash). Pairing needs the
+  one-time code and the PIN, with the lock screen's 5-tries-then-wait rule.
+  The certificate's private key and the paired devices are never put in a
+  backup.
+
+### Thanks
+Reported or asked for by @Barunsaha (#181, #172, #159), @Harsh705 (#182,
+#183), @snvrahulkumarde-collab (#184, #185, #186, #165, #148),
+@theaitechstudio (#187), @ethbroken-svg (#190), @sundarelectricservice
+(#191), @vhoramunis9510 (#112), @aryanphogat (#125), @ashishpipariya2071-lgtm
+(#135), @crimsouneclub2-hub (#137), @7harsh-m (#140), @dhirensawalakhe (#157),
+@dhananjayseti09013 (#158), @fulbandhemanish-droid (#160), @Manishkumarroy823
+(#168), @Sujalvishwkarma (#171), @AmanKrSarkar (#189), @Sanjeev-1695 (#147),
+@supremecom143 (#122), @ezonebsp (#142), @Rounak2001 (#175), @premtarate999
+(#180) and @infoaimautomation-ui (#115). Thank you.
+
+**Next update:** Saturday 21 November 2026.
+
+---
+
+## [1.10.84] - 2026-11-07
+
+### How to update
+
+**Current version:** 1.10.83  →  **New version:** 1.10.84
+
+#### If the in-app Update button works for you (1.10.73 and later)
+1. Open the app and click **Update to v1.10.84** in the menu, or
+   **Settings → Updates → Update Now**.
+2. Wait about a minute, then reload the page.
+
+#### On 1.10.72 or older
+Use the launcher: **More options → Update to the latest version**, then
+**Open App**.
+
+#### If that does not work (or you are unsure)
+1. Download `Free-GST-Billing.zip` from the
+   [Releases page](https://github.com/IamRamgarhia/Free-GST-Billing-Software/releases/latest).
+2. Close the app (Control Panel → **Stop Server**, or the launcher's
+   **More options → Stop the app**).
+3. **Right-click the ZIP → Extract All.** Do not open anything while still inside the ZIP.
+4. Extract over your existing Free GST Billing folder, replacing files when asked.
+5. Double-click **Free GST Billing - WINDOWS**.
+
+#### Mac
+Use the **Update** button in the app. **Never drag the new folder over the
+old one on a Mac**: Finder's Replace swaps the whole folder, including
+`_system/data` with your invoices. Step by step:
+[Updating on a Mac](https://dicecodes.com/free-gst-software-documentation/update.html#mac).
+
+#### Linux / NAS
+Run `update-unix.sh` from the `_system` folder, or extract the new ZIP over
+the old folder. Restart the app afterwards. New on Linux: the `.deb` and the
+AppImage (see *Added*).
+
+#### New: install it like other Windows programs (optional)
+You do not need this to update - the steps above are enough. If you want the
+app as a normal program with its own window: download
+`Free-GST-Billing-Windows-Setup.exe` from the
+[Releases page](https://github.com/IamRamgarhia/Free-GST-Billing-Software/releases/latest)
+and run it (Windows may say "Windows protected your PC": click **More info**,
+then **Run anyway**). It finds your current copy and asks: keep using your
+books where they are, or copy them to `C:\Users\<your name>\Free GST Billing`.
+Your current folder is never changed or deleted. Later updates come from the
+app's **Update Now**, with no download by hand.
+
+Your invoices, clients, products and settings are never touched by an update;
+a backup is made first.
+
+### Added
+- **A Windows Setup program** (`Free-GST-Billing-Windows-Setup.exe`): installs
+  like other software (Start menu, Desktop icon, optional start with Windows,
+  Settings → Apps to remove; no administrator password), opens in a window of
+  its own - a real program window with its own taskbar icon (pin it), which
+  opens full screen the first time and then remembers its size and place. Closing it with X keeps the app running near
+  the clock (click the icon to open it again; right-click for Check for
+  updates, Open books folder, Make a backup now and Quit), and with "Open when
+  Windows starts" it waits there quietly. Update notices show there too. If
+  the app ever stops, the window starts it again by itself behind its start
+  screen (logo and a moving bar), never an error page. Right-click its
+  taskbar icon for New Invoice, Dashboard, Clients and Reports. Setup installs
+  Microsoft's WebView2 engine if your PC does not have it (needs the
+  internet; without it the app opens in Edge's app window as before). It
+  updates itself from **Update Now** with that window open, no reinstalling
+  and no restart. It asks
+  where your books go and finds an earlier copy: keep using it where it is, or
+  copy it to `C:\Users\<your name>\Free GST Billing` (every file checked; the old folder
+  is never changed, its icons are moved to a backup folder). Not signed yet:
+  Windows SmartScreen asks once (More info → Run anyway).
+- **Linux packages** (Ubuntu, Linux Mint, Debian and others): install
+  `free-gst-billing_1.10.84_amd64.deb` like any other program (double-click,
+  or `sudo apt install ./free-gst-billing_1.10.84_amd64.deb`), or use
+  `Free-GST-Billing-Linux-x86_64.AppImage` on any 64-bit Linux (right-click ->
+  Properties -> Permissions -> *Allow executing file as program*, then
+  double-click). The app opens in your browser; your books are kept in
+  `~/.local/share/free-gst-billing-data`, and removing the program keeps them.
+  An earlier ZIP copy is left exactly as it was. The ZIP still works on Linux
+  as before.
+- **One copy of the server per set of books.** Two copies started on the same
+  data folder (two launchers, two icons) used to both write the same files;
+  the second now does not start and the running one opens instead.
+- **Import from Vyapar, Tally and Excel** (#130, #131). Clients and Products
+  import take a CSV, an Excel `.xlsx` (a *Sheet* list appears when the file has
+  several) or Tally's masters export (`.xml`, *Gateway of Tally → Export →
+  Masters*): Sundry Debtors and Creditors become clients, stock items become
+  products with HSN, GST, unit and prices. The invoice and purchase import take
+  `.xlsx` too, and a Vyapar Sale Report brings in what was received as payments.
+- **Importing products again fills in the blanks** (#134): a product already
+  saved gets the details it is missing (HSN, unit, prices, GST...) from the
+  file; nothing already filled in is changed.
+- **Size billing for glass, mirror and flex shops** (#140). Turn on *Settings →
+  Features → Size billing (Sq.ft)*, pick the unit Sq.ft on a row and type
+  Length and Width in inches, the pieces and 3 or 6 inch rounding: the square
+  feet and amount are worked out (25 x 30, 2 pcs, 6 inch, ₹50 = 12.50 sq.ft,
+  ₹625). *Type amount* bills a fixed amount. The invoice prints Size and SQFT
+  columns.
+- **Your own fields on invoices** (#126): under *Order, dispatch & reference
+  details*, *Add a field* adds a box you name (R SPH, patient name, job card).
+  Filled ones print; the names stay for your next invoice.
+- **Unit NA for services** (#143): no quantity, the amount is the rate;
+  GSTR-1 reports it with unit NA and quantity 0.
+- **Customer phone box** (#129): type a phone number at the top of the invoice
+  to fill in that customer, or add a new one with just a name. Clients shows
+  visits and the last visit.
+- **GSTR-1 file: exports, nil-rated / exempt and deemed exports** (Tables 6A,
+  8 and DE), bills of supply included, and GSTR-3B 3.1(c)/(e) from the same lines.
+- **Income tax for tax year 2026-27**, with a year picker (2025-26 kept).
+- **Profit & Loss counts the cost of the goods sold** (#146): quantity sold ×
+  the product's purchase price, as its own line, then Gross Profit. Items with
+  no purchase price are named so you can fill it in.
+- **Invoices, Cancelled and Trash tabs on the Invoices screen**: cancelled
+  invoices have their own tab (they keep their numbers; *Undo cancel* puts one
+  back). *Delete* (in each invoice's ⋯ menu, or *Delete invoices* for the ticked
+  ones) moves invoices to the *Trash* tab, which shows the days left; they are
+  removed for good after 30 days. *Restore* puts one back with its stock;
+  *Delete forever* removes it at once.
+- **Delete many products at once** (#177): tick products in the list (or the
+  box in the header for all shown) and click *Delete selected*.
+- **Search invoices by order ID, AWB, phone or GSTIN** (#172): the Invoices
+  search also looks in the order, dispatch and reference details (Buyer's Order
+  No, Dispatch Doc No, courier, your own fields) and the client's phone and GSTIN.
+- **Received From suggests your clients** on a new payment receipt (#143).
+- **Print rates before GST** (#164): with *Prices include tax* ticked, a second
+  tick box prints each rate without GST (₹13.25 at 18% prints ₹11.23), so
+  Qty × Rate matches the Amount. The GST and the total do not change.
+- **A Print switch beside every printed part of the invoice form** (due date,
+  place of supply, bank details, UPI QR, LUT declaration, notes, terms), and
+  Customize can hide the export / LUT declaration.
+
+### Changed
+- **Control Panel in the installed Windows app**: *Stop Server* and *Move to
+  Another PC* are gone there (the icon near the clock has *Quit*; Backup and
+  Restore move your books), and *Remove the App* opens Windows' *Installed apps*.
+  The ZIP's Control Panel is unchanged.
+- **Settings has 6 tabs instead of 14**: *Company*, *Print & PDF*, *Features*,
+  *Privacy & Security*, *Data & Backups* and *Updates*, each showing its cards
+  one under the other. Nothing was removed; *Ctrl + K* finds any setting and
+  opens its tab at that card.
+- **The GST switch says what it does** (#152, #138): Customize's *Tax % column*
+  always turned GST off for the whole invoice. It is now *Charge GST on this
+  invoice* (group *Tax*), and a new *Tax % columns* switch hides only the GST
+  columns on each line while GST is still charged. *Hide all* no longer turns
+  GST or the round-off line off.
+- **One WhatsApp message everywhere** (#156): the Invoices list, the Clients
+  page and the invoice form send the same message: your business, the client,
+  number and dates, total, paid and balance, status, and your UPI ID while
+  money is due.
+- **Numbering carries on after a number you type** (#145): type
+  `.../0049` and the next invoice is `.../0050`. A lower number (an old paper
+  bill) leaves the series alone.
+- **GSTR-1 Table 12 in two parts** (#166): the GST Returns screen and the HSN
+  CSV show B2B and B2C separately, as the portal does (the JSON already did).
+- The window title reads like a desktop program: the page and your business name.
+
+### Fixed
+- **The Invoices list fits the screen**: at 1366 px with the full menu its last
+  column (with the ⋯ menu and Delete) was off the right edge; the list now fits,
+  and the Actions column stays visible on narrower windows too.
+- **Compact menu**: the Control Panel icon sat off-centre (its status dot pushed
+  it left); the dot is now a small badge in the corner.
+- **The app window never shows "Needs a Quick Start"** (ERR-085): while an
+  update or a restart stopped the app for a moment, the window showed the
+  browser's start-up instructions; it now shows "Starting again..." and
+  carries on by itself.
+- **Cancel invoices did nothing when the ticked invoices were already
+  cancelled**: it now says so and points to *Delete invoices*.
+- **A deleted invoice now really stays 30 days in the Trash** (ERR-084): an
+  invoice not changed for over 30 days was removed from the Trash at the next
+  start of the app, and the Trash bin showed its old date as the delete date.
+- **Imported invoices add their items to Products** (#170): new items get
+  their name, HSN, unit, rate and GST (tick box *Add new items to Products*,
+  on by default); products you already have are not changed.
+- **The app opens on the newest version** (ERR-075): the page comes from the
+  app first, the cached copy only when the app is not running. Edge could show
+  a blank window after an update (#153).
+- **Opening the app stopped at "Opening the app in your browser now..."** on
+  some PCs (ERR-076).
+- **GST Returns cleans client GSTINs** (capitals, spaces, hidden characters)
+  and accepts a letter as the 13th character (#141, ERR-077).
+- **Enter after an item put the cursor in HSN**, not the next Item box (#151, ERR-078).
+- **With the preview hidden, Save / Download / Print opened it and closed it
+  again** (#161, ERR-079).
+- **Enter moves to the next box** on an item row: Item → HSN → Qty → Unit →
+  Rate; Enter in Rate starts the next row. Picking a product jumps to Qty (#167).
+- **The copy label (ORIGINAL FOR RECIPIENT) no longer covers the e-invoice QR**
+  code (ERR-081).
+
+### Security
+- The app answers only requests addressed to `localhost` / `127.0.0.1`, so a
+  web page cannot use "DNS rebinding" to reach your books through your
+  browser.
+- A receipt number is escaped in the receipt print window, so text typed into
+  it can never run as a script.
+
+---
+
+## [1.10.83] - 2026-10-31
+
+### How to update
+
+**Current version:** 1.10.82  →  **New version:** 1.10.83
+
+#### If the in-app Update button works for you (1.10.73 and later)
+1. Open the app and click **Update to v1.10.83** in the menu, or
+   **Settings → Updates → Update Now**.
+2. Wait about a minute, then reload the page.
+
+The first time the app starts after the update, the **Free GST Billing** icon
+on your Desktop and in the Start menu changes: from then on one click starts
+the app and opens it. If you have a Free GST Billing icon made by Chrome or
+Edge, remove it (right-click it, then **Uninstall**): it cannot start the app.
+
+#### On 1.10.72 or older
+Use the launcher: **More options → Update to the latest version**, then
+**Open App**.
+
+#### If that does not work (or you are unsure)
+1. Download `Free-GST-Billing.zip` from the
+   [Releases page](https://github.com/IamRamgarhia/Free-GST-Billing-Software/releases/latest).
+2. Close the app (Control Panel → **Stop Server**, or the launcher's
+   **More options → Stop the app**).
+3. **Right-click the ZIP → Extract All.** Do not open anything while still inside the ZIP.
+4. Extract over your existing Free GST Billing folder, replacing files when asked.
+5. Double-click **Free GST Billing - WINDOWS**.
+
+#### Mac
+Use the **Update** button in the app. **Never drag the new folder over the
+old one on a Mac**: Finder's Replace swaps the whole folder, including
+`_system/data` with your invoices. Step by step:
+[Updating on a Mac](https://dicecodes.com/free-gst-software-documentation/update.html#mac).
+
+#### Linux / NAS
+Run `update-unix.sh` from the `_system` folder, or extract the new ZIP over
+the old folder. Restart the app afterwards.
+
+Your invoices, clients, products and settings are never touched by an update;
+a backup is made first.
+
+### Added
+- **Offline mode, and proof the app keeps your data private.** Settings has
+  a new *Privacy & internet* tab: one table of everything the app uses the
+  internet for, and when, and an *Offline mode* switch. The same switch is a
+  Wi-Fi button at the top right of every screen, which shows what Offline
+  mode changes and what stays the same. With it on, the app
+  never goes online by itself: no update check, no supporters list, no
+  automatic copy of each PDF to Google Drive. Check for Updates and other
+  things you click still work. The tab, the *Is it safe?* guide page and the
+  GitHub page also explain how to check it yourself in two minutes (switch the
+  internet off: everything works) and why the app is free. **Free forever**
+  is now at the top right of every screen: no paid version, no locked
+  features, no ads, no tracking. While Offline mode is on, Support & About says the
+  supporters figures are the last ones seen; turning it off reads the latest.
+- **Purpose code for payments from abroad.** Each payment account can hold
+  an RBI purpose code (for example P0802 software consultancy, P1006
+  business consultancy, P1099 other services), picked from a list or typed.
+  It prints with the bank details, next to SWIFT, on invoices to clients
+  abroad or in a foreign currency, so the client can quote it on the
+  transfer. One invoice can use another code (*Purpose code (RBI)* on the
+  invoice).
+- **Remove the app in one click** (#128, thanks @ravidas9191-png). *Control
+  Panel → Remove…*, or on Windows the launcher's *More options → Remove the
+  app...*, uninstalls the
+  app with its Desktop, Start-menu and start-up icons (Mac: the app in
+  Applications; Linux: the menu entry). Tick boxes choose what else goes:
+  your invoices, clients and settings; saved PDFs; the backups folder.
+  *Select everything* ticks all three. Nothing is ticked at first, so by
+  default your books stay and reinstalling brings them back. Deleting the
+  data while keeping backups saves a last copy first; if that copy fails,
+  the data is kept.
+- **Products: Goods or Service.** The product form asks *This is a: Goods
+  (stock counted) / Service (no stock)*. A service has no stock box and is
+  never counted: selling it, buying it on a purchase bill, importing it or
+  using it in manufacturing moves no stock, and it never shows *Out of
+  Stock*, never appears in low-stock alerts, the bell or the stock report.
+  Its unit list shows service units (Hrs, Day, Month, Project, Page...) and
+  the code box says *SAC*. Products you already have stay Goods; open one and
+  pick *Service* to switch it. (#121, thanks @apfx007)
+- **Sample files for importing Products and Clients.** *Import CSV* now opens
+  a window with *Download sample file* (the exact column headings and two
+  demo rows), shows how many will be added and any row with a problem before
+  anything is saved, and points to *Dashboard → CSV import / export* for old
+  invoices. The products file has a *Type* column (Goods or Service), and the
+  Products CSV export imports straight back. (#121, thanks @apfx007)
+- **Pay your suppliers on the purchase bill** (#123, thanks @neelind11). The
+  green ₹ button on a purchase bill records a payment to the supplier: amount
+  (starts at what is still owed, the total less any TDS you keep back), date,
+  Cash / UPI / Bank transfer / Cheque / Card / Other, reference or cheque
+  number, and a note. Pay in parts, as many times as you like; change or
+  delete a payment from its Payment History. The bill shows **Unpaid**,
+  **Partly paid** or **Paid** by itself, the list has a *Balance due* column,
+  an *Unpaid / Partly paid* filter and an *Owed to suppliers* card, and the
+  bill's view and PDF list the payments and the balance. Cash payments show
+  in the Cash book as money out, once. Reports → Party Outstanding has a new
+  *You owe suppliers* view, supplier by supplier, month by month. Bills you
+  marked Paid before stay Paid; *Paid* in the Status dropdown now records one
+  payment for the balance, and *Unpaid* takes it back.
+- **"Is it safe?"** A short *Safe and private* note on the first welcome
+  screen and on Support & About (your data stays on this computer, no account,
+  works offline, open source), linking to a new help page that answers the
+  question in full: where your data is, every internet address the app ever
+  contacts and why, the PIN lock and backups, and how to check it yourself.
+- **Change the currency right on the invoice.** If you bill abroad (Region
+  International or Both, or a client outside India), a *Currency* box such as
+  "$ USD" sits in Invoice Details, with *1 USD = ? INR* for the exchange rate
+  and the total in rupees under it. Every amount on screen and in the preview
+  switches at once. Each client remembers their currency; a new client abroad
+  starts in their own country's currency.
+- **Getting paid from abroad**: a payment account can have an IBAN and an
+  online payment link (PayPal, Wise, Payoneer), printed as *Pay online* on
+  invoices in a foreign currency, where the UPI QR (rupees only) is left off.
+  Record Payment on such an invoice can note the rupees credited, bank
+  charges and the FIRC / e-BRC number.
+- **Clients abroad**: no GSTIN or state needed; their own tax ID (VAT number,
+  EIN...) and country print on the invoice, and the place of supply prints as
+  *Outside India*. Preferred currency lists every currency, not seven.
+- **GSTR-1 lists exports (Table 6A) in rupees**, each at its invoice's own
+  exchange rate, with WPAY / WOPAY, ready to type into the portal, and an
+  *Exports* CSV.
+- **Reports: "All, in ₹"** - with invoices in more than one currency, profit
+  and loss and the other reports count every invoice in rupees at its own
+  rate (the default). The Dashboard shows "≈ ₹ in all" under the totals.
+- **Freelancers**: choosing the Freelancer business type starts new invoices
+  in Services mode, without the unit next to the quantity, due in 15 days.
+  *Due in 7 / 15 / 30 days* buttons under the due date for everyone. In
+  Services mode the unit list starts with Hrs, Day, Month, Project, Nos, the
+  HSN box is labelled SAC, and the unit is left off the printed invoice
+  unless you turn it on (Customize → Items table).
+- **Business type comes first.** Settings has a new first tab, *Business
+  type*: pick Retail shop, Freelancer, Restaurant, Wholesale, Manufacturing,
+  Service / repair or Everything, and the Features tick boxes are filled in
+  for that business (a freelancer does not see Products or Purchases). New
+  installs choose it in the first-run setup. If you are updating, your
+  current choices stay exactly as they are until you pick a type.
+- **Settings → Features lists everything the app can show**, one tick box
+  each, plus arrows to change the order of the menu. Nothing changes until
+  you click *Save all changes*, and nothing is ever deleted: unticked things
+  are only hidden. Support & About is always shown.
+- **Install with one line** (Windows, Mac and Linux): paste one line from the
+  install guide and the app installs itself, with its own icon, and opens in
+  its own window. No administrator password and no "unknown publisher"
+  warning. The same line updates or repairs the app; your data is backed up
+  first.
+- **Cost centres** (#112, thanks @vhoramunis9510): turn on in Settings →
+  Features, then tag sales, purchases and expenses with a branch, site or
+  project and see the totals per cost centre.
+- **Problem log and "Report on GitHub"**: if something goes wrong, the app
+  shows a plain message instead of a blank screen, keeps a log (Support &
+  About → Problem log) and fills in a GitHub issue for you with the details,
+  ready to send. The docs have a new list of messages and how to fix each.
 - **Supporters list with amounts:** Support & About shows "Thank you to our
   N supporters - see all"; one click opens the full list with each name, the
   amount and the date, newest first, with a search once the list is long.
@@ -17,12 +1019,262 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Business Profile → *Signature and stamp layout*: side by side, the stamp
   above the signature, or the stamp on the signature, with a preview. Every
   invoice design follows it.
+- **Cash book:** a new screen in the sidebar for cash in and out that is not
+  on an invoice or bill: counter sales, advances, salary, tea, auto fare,
+  money taken home, deposits to the bank. Each entry is Money in or Money out
+  with an amount, name, note, date and category, typed in the form at the top
+  (Enter saves). Shows cash in hand, today's and this month's in and out, a
+  running balance, search, dates (this month, last month, this financial
+  year, your own dates, all) and Print / PDF, Excel and CSV. Cash payments on
+  invoices, cash receipts and cash expenses show in it on their own, read-only,
+  each counted once. One per business; on to start (Settings → Features).
+
+- **Purchase orders** (#112, thanks @vhoramunis9510). Turn on in Settings →
+  Features. Make a purchase order for a supplier (own number PO/26-27/0001
+  per business), print it, download the PDF or send it on WhatsApp / email.
+  **Convert to purchase bill** fills the bill in for you; the order shows
+  Open, Partly received or Received from what the bills received. Stock
+  changes only when the bill is saved.
+- **E-invoicing (IRN), offline** (#111, thanks @Sumit200507). Turn on
+  *E-invoicing (IRN)* in Settings → Features (off by default; only for
+  businesses above ₹5 crore turnover). Download the e-invoice JSON for one
+  invoice (**E-invoice** in the invoice toolbar) or many (tick them →
+  **E-invoice JSON**). It is checked first, and anything the portal would
+  reject is listed in plain English. Upload it on einvoice1.gst.gov.in, then
+  **Import IRN** on the Dashboard (or paste the values into the invoice).
+  Every invoice design then prints the IRN, Ack No, Ack Date and the signed
+  QR code.
+- **Manufacturing (bill of materials)** (#115, thanks @infoaimautomation-ui).
+  Turn it on in Settings → Features. Tick *Made here* on a product and list
+  its raw materials and the quantity per unit; the app shows the cost per
+  unit from purchase prices. **Make** on the Products screen records
+  production: raw materials go down and the finished product goes up in one
+  step, with a clear warning if anything would go below zero. Production
+  entries are listed per business with a date filter; deleting one puts its
+  stock back exactly (to change one, delete it and enter it again). The stock
+  report counts production by its date.
+- **Exports and SEZ supplies under a LUT:** Settings → Company has a new box
+  for your LUT (the Letter of Undertaking, form GST RFD-11, filed free on the
+  GST portal each financial year): its ARN and the year it covers. An invoice
+  for a client abroad or an SEZ client then shows *Export / SEZ supply under
+  LUT (no IGST)*, ticked by itself when your LUT covers the invoice date: no
+  IGST is charged and every invoice design prints the declaration Rule 46
+  requires, with your LUT's ARN. Untick it to charge IGST instead (the "on
+  payment of integrated tax" declaration prints). No LUT saved? The box
+  explains in one line why it is worth filing and links to the guide. GSTR-1,
+  the e-invoice file and the E-Way Bill follow the tick.
+- **Reports → TDS & TCS:** TDS your clients deducted from your sales (with a
+  *Certificate* tick per invoice, to match against Form 16A / Form 26AS), TCS
+  you collected, and TDS you deducted from suppliers, with totals by client,
+  section and quarter. Choose a financial year, a quarter or your own dates;
+  every list prints and downloads as Excel or CSV.
+- **TDS on purchase bills:** tick *TDS deducted* on a purchase bill, pick the
+  section (the rate fills in, or type the amount) and the bill shows *Paid to
+  supplier* = total less TDS, on screen and on its PDF.
+- **Client paid less because of TDS?** The Record Payment window has *Client
+  deducted TDS*: pick the section and rate, and the invoice is marked Paid
+  once the rest arrives. You can also record the TDS on its own.
 
 ### Changed
+- **Your business name and logo in the menu.** Tick *Show my business name
+  and logo in the app's menu* in Settings → Company → Branding (new installs
+  are asked in the first setup): the top of the menu shows your logo, or your
+  first letter, and your business name, for whichever business is open.
+  "by DiceCodes" stays under it.
+- **One icon that opens the app.** On Windows, the Free GST Billing icon (the
+  blue B) on the Desktop and in the Start menu now starts the app if it is not
+  running and opens it in its own window: one click, nothing else. Before, an
+  install from the ZIP opened the launcher and needed a second click on
+  *Open App*. Icons from an earlier install change over by themselves the
+  first time the app starts after this update. The launcher stays in the app
+  folder for installing, updating and repairs; update, backup, restart and
+  stop are in the Control Panel.
+- **No more "Install as Desktop App" banner.** The icon it made (through
+  Chrome or Edge) opened only a browser window and could not start the app,
+  so after a restart it showed *Needs a Quick Start*. That screen now says so
+  and points to the Free GST Billing icon. Remove the old one: right-click
+  it, then *Uninstall*.
+- **"Can I put it online?" answered.** The guide's *Is it safe?* page and the
+  GitHub page now say why the app should not be hosted on Railway, Render or
+  a server yet (no login on its server; Supabase would not be used). The old
+  online-deployment guide, which said it worked with no code changes, is
+  replaced by that answer.
+- **Control Panel → Restart the App.** When something is not working, one
+  click restarts the app on the same address and reloads the page.
+- **Remove the App always leads somewhere.** Where the app cannot remove
+  itself (run from source code or an old ZIP), the button reads *How to
+  remove it* and opens the steps, instead of a greyed-out *Not available
+  here*.
+- **The help "?" sits next to each page title**, instead of floating in
+  the middle of the header.
+- **Safe and private is its own section on Support & About**, after the ways to support, with every
+  point: data on this computer, no account, offline, no tracking, not open
+  to other computers, open source, the install, backups, PIN lock, problem
+  reports, security fixes and your part. Each opens its part of the guide.
+- **Support amounts are ₹200, ₹500, ₹1,000 or any amount.**
+- **Full view while making an invoice.** The Live preview bar has *Full
+  view*: the whole page in the print preview window, with Print and
+  Download PDF. The print preview also opens at a size that fits the window,
+  phone included.
+- **The LUT line on an export invoice is one quiet line.** The Rule 46 words
+  are unchanged (they are required word for word), but the green box and
+  bold type are gone.
+- **Ticked invoices as separate PDFs.** Next to *One merged PDF* (formerly
+  *Bulk PDF*), *Separate PDFs (ZIP)* downloads one PDF per invoice, named by
+  its invoice number, in one ZIP. The date filters now read *From* and *To*,
+  so any date range is easy to pick before ticking the header box.
+- **The app's status is a dot on *Control Panel*.** The *App Ready* box
+  under the menu is gone: a green dot on the Control Panel button means the
+  app is running, red means it is not. Control Panel holds what the
+  launcher window does (Update, Back up, Restore, Move, Stop, Remove).
+- **A services invoice shows only what services need.** In Services mode
+  (where the Freelancer / consultant type starts every invoice), these are
+  left out: the Unit column (while the unit is not printed), *Delivery
+  charges*, *Ship to*, and the goods boxes under *Order, dispatch &
+  reference details*. A line discount is just an amount or a percent, and
+  the whole-bill discount sits behind *+ Discount on the whole bill*.
+  Anything already filled in still shows; Goods or Mixed brings every box
+  back.
+- **The item box grows with the text.** A long item name wraps and stays
+  readable, and the box can be dragged taller. Enter still adds the next
+  row. The box is also wider.
+- **GST returns, income tax and the TDS & TCS report count invoices billed in
+  dollars, euros... in rupees**, at the exchange rate saved on each invoice.
+  An invoice in another currency without a rate is listed so you can add it,
+  and the GSTR-1 file waits for it.
+- **Dark mode, Notifications, User Guide and Lock moved to the top right** of
+  every screen as small buttons (on a phone, into the top bar), so the
+  sidebar holds only the screens. Settings → Features can hide or reorder
+  them.
+- **Settings opens as tabs**: one page per tab (Business type, Company,
+  Profiles, Print & PDF, Features...) instead of one very long page.
+- **Every ? opens its guide at the right place**: the ? on each screen, each
+  Settings tab and each dialog goes straight to that topic in the online
+  guide, and the guide highlights it.
+- **Smaller download**: the app ZIP is about 25 MB instead of 58 MB, so it
+  downloads, starts for the first time and updates faster.
 - **Purchases show CGST + SGST** (#117): the purchase form shows the tax split
   as you type (IGST for an inter-state bill), and the purchase register export
   has CGST, SGST and IGST columns instead of one tax column. CGST and SGST
   always add up to the tax exactly.
+- **TCS under CGST section 52 starts at 0.5%** (the rate since 10 July 2024;
+  it was 1%). Invoices already made keep the rate they were made with.
+- **The Export / International (LUT) terms preset** now uses the exact Rule 46
+  wording.
+
+### Fixed
+- **Products CSV import filled in only the names** (#134, thanks
+  @ethbroken-svg). A file with HSN/SAC, Purchase price, Selling price and
+  GST % columns (what the Products export itself writes) left those empty. The
+  import now reads them. Products already imported without their details:
+  delete them and import the file again.
+- **A purchase bill that added several new products could lose one.** Two
+  products saved in the same instant got the same ID, so one replaced the
+  other. New records now always get an ID of their own.
+- **The bulk PDF buttons stayed greyed out** after "Could not generate any
+  PDFs" until you left the Dashboard.
+- **Clicking the app icon twice while it started** could start two copies of
+  the app on the same books; the second one now waits for the first.
+- **Deleting a purchase bill with payments** now says those payments go
+  with it (they leave the Cash book), and suggests editing the bill instead.
+- **The one-line remove** deletes only the app's own files: anything else in
+  the folder it was installed into is left alone. The Windows remove line in
+  the install script's notes now works in Windows PowerShell 5.1.
+- **The GST portal refused the GSTR-1 JSON** with "File could not be
+  uploaded! Download the latest version of Offline tool..." (#133, thanks
+  @abhi783821). From the May 2025 return the portal wants the HSN summary
+  (Table 12) as two lists, B2B and B2C; the app still sent one. The file now
+  has both lists, HSN descriptions of at most 30 characters, *OE* on every
+  B2C row, no empty tables or blank values, and no turnover fields (they were
+  only for 2017-18). Credit notes to buyers without a GSTIN are now in it
+  too: they reduce the B2C totals, and a large inter-state one goes in Table
+  9B. The export now stops, with the reason, when your GSTIN is missing, the
+  period is a full year, or an invoice has no place of supply. **Export the
+  JSON again** for any month you could not upload.
+- **CSV invoice import made a duplicate client when the name was mistyped**
+  even though the GSTIN matched a saved client (#132, thanks @surajparshad8).
+  A row with a saved GSTIN now goes to that client under its saved name, and
+  two new rows with one GSTIN make one client.
+- **Billing a client abroad in dollars, with the client saved as in India,
+  gave a domestic invoice with no LUT.** The client form starts on India, so
+  clients abroad were often saved that way. The invoice now says *Billing in
+  USD to a client in India?* with a button to the client's Country box.
+  Setting it makes the invoice an export: "Outside India", the LUT, no IGST.
+  A client abroad with an Indian state as Place of supply (picked by hand or
+  kept from a copied invoice) gets the same kind of note, with *Make it an
+  export*. So does a tax invoice to a client abroad with GST turned off
+  (Customize → Tax % column, which hides the LUT too), with *Turn GST on*.
+- **The purpose-code suggestion list showed dark on a light screen** when
+  Windows was in dark mode. The browser's own pop-ups now follow the app's
+  theme.
+- **"Out of Stock" on things whose stock was never entered.** A product with
+  a blank stock is now "not counted" (shown as a dash), not 0; the Dashboard
+  low-stock strip, the bell and the products list all agree. A blank Stock box
+  in the form or in Bulk edit no longer saves 0. (#121, thanks @apfx007)
+- **GSTR-3B put supplies to SEZ units in 3.1(a)**; as zero-rated supplies they
+  belong in 3.1(b) with exports (CBIC Circular 147/03/2021-GST). They are now
+  there, in rupees, with their IGST if paid; the tax payable is unchanged.
+- **Foreign-currency invoices were added up as if they were rupees** in the
+  GST returns (Table 3.1(b), the HSN summary) and left out of income tax.
+- **TDS recorded with a payment (Client deducted TDS) could turn into 0** when
+  the invoice was opened and saved again (the 194Q ₹50 lakh threshold was
+  applied afresh). It now stays as recorded unless you change its rate.
+- **After a dollar invoice, the next Indian client was billed in dollars too.**
+  An Indian client now starts in rupees.
+- **A foreign client's VAT number printed as "GSTIN"** and was flagged as an
+  invalid GSTIN on the GST returns screen.
+- **Boxed grid and Tally style kept the unit column** when the unit was
+  switched off; thermal receipts printed "Rs." on a dollar invoice.
+- **Purchase bills took 18% GST for every product picked on a new line**,
+  instead of the product's own rate (a 12% item was booked at 18%, giving the
+  wrong input tax credit). A product with no rate saved still gets 18%.
+- **After an update the app could open blank (or as the old version) until
+  you refreshed a second time**: the browser's offline copy still held the
+  old version, which asked for files the update had removed. The new version
+  now reloads open windows when it takes over, and if the app's code ever
+  cannot load, it clears its offline copy once and reloads by itself. Your
+  data is never part of that copy.
+- **Updates now leave a clean folder**: files an older version had and the
+  new one no longer needs are removed (the Update button, the update scripts
+  and the one-line install all do this). Your books, saved PDFs, the bin and
+  the backups are never touched, and your data is still backed up first.
+- **The Windows installer said "Drive C:\ is almost full. It has 0 MB free"**
+  on a drive with plenty of space (some PCs do not report free space the way
+  the installer asked). It now asks Windows directly and never blocks when it
+  cannot tell.
+- **Opening the app no longer contacts Google**: its font is now built into
+  the app instead of loaded from Google Fonts each time, and the supporters
+  list is read only when it is shown.
+- **On a phone, the buttons at the top of a screen** (such as New Invoice on
+  the Dashboard) ran off the right edge; they now wrap.
+- **Stop Server did nothing on Mac and Linux** (the button was greyed out).
+  It now stops the app there too.
+- **Windows: the first Open App could wait 90 seconds and give up** when
+  another program was using the app's usual port. It now finds the port the
+  app moved to.
+- **The Windows install line failed on some older Windows 10 PCs** that do
+  not use the newer secure connection by default. The line now turns it on.
+- **E-Way Bill did nothing** when your or the client's PIN code was missing.
+  It now says which PIN code is missing and where to fill it in.
+- **"Cancel this invoice?" said to undo it from the status dropdown**; undo is
+  the *Undo cancel* arrow on the row. The message now says so.
+- **Send reminder showed on open quotations and proformas.** Only invoices
+  that are owed money offer a payment reminder now.
+- **The NIL return banner ignored purchase bills:** a period with purchases
+  has input tax credit to claim, so it is not a NIL GSTR-3B. The banner now
+  appears only when there are no invoices, purchase bills or expenses.
+- **The NIL-by-SMS hint left out the return type.** It now gives the GST
+  portal's exact formats: `NIL R1`, `NIL 3B` or `NIL C8`, then the GSTIN and
+  the period, sent to 14409.
+- **The GST rate suggested for an HSN code was the old, pre-September-2025
+  rate**, and the invoice filled it in for you: chocolates, biscuits and
+  mineral water came up at 18% instead of 5%, soft drinks at 28% instead of
+  40%, TVs and cement at 28% instead of 18%, medicines at 12% instead of 5%.
+  Suggestions now follow the rates in force since 22 September 2025. Where the
+  rate depends on the price, size or packing (clothes and shoes up to or above
+  ₹2,500, cars and bikes by engine size, loose or packed food), the hint shows
+  every possible rate and leaves your GST % alone. The hint is still a guide:
+  check the rate for your item.
 
 ---
 

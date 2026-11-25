@@ -62,12 +62,19 @@ import {
   templateTotals,
   parseLocalDate,
   formatDateGST,
+  spreadBillDiscount,
+  templateItems,
+  withReceivedNow,
+  receivedNowPayment,
 } from '../src/utils.js';
-import { splitPurchaseTax } from '../src/utils.js';
+import { receiptForPayment } from '../src/utils/bankMatch.js';
+import { linkedCashLines } from '../src/utils/cashBook.js';
+import { hsnSummary } from '../src/utils/gstr1Json.js';
+import { splitPurchaseTax, clientPaperPrefs, clientPaperOptions, getPaperSize } from '../src/utils.js';
 import { buildXlsx, colName } from '../src/utils/xlsx.js';
 import { bulkRowToProduct, closingStock, stockValueOf } from '../src/utils/products.js';
 import { upiNote, parseSupporters, shouldShowSupportNudge } from '../src/utils/supporters.js';
-import { parseChangelog, inlineParts } from '../src/utils/changelog.js';
+import { parseChangelog, headline, releaseTitles } from '../src/utils/changelog.js';
 import { unzipSync, strFromU8 } from 'fflate';
 import {
   compute44AE,
@@ -87,6 +94,9 @@ import {
   getOldRegimeSlabs,
   getNewRegimeSlabs,
   CURRENT_FY,
+  TAX_YEARS,
+  yearLabel,
+  filingDueDates,
   NEW_REGIME_SLABS_FY_2025_26,
   AUTO_CATEGORY_RULES,
   buildITR4FieldMap,
@@ -639,8 +649,9 @@ console.log("\n[V71] A client's sales so far this financial year");
     { id: 'f', clientName: 'Meera', invoiceDate: '2026-05-01', totalAmount: 3200, invoiceType: 'tax-invoice', currency: 'USD' },
     { id: 'g', clientName: 'Arjun', invoiceDate: '2026-05-01', totalAmount: 6400, invoiceType: 'tax-invoice' },
   ];
-  eq(clientYearToDate(bills, 'Meera', '2026-09-24'), 300, 'Same client, same FY, rupee sales only (quotes, cancelled, USD, last FY and other clients left out)');
-  eq(clientYearToDate(bills, 'Meera', '2026-09-24', 'a'), 200, 'The invoice being edited is not counted twice');
+  eq(clientYearToDate(bills, 'Meera', '2027-03-31'), 300, 'Same client, same FY, rupee sales only (quotes, cancelled, USD, last FY and other clients left out)');
+  eq(clientYearToDate(bills, 'Meera', '2027-03-31', 'a'), 200, 'The invoice being edited is not counted twice');
+  eq(clientYearToDate(bills, 'Meera', '2026-09-24'), 100, 'v1.10.85: only invoices up to this date (the one on 31 Mar 2027 is later)');
   eq(clientYearToDate(bills, '', '2026-09-24'), 0, 'No client name, nothing counted');
 }
 
@@ -654,6 +665,7 @@ console.log('\n[V71] GST rates and the B2C Large limit');
 
 console.log('\n[V71] Marking an invoice paid records the balance as a payment');
 {
+  eq(markPaidPatch({ totalAmount: 1000, payments: [] }, 'Marked paid', 'cash').payments[0].mode, 'cash', 'v1.10.85 (#184): marked paid in cash is a cash payment (Cash book)');
   const p = markPaidPatch({ totalAmount: 1000, payments: [{ amount: 400 }] });
   eq(p.paidAmount, 1000, 'Paid amount becomes the total');
   eq(p.payments.length, 2, 'One payment is added');
@@ -829,9 +841,9 @@ console.log('\n[V77] #86 choosing Unpaid takes back the "Paid" payment');
 
 console.log('\n[V77] #84 duplicate business profiles, terms line breaks');
 {
-  const saved = [{ id: 'a', businessName: 'Anant Exports', gstin: '09AABCU9355J1ZS' }, { id: 'b', businessName: 'Kaveri Stationers', gstin: '' }];
+  const saved = [{ id: 'a', businessName: 'Anant Exports', gstin: '09AABCU9355J1ZS' }, { id: 'b', businessName: 'DiceCodes', gstin: '' }];
   eq(findSameBusiness(saved, { businessName: 'ANANT EXPORTS PVT', gstin: '09aabcu9355j1zs' })?.id, 'a', 'Same GSTIN under another spelling is the same business');
-  eq(findSameBusiness(saved, { businessName: '  kaveri   stationers ', gstin: '' })?.id, 'b', 'No GSTIN: the same name (case and spaces ignored)');
+  eq(findSameBusiness(saved, { businessName: '  dicecodes ', gstin: '' })?.id, 'b', 'No GSTIN: the same name (case and spaces ignored)');
   eq(findSameBusiness(saved, { businessName: 'Anant Exports', gstin: '27AAAAA0000A1Z5' }), null, 'Same name but a different GSTIN is a different business');
   eq(findSameBusiness(saved, { businessName: 'Anant Exports', gstin: '' }), null, 'No GSTIN never overwrites a saved profile that has one');
   eq(findSameBusiness(saved, { businessName: 'Anant Exports', gstin: '09AABCU9355J1ZT' }, saved[0])?.id, 'a', 'Loaded profile with a corrected GSTIN typo: that profile is updated');
@@ -910,19 +922,19 @@ console.log('\n[V79] #96 quantities, #95 places of supply and per-business numbe
   eq([fmt({}, 'INV', 7), fmt({ ...brand, showFinYear: false }, 'INV', 7), fmt(brand, 'RPT', 3, { explicitPrefix: true })],
     ['INV/2026-27/0007', 'ACME/0007', 'RPT/2026-27/0003'], 'No brand: type prefix; no FY; a Print Settings per-type prefix is used as is');
 
-  const kaveri = { businessName: 'Kaveri Stationers', gstin: '29abcde1234f1zw' };
+  const dicecodes = { businessName: 'DiceCodes', gstin: '29abcde1234f1zw' };
   const anant = { businessName: '  Anant  Exports ', gstin: '' };
-  eq([businessKeyOf(kaveri), businessKeyOf(anant), businessKeyOf(null)], ['29ABCDE1234F1ZW', 'NAME:anant exports', ''], 'A business is known by its GSTIN, else its name');
+  eq([businessKeyOf(dicecodes), businessKeyOf(anant), businessKeyOf(null)], ['29ABCDE1234F1ZW', 'NAME:anant exports', ''], 'A business is known by its GSTIN, else its name');
   const shared = { brandPrefix: '', startNumber: 1 };
   const map = { [businessKeyOf(anant)]: { brandPrefix: 'AE', startNumber: 502 } };
-  const a = numberSeriesFor(shared, map, businessKeyOf(kaveri));
+  const a = numberSeriesFor(shared, map, businessKeyOf(dicecodes));
   const b = numberSeriesFor(shared, map, businessKeyOf(anant));
   eq([a.own, b.own, b.brandPrefix, b.startNumber, b.separator], [false, true, 'AE', 502, '/'], 'A business without its own numbering uses the shared one; one with it uses its own');
-  eq([counterKeyFor('INV', a, businessKeyOf(kaveri)), counterKeyFor('INV', b, businessKeyOf(anant))], ['counter_INV', 'counter_INV@NAME:anant exports'], 'Each own series has its own counters');
+  eq([counterKeyFor('INV', a, businessKeyOf(dicecodes)), counterKeyFor('INV', b, businessKeyOf(anant))], ['counter_INV', 'counter_INV@NAME:anant exports'], 'Each own series has its own counters');
   eq([fmt(a, 'INV', nextCounterValue(1225, startFor('tax-invoice', a))), fmt(b, 'INV', nextCounterValue(undefined, startFor('tax-invoice', b)))],
     ['INV/2026-27/1226', 'AE/2026-27/0502'], '#95: firm A continues at 1226, firm B starts its own series at 0502');
 
-  const ctx = { shared: { brandPrefix: 'ACME' }, seriesMap: map, businessKey: businessKeyOf(kaveri), customPrefixes: { 'tax-invoice': 'RPT' } };
+  const ctx = { shared: { brandPrefix: 'ACME' }, seriesMap: map, businessKey: businessKeyOf(dicecodes), customPrefixes: { 'tax-invoice': 'RPT' } };
   eq([!!ownPrefixProblem('', ctx), !!ownPrefixProblem('inv', ctx), !!ownPrefixProblem('ACME', ctx), !!ownPrefixProblem('AE', ctx), !!ownPrefixProblem('RPT', ctx), ownPrefixProblem('KS', ctx)],
     [true, true, true, true, true, ''], 'An own prefix must be set and unlike any other series (type prefixes, shared, other businesses, Print Settings)');
   eq(ownPrefixProblem('AE', { ...ctx, businessKey: businessKeyOf(anant) }), '', 'A business may keep its own prefix when it saves again');
@@ -1011,7 +1023,7 @@ console.log('\n[Audit 2026-10] Income tax marginal relief');
 
 console.log('\n[V80] Support page: UPI payment note and the supporters tracker');
 {
-  eq(upiNote('Kaveri Stationers'), 'Free GST Billing support - Kaveri Stationers', 'The payment note names the business that paid');
+  eq(upiNote('DiceCodes'), 'Free GST Billing support - DiceCodes', 'The payment note names the business that paid');
   eq(upiNote(''), 'Free GST Billing support', 'No business name: the plain note');
   eq(upiNote('M/S Sharma & Sons #12'), 'Free GST Billing support - M S Sharma Sons 12', 'Characters some UPI apps refuse are dropped');
   eq(upiNote('A Very Long Business Name Private Limited Company of India').length <= 50, true, 'The note is kept to 50 characters');
@@ -1066,9 +1078,181 @@ console.log('\n[V81] What\'s new: the changelog on the Support page');
     { kind: 'item', text: 'CSV dates read day first.', children: [] },
   ], 'Items, nested items and wrapped lines');
   eq(e[1].sections[0].blocks.map((b) => b.kind), ['para', 'item'], 'A plain line is a paragraph');
-  eq(inlineParts('**B** *i* `c` [x](https://a.b) [y](docs/z.md) [j](javascript:alert(1))').map((p) => p.t),
-    ['b', 'text', 'i', 'text', 'code', 'text', 'link', 'text'], 'Bold, italic, code and http links; other links stay text');
-  eq(inlineParts('[j](javascript:alert(1))').some((p) => p.t === 'link'), false, 'A javascript: link is never a link');
+  // v1.10.86 - only the main titles on Support & About.
+  eq(headline('**Sales orders, with a dispatch status** (#135, #112): the order between the quotation and the invoice.'), 'Sales orders, with a dispatch status', 'A bold lead is the title');
+  eq(headline("**Duplicate** keeps the invoice's currency: a copy of a USD invoice opened in INR."), "Duplicate keeps the invoice's currency", 'A one-word bold lead: its first clause instead');
+  eq(headline("**The app's status is a dot on *Control Panel*.** The box is gone."), "The app's status is a dot on Control Panel", 'Italics inside the bold lead are plain text');
+  eq(headline("The invoice screen's **Save & Download** button is now **Save PDF** (it still saves)."), "The invoice screen's Save & Download button is now Save PDF", 'No bold lead: the first sentence, without Markdown');
+  eq(headline('Docker: `FGSB_ALLOW_UNSAFE_LAN` is gone. More text.'), 'Docker: FGSB_ALLOW_UNSAFE_LAN is gone', 'A one-word lead before ":" keeps the next clause');
+  eq(headline('See [the guide](javascript:void) <b>now</b>'), 'See the guide <b>now</b>', 'A link is only its text, and HTML stays text (React shows it as text)');
+  const long = headline(`A ${'very '.repeat(30)}long line`);
+  eq([long.length <= 81, long.endsWith('…'), long.includes('  ')], [true, true, false], 'A long first sentence is cut short at a word, with ...');
+  eq(releaseTitles(e[0]), [{ title: 'Fixed', items: ['Old Node.js', 'CSV dates read day first'], more: 0 }], 'Titles per section; nested items are left out');
+  const many = { sections: [{ title: 'Added', blocks: Array.from({ length: 11 }, (_, i) => ({ kind: 'item', text: `**Thing ${i}** here`, children: [] })) }, { title: 'Changed (#92, thanks @x)', blocks: [{ kind: 'item', text: 'One change.', children: [] }] }, { title: 'Thanks', blocks: [{ kind: 'item', text: 'Reported by @a.', children: [] }] }] };
+  eq(releaseTitles(many).map((s) => [s.title, s.items.length, s.more]), [['Added', 8, 3], ['Changed', 1, 0]], 'At most 8 per section (the rest counted), "Changed (...)" is Changed, no Thanks');
+  eq(releaseTitles(e[1]), [{ title: 'Added', items: ['Lock button'], more: 0 }], 'A plain paragraph gives no title');
+}
+
+console.log('\n[ERR-006] A client on custom paper keeps its width');
+{
+  const saved = clientPaperPrefs({ paperSize: 'custom', customPaperWidth: 210, customPaperHeight: 297 });
+  eq(saved, { preferredPaperSize: 'custom', preferredCustomPaperWidth: 210, preferredCustomPaperHeight: 297 }, 'the width and height are saved with the size');
+  const back = clientPaperOptions(saved, { paperSize: '80mm' });
+  eq([back.paperSize, back.customPaperWidth, getPaperSize(back.paperSize, back).kind], ['custom', 210, 'sheet'], 'picking the client restores 210mm, a sheet, not an 80mm receipt');
+  eq(clientPaperOptions({}, { paperSize: '80mm' }).paperSize, '80mm', 'a client with no preference keeps the invoice\'s paper (not A4)');
+  eq(clientPaperOptions(undefined, {}).paperSize, 'a4', 'nothing set anywhere: A4');
+}
+
+console.log('\n[v1.10.84] Tax year 2026-27 (Income-tax Act 2025; rates as FY 2025-26, Finance Act 2026)');
+{
+  eq(TAX_YEARS, ['2026-27', '2025-26'], 'the year picker offers tax year 2026-27 (first) and FY 2025-26');
+  eq(CURRENT_FY, '2026-27', 'the default year is 2026-27');
+  for (const fy of TAX_YEARS) {
+    eq(getNewRegimeSlabs(fy), NEW_REGIME_SLABS_FY_2025_26, `${fy}: new-regime slabs are the FY 2025-26 ones (4L/8L/12L...)`);
+    eq(get87AConfig('new', fy), { threshold: 1_200_000, cap: 60_000 }, `${fy}: new-regime rebate up to ₹60,000 on income to ₹12L`);
+    // ₹12.75L salary - ₹75,000 standard deduction = ₹12L: no tax at all.
+    eq(computeTax({ salary: 1_275_000, regime: 'new', fy }).totalTax, 0, `${fy}: ₹12.75L salary pays no tax in the new regime`);
+  }
+  eq(getNewRegimeSlabs('2024-25') === NEW_REGIME_SLABS_FY_2025_26, false, 'FY 2024-25 keeps its own (older) slabs');
+  eq(yearLabel('2026-27'), 'Tax year 2026-27', 'the new Act names the year "Tax year"');
+  eq(yearLabel('2025-26'), 'FY 2025-26 (AY 2026-27)', 'earlier years keep FY and AY');
+  // Finance Act 2026: non-audit business returns are due 31 August, from AY 2026-27.
+  eq(filingDueDates('2025-26'), { salary: '2026-07-31', business: '2026-08-31', audit: '2026-10-31' }, 'FY 2025-26 due dates');
+  eq(filingDueDates('2026-27'), { salary: '2027-07-31', business: '2027-08-31', audit: '2027-10-31' }, 'tax year 2026-27 due dates');
+}
+
+console.log('\n[v1.10.85 #190] Whole-bill discount before GST (trade discount)');
+{
+  const prof = { country: 'India', state: 'Punjab', gstin: '03AAAAA0000A1Z5' };
+  const intra = { name: 'A', state: 'Punjab' };
+  const inter = { name: 'B', state: 'Delhi' };
+  const run = (items, invoiceOptions, extra = {}) => computeInvoiceTotals({ items, profile: prof, client: extra.client || intra, details: {}, showGST: extra.showGST !== false, taxInclusive: !!extra.taxInclusive, invoiceOptions });
+  const sumShares = (list) => Math.round(list.reduce((s, it) => s + (Number(it.billDiscShare) || 0) * 100, 0));
+
+  // Proportional split: 6,000 and 4,000 share a 1,000 discount as 600 / 400.
+  const two = [{ quantity: 1, rate: 6000, taxPercent: 18 }, { quantity: 2, rate: 2000, taxPercent: 18 }];
+  const spread = spreadBillDiscount(two, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 1000 });
+  eq(spread.map((i) => i.billDiscShare), [600, 400], 'the discount is shared in proportion to each line\'s value');
+  eq(two.map((i) => i.billDiscShare), [undefined, undefined], 'the items passed in are not changed');
+  const t1 = run(two, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 1000 });
+  eq([t1.taxableAmount, t1.cgst, t1.sgst, t1.igst, t1.total], [9000, 810, 810, 0, 10620], 'intra-state: GST on 9,000 (CGST 810 + SGST 810), total 10,620');
+  eq([t1.billDiscountBeforeGst, t1.invoiceDiscountAmount, t1.totalDiscount], [1000, 0, 1000], 'shown as a before-GST discount; nothing more comes off the total');
+  const t1x = run(two, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 1000 }, { client: inter });
+  eq([t1x.taxableAmount, t1x.igst, t1x.cgst, t1x.total], [9000, 1620, 0, 10620], 'inter-state: IGST 1,620 on 9,000');
+
+  // Old bills (no flag) and the default stay exactly as before: after GST.
+  const after = run(two, { invoiceDiscountValue: 1000 });
+  eq([after.taxableAmount, after.cgst, after.invoiceDiscountAmount, after.billDiscountBeforeGst, after.total], [10000, 900, 1000, 0, 10800], 'default "After GST": GST on 10,000, then 1,000 off (11,800 - 1,000)');
+  const afterPct = run(two, { invoiceDiscountValue: 10, invoiceDiscountType: 'percent' });
+  eq([afterPct.taxableAmount, afterPct.invoiceDiscountAmount, afterPct.total], [10000, 1180, 10620], 'default percent: 10% of the total with GST');
+  eq(spreadBillDiscount(two, { invoiceDiscountValue: 1000 }), two, 'after GST the lines get no part');
+  eq(run(two, { invoiceDiscountValue: 1000, invoiceDiscountBeforeGst: false }).total, 10800, 'Before GST switched off = After GST');
+
+  // Rounding: 100 over three equal lines -> 33.34 + 33.33 + 33.33, exactly 100.
+  const three = [1, 2, 3].map(() => ({ quantity: 1, rate: 100, taxPercent: 5 }));
+  const s3 = spreadBillDiscount(three, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 100 });
+  eq(s3.map((i) => i.billDiscShare), [33.34, 33.33, 33.33], 'paise left over go to the largest remainder, first line first');
+  eq(sumShares(s3), 10000, 'the parts add up to the discount exactly');
+  // Awkward values: 7 lines, odd rates, 123.45 off.
+  const odd = [17.31, 9.99, 250, 0.7, 1234.56, 3.33, 77.77].map((rate, i) => ({ quantity: i + 1, rate, taxPercent: [0, 5, 12, 18, 28, 18, 5][i] }));
+  const sOdd = spreadBillDiscount(odd, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 123.45 });
+  eq(sumShares(sOdd), 12345, '7 odd lines: parts add up to 123.45 exactly');
+  truthy(sOdd.every((it) => Math.abs(it.billDiscShare * 100 - Math.round(it.billDiscShare * 100)) < 1e-6), 'every part is whole paise');
+  const tOdd = run(odd, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 123.45 });
+  approx(tOdd.taxableAmount, run(odd, {}).taxableAmount - 123.45, 'taxable value drops by exactly the discount', 0.005);
+  const sPct = spreadBillDiscount(odd, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 7.5, invoiceDiscountType: 'percent' });
+  const oddBase = odd.reduce((s, it) => s + it.quantity * it.rate, 0);
+  eq(sumShares(sPct), Math.round(oddBase * 7.5), '7.5% on odd lines: parts add up to the rounded 7.5% exactly');
+
+  // Mixed GST rates: GST is worked out on each line's reduced value.
+  const mixed = [{ quantity: 1, rate: 1000, taxPercent: 5, hsn: '1001', name: 'Rice' }, { quantity: 1, rate: 3000, taxPercent: 18, hsn: '8471', name: 'Cable' }];
+  const tm = run(mixed, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 10, invoiceDiscountType: 'percent' });
+  eq([tm.taxableAmount, tm.cgst, tm.sgst, tm.total], [3600, 265.5, 265.5, 4131], '10% before GST on 5% + 18% lines: 900 @5% + 2,700 @18% = GST 531');
+  eq(tm.billDiscountBeforeGst, 400, 'percent: 10% of the value before GST (400)');
+  const tmx = run(mixed, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 400 }, { client: inter });
+  eq([tmx.taxableAmount, tmx.igst, tmx.total], [3600, 531, 4131], 'inter-state mixed rates: IGST 531');
+
+  // Line discounts first, then the bill discount on what is left.
+  const withLine = [{ quantity: 10, rate: 100, discount: 10, discountType: 'percent', taxPercent: 12 }, { quantity: 1, rate: 1100, discount: 100, taxPercent: 12 }];
+  const sl = spreadBillDiscount(withLine, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 190 });
+  eq(sl.map((i) => i.billDiscShare), [90, 100], 'shared on the value after line discounts (900 and 1,000)');
+  const tl = run(withLine, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 190 });
+  eq([tl.taxableAmount, tl.totalDiscount, tl.cgst], [1710, 390, 102.6], 'taxable 1,710 after 200 line + 190 bill discount');
+
+  // Fixed discount larger than the bill: capped at the bill's value.
+  const capped = run([{ quantity: 1, rate: 50, taxPercent: 18 }], { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 80 });
+  eq([capped.taxableAmount, capped.total], [0, 0], 'a discount bigger than the bill takes it to 0, never below');
+
+  // Tax-inclusive: the discount comes off the prices as entered (GST included), GST backed out of what is left.
+  const incl = [{ quantity: 1, rate: 1180, taxPercent: 18 }, { quantity: 1, rate: 1050, taxPercent: 5 }];
+  const ti = run(incl, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 223 }, { taxInclusive: true });
+  eq(spreadBillDiscount(incl, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 223 }, true).map((i) => i.billDiscShare), [118, 105], 'inclusive: shared on the prices with GST');
+  eq([ti.taxableAmount, Math.round((ti.cgst + ti.sgst) * 100) / 100, ti.total], [1800, 207, 2007], 'inclusive: 1,062 + 945 left, taxable 900 + 900, GST 207, total 2,007');
+  const tiPct = run(incl, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 10, invoiceDiscountType: 'percent' }, { taxInclusive: true });
+  eq([tiPct.taxableAmount, tiPct.total], [1800, 2007], 'inclusive percent: 10% off the same as 223 fixed');
+  const tiAfter = run(incl, { invoiceDiscountValue: 223 }, { taxInclusive: true });
+  eq([tiAfter.taxableAmount, tiAfter.total], [2000, 2007], 'inclusive After GST unchanged: taxable 2,000, 2,230 - 223');
+
+  // Bill of supply (no GST): Before GST does not apply; the discount comes off the total as before (review).
+  const bos = run(two, { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 1000 }, { showGST: false });
+  eq([bos.taxableAmount, bos.total], [10000, 9000], 'bill of supply: no GST, so the discount comes off the total (10,000 - 1,000), lines unchanged');
+
+  // Cess follows the reduced value too.
+  const cessT = run([{ quantity: 1, rate: 1000, taxPercent: 28, cessPercent: 12 }], { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 100 });
+  eq([cessT.taxableAmount, cessT.cess, cessT.total], [900, 108, 1260], 'cess on 900: 108');
+
+  // Saved lines carry their part: GSTR-1 HSN summary and splitLineTax agree with the totals.
+  const opts = { invoiceDiscountBeforeGst: true, invoiceDiscountValue: 400 };
+  const savedItems = spreadBillDiscount(mixed, opts);
+  const tSaved = run(savedItems, opts);
+  eq(tSaved.taxableAmount, tm.taxableAmount, 'totals of the saved lines match (an old part is replaced, not added again)');
+  const bill = { invoiceType: 'tax-invoice', data: { items: savedItems, profile: prof, client: intra, totals: tSaved, invoiceOptions: opts, details: {} } };
+  const hsn = hsnSummary([bill]).rows;
+  eq(hsn.map((r) => [r.hsn_sc, r.txval, r.camt]), [['1001', 900, 22.5], ['8471', 2700, 243]], 'GSTR-1 HSN summary: taxable 900 and 2,700, CGST 22.50 and 243');
+  eq(Math.round(savedItems.reduce((s, it) => s + splitLineTax(it, false).taxable, 0) * 100) / 100, 3600, 'GSTR-1 taxable value (splitLineTax) 3,600');
+  eq(resolveLineDiscount(savedItems[1]), 300, 'the line\'s discount includes its part (300)');
+  // Switching back to After GST drops the parts: no stale discount.
+  const back = run(savedItems, { invoiceDiscountValue: 400 });
+  eq([back.taxableAmount, back.invoiceDiscountAmount], [4000, 400], 'switched to After GST: the saved parts are ignored');
+  eq(spreadBillDiscount(savedItems, {}).some((i) => 'billDiscShare' in i), false, 'and removed from the lines');
+
+  // Recurring invoices save the lines with their parts.
+  const tpl = { invoiceType: 'tax-invoice', items: mixed, invoiceOptions: opts, clientName: 'A', clientState: 'Punjab' };
+  eq(templateItems(tpl).map((i) => i.billDiscShare), [100, 300], 'a recurring invoice saves each line\'s part');
+  eq(templateTotals(tpl, prof).taxableAmount, 3600, 'and its totals use them');
+}
+
+console.log('\n[v1.10.85 #185] Payment received while making the invoice');
+{
+  const pay = receivedNowPayment({ amount: '1180', mode: 'cash', date: '2026-11-14' });
+  eq([pay.amount, pay.mode, pay.date, pay.note, /^pay_/.test(pay.id), !!pay.recordedAt], [1180, 'cash', '2026-11-14', 'Received with the invoice', true, true], 'a payment with the Record Payment fields (id, amount, date, mode, note)');
+  eq(receivedNowPayment({ amount: '' }), null, 'an empty amount is no payment');
+  eq(receivedNowPayment({ amount: '0' }), null, '0 is no payment');
+  eq(receivedNowPayment({ amount: '-5' }), null, 'a negative amount is no payment');
+  eq(receivedNowPayment({ amount: '10.005', id: 'pay_x', recordedAt: 'T0' }).amount, 10.01, 'rounded to the paisa');
+  eq(receivedNowPayment({ amount: 5, id: 'pay_keep', recordedAt: 'T0' }).id, 'pay_keep', 'a later save keeps the same id');
+  eq(typeof receivedNowPayment({ amount: 5 }).date, 'string', 'no invoice date: today');
+
+  // First save adds it; every later save (auto-saves too) replaces it, never adds a second.
+  const credit = { id: 'pay_credit', amount: 100, mode: 'credit-applied' };
+  let payments = withReceivedNow([credit], null, { ...pay, id: 'pay_now' });
+  eq(payments.map((p) => p.id), ['pay_credit', 'pay_now'], 'first save: the payment is added');
+  for (let i = 0; i < 3; i++) payments = withReceivedNow(payments, 'pay_now', { ...pay, id: 'pay_now', amount: 500 + i });
+  eq(payments.map((p) => `${p.id}:${p.amount}`), ['pay_credit:100', 'pay_now:502'], 'saved again 3 times: still one payment, with the latest amount');
+  eq(withReceivedNow(payments, 'pay_now', null).map((p) => p.id), ['pay_credit'], 'amount cleared: the payment is removed, others kept');
+  eq(withReceivedNow(undefined, null, null), [], 'no payments at all');
+
+  // Status and cash book, as the Dashboard's Record Payment gives them.
+  const bill = { id: 'INV-1', invoiceNumber: 'INV-1', clientName: 'Walk-in', currency: 'INR', totalAmount: 1180, invoiceType: 'tax-invoice', data: { client: { name: 'Walk-in' }, profile: { gstin: '03AAAAA0000A1Z5', businessName: 'DiceCodes' }, totals: { total: 1180 } } };
+  eq(paymentStatusFor(bill, 1180), 'paid', 'the full amount: Paid');
+  eq(paymentStatusFor(bill, 500), 'partial', 'part of it: Partly paid');
+  const p2 = { ...pay, id: 'pay_now' };
+  const receipt = receiptForPayment(bill, p2);
+  eq([receipt.id, receipt.amount, receipt.paymentMode, receipt.againstInvoice, receipt.billId, receipt.source], ['pay_now', 1180, 'cash', 'INV-1', 'INV-1', 'auto-from-payment'], 'its receipt carries the payment\'s id, as the Dashboard saves it');
+  const lines = linkedCashLines({ bills: [{ ...bill, payments: [p2] }], receipts: [receipt] });
+  eq(lines.map((l) => [l.source, l.type, l.amount]), [['receipt', 'in', 1180]], 'Cash book: the cash payment shows once (paired with its receipt)');
+  const upi = linkedCashLines({ bills: [{ ...bill, payments: [{ ...p2, mode: 'upi' }] }], receipts: [{ ...receipt, paymentMode: 'upi' }] });
+  eq(upi.length, 0, 'a UPI payment stays out of the Cash book');
 }
 
 console.log('\n────────────────────────────────────────');

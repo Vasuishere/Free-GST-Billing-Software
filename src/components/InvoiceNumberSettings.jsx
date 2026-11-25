@@ -10,11 +10,12 @@ import { Hash, Save } from 'lucide-react';
 import { getInvoiceNumberSettings, saveInvoiceNumberSettings, getNumberSeriesMap, saveNumberSeriesMap } from '../store';
 import {
   getFinancialYearLabel, nextCounterValue, MAX_START_NUMBER, DEFAULT_NUMBER_SETTINGS,
-  formatDocNumber, counterKeyFor, ownPrefixProblem, numberFormatProblem,
+  formatDocNumber, counterKeyFor, ownPrefixProblem, prefixClashWarning, numberFormatProblem,
 } from '../utils';
 import { getPrintSettings } from '../utils/printSettings';
 import { toast } from './Toast';
 import { confirmAction } from './ConfirmModal';
+import HelpButton from './HelpButton';
 
 const cleanStart = (v) => (Number.isInteger(Number(v)) && Number(v) >= 1 ? Number(v) : 1);
 
@@ -105,6 +106,9 @@ const InvoiceNumberSettings = forwardRef(function InvoiceNumberSettings(
       settings.brandPrefix = String(settings.brandPrefix || '').trim().toUpperCase();
       const problem = ownPrefixProblem(settings.brandPrefix, { shared, seriesMap, businessKey, customPrefixes: getPrintSettings().customPrefixes });
       if (problem) { toast(problem, 'warning'); return false; }
+      // v1.10.85 - an old SO / DN prefix still saves, with a word of warning.
+      const clash = prefixClashWarning(settings.brandPrefix);
+      if (clash) toast(clash, 'warning', 12000);
     } else {
       // The shared prefix may not be one a business numbers with on its own.
       const brand = String(settings.brandPrefix || '').trim().toUpperCase();
@@ -181,10 +185,10 @@ const InvoiceNumberSettings = forwardRef(function InvoiceNumberSettings(
   const brand = String(draft.brandPrefix || '').trim();
   return (
     <>
-      <h3 className="section-title mt-8"><Hash size={18} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 6 }} />Invoice Number Format</h3>
+      <h3 className="section-title mt-8"><Hash size={18} style={{ display: 'inline', verticalAlign: 'middle', marginRight: 6 }} />Invoice Number Format <HelpButton title="Invoice Number Format" doc="settings#invoice-numbers" size={16} style={{ marginLeft: 6 }} /></h3>
       {(showScope || savedScope === 'own') && (
         <div className="form-group" style={{ marginBottom: '0.75rem' }}>
-          <label className="form-label">Numbering for {businessName || 'this business'}</label>
+          <label className="form-label">Numbering for {businessName || 'this business'} <HelpButton title="Shared or own numbering" doc="settings#own-numbering" size={16} style={{ marginLeft: 6 }} /></label>
           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
             <button type="button" className={`type-chip ${scope === 'shared' ? 'type-chip-active' : ''}`} onClick={() => pickScope('shared')}>
               Shared numbering
@@ -262,6 +266,7 @@ const InvoiceNumberSettings = forwardRef(function InvoiceNumberSettings(
           <span style={{ fontSize: '0.7rem', fontWeight: 400, color: 'var(--text-muted)', marginLeft: '0.3rem' }}>
             (defaults are fine for most businesses)
           </span>
+          <HelpButton title="Prefix, separator and padding" doc="settings#number-customize" size={16} style={{ marginLeft: 'auto' }} />
         </summary>
         <div className="grid grid-cols-2 gap-4" style={{ padding: '0.75rem 0.85rem 0.85rem' }}>
           {scope !== 'own' && (

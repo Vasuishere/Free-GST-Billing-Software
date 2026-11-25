@@ -102,6 +102,8 @@ MSHTML and the long form is the reliable one there.
 encoding, so keep the nice typography; PowerShell cannot be trusted to,
 so strip to ASCII. Do not "fix" the HTA by stripping its emoji.
 
+**Automated (30 Oct 2026):** `npm run release:check` fails if the launcher loses `charset=utf-8` or gains a non-ASCII character ("ERR-002 ...").
+
 **Guard:** none — HTA is not covered by `assertAsciiOnly()`. Check by
 eye when editing the launcher.
 
@@ -191,6 +193,8 @@ only in Chrome hides this entire class of bug.
 > `frame-src` (PDF print). A directive with an explicit value does **not**
 > inherit `default-src`.
 
+**Automated (30 Oct 2026):** `npm run release:check` fails if `frame-src`, `worker-src` or `img-src` in src/index.html loses `blob:` ("ERR-004 ...").
+
 **Guard:** none automated. When adding any `createObjectURL` usage, check
 which CSP directive governs the sink and confirm it lists `blob:`.
 
@@ -260,6 +264,8 @@ not the dimensions. A client stored on `custom` therefore came back as
 > A setting whose meaning depends on companion fields must persist those
 > fields together. Never let a missing dimension fall through to a default
 > that changes the **kind** of output.
+
+**Automated (v1.10.84):** `clientPaperPrefs` / `clientPaperOptions` in src/utils.js, round-trip tested in scripts/tax-test.mjs ("[ERR-006] ...").
 
 **Guard:** none automated.
 
@@ -623,6 +629,8 @@ differed from the saved baseline, which is what raised the unsaved-changes bar.
 the form, and reset the dirty baseline afterwards. Clearing a form is not the
 same as creating a record, and the active profile is a single file, not a list.
 
+**Audit, 30 Oct 2026:** the smoke check named below does not exist in tests/smoke.mjs. Writing it is planned for 7 Nov; until then this is checked by hand.
+
 **Guard** - `tests/smoke.mjs` (#66): after Add New Profile the previous company
 is present in Business Profiles and the form is not marked dirty.
 
@@ -673,6 +681,8 @@ checked, so there was no way to tell the two apart.
 looked in. A path the user can compare against what is on screen ends the
 argument in one glance; "a file is missing" starts it.
 
+**Automated (30 Oct 2026):** `npm run release:check` fails if the launcher loses its Temp-folder check ("ERR-017 ...").
+
 **Guard** - the launcher now detects a `%LOCALAPPDATA%\Temp\` location and says
 so in its own words ("Windows opened this file straight out of the ZIP"), with
 numbered steps and a button that opens the Downloads folder. Any other missing
@@ -717,6 +727,797 @@ before shipping a release that touches the launcher or the scripts.
 **Guard** - none automated (it needs a real Windows desktop session and a
 browser). Verified by hand: extract the ZIP, run `_system\install-windows.ps1`,
 and confirm the browser opens on `http://localhost:47371` with no warning.
+
+---
+
+## ERR-097 - Node.js 26 does not start on minimal Linux (libatomic.so.1 missing)
+
+**Version:** caught while building v1.10.86 (moving Linux to Node.js 26), never released
+**Reported by:** the release build (npm run release:linux)
+
+**Symptom** - "node: error while loading shared libraries: libatomic.so.1: cannot open shared object file".
+**Cause** - Node.js 26 Linux binaries link libatomic, which debian:bookworm-slim and minimal Debian / Ubuntu installs do not have; the build also still checked for Node 20.
+**Rule** - a Node.js bump on Linux ships every shared library the new binary needs (ldd it in debian:bookworm-slim) and moves every version check with it.
+**Guard** - packaging/linux/build-in-container.sh runs the bundled node with only node/lib after removing libatomic1 (fails the build if it cannot start); install.sh falls back to Node.js 22. By hand: install.sh in plain debian:bookworm-slim.
+
+---
+
+## ERR-096 - Settings: GET /api/templates -> 500 Internal server error
+
+**Version:** v1.10.85 and earlier · fixed in v1.10.86
+**Reported by:** #217 (Windows 11, Edge)
+
+**Symptom** - "Kind: api. Request: GET /api/templates -> 500. Message: Internal server error" on the Settings screen.
+**Cause** - with no terms template on file, the route saved the default one first; when that write failed (folder locked by OneDrive / antivirus, or missing) the whole request failed, on every visit. Sorting also threw on a template whose name was not text.
+**Rule** - a list route never fails because a best-effort seed write failed: catch it, log it, still answer; never call string methods on stored values without String().
+**Guard** - none automated; by hand: make data/templates read-only, open Settings, the default terms still show.
+
+---
+
+## ERR-095 - Missing CSS classes: boxes touched side by side
+
+**Version:** for months (gap-3, p-0, p-3, btn-sm, btn-link, stat-icon-red) · fixed in v1.10.86
+**Reported by:** the maintainer, 15 Nov 2026 (New Invoice → More invoice details)
+
+**Symptom** - two-column boxes in More invoice details touched each other; small buttons were full size; one Income Tax icon had no colour.
+**Cause** - screens used utility classes that no stylesheet defined, so they did nothing.
+**Rule** - never use a spacing, grid or button class without checking it exists in src/index.css; add it there first.
+**Guard** - `scripts/css-classes-test.mjs` (in `npm run test:unit`) fails on any undefined gap / p / m / grid-cols / btn / stat-icon class.
+
+---
+
+## ERR-094 - Docker: container healthy, but "can't reach this page"
+
+**Version:** v1.10.85 (Docker image) · fixed in v1.10.86
+**Reported by:** #207 (Docker Desktop on Windows 11)
+
+**Symptom** - "Hmmm... can't reach this page / localhost refused to connect" on localhost:47443; the log said `running at http://localhost:47371`.
+**Cause** - the container was started with Docker Desktop's Run button, so docker-compose.yml's FGSB_PHONE_ACCESS, PIN and port 47443 were never set; plain HTTP answers 127.0.0.1 inside the container only, and the healthcheck tested only that.
+**Rule** - in Docker the startup log must say how to open the app (or what is missing: compose, FGSB_PIN), never an address that only works inside the container; the healthcheck must test the address users open.
+**Guard** - the Dockerfile HEALTHCHECK also connects to 47443 when FGSB_PHONE_ACCESS=1 (container shows unhealthy). By hand: `docker run` the image without compose and read the log.
+
+---
+
+## ERR-093 - Purchases made a second product for the same item
+
+**Version:** all versions with stock from purchases · fixed in v1.10.86
+**Reported by:** #199
+
+**Symptom** - "When adding products through the Purchase module, the system allows duplicate products."
+**Cause** - purchase lines never saved their productId (the code said it did), so stock was matched by the exact name only: an extra inner space, a name from GSTR-2B / a photo, or renaming a line while editing made a new product.
+**Rule** - a purchase line keeps the productId it was picked or matched with; names are compared with productKey (trim, collapse spaces, lower case), then the barcode, before a product is created.
+**Guard** - `scripts/purchase-lines-test.mjs` (rename, inner spaces, barcode, stock on edit and delete).
+
+---
+
+## ERR-092 - One client showed as two accounts; a receipt edit paid an invoice twice
+
+**Version:** all earlier versions · fixed in v1.10.86
+**Reported by:** #202
+
+**Symptom** - "the system creates a duplicate client ledger ... the transaction gets recorded in both ledgers"; "change the mode of payment from Cash to UPI ... records two separate receipts".
+**Cause** - the Clients screen grouped bills by `clientName.toLowerCase()` without trimming, while other lookups used the exact name; and the Receipts page found the invoice's payment only by receiptNo, which Dashboard and Received-now payments never stored, so an edit appended a second payment with the same id.
+**Rule** - every client match by name goes through `clientKey()`; a receipt edit finds its payment by id or receiptNo; every new payment stores its receiptNo.
+**Guard** - `scripts/client-ledger-test.mjs`.
+
+---
+
+## ERR-091 - An import that found nothing said only "no rows under the header"
+
+**Version:** all earlier versions · fixed in v1.10.86
+**Reported by:** #213 (an e-commerce seller's order CSV)
+
+**Symptom** - "Order-CSV (2).csv: 0 invoices ready. The file has no rows under the header."
+**Cause** - one message for every way of getting nothing: a Flipkart report with no invoice numbers yet, all rows cancelled, another marketplace's file, an unclosed quote swallowing the file.
+**Rule** - an import that produces nothing says which of these it is and what to do.
+**Guard** - `scripts/purchase-lines-test.mjs` (emptyImportMessage cases).
+
+---
+
+## ERR-090 - Error reports from the Vite developer server
+
+**Version:** any (someone running `npm run dev` in a cloud editor) · fixed in v1.10.86
+**Reported by:** #204
+
+**Symptom** - "Kind: uncaught. Message: WebSocket closed without opened. ... /@vite/client".
+**Cause** - the uncaught-error reporter logged the dev server's live-reload socket closing.
+**Rule** - errors whose stack is in /@vite/client or node_modules/.vite are not app problems and are not reported.
+**Guard** - none automated; `DEV_SERVER` in src/main.jsx.
+
+---
+
+## ERR-089 - "Update Software" on the ZIP copy stayed on "Updating..." for good
+
+**Version:** v1.10.44 and later (ZIP copy on Windows) · fixed in v1.10.86
+**Reported by:** the maintainer, 14 Nov 2026: users cannot tell anything is happening after "Update Software"
+
+**Symptom** - Control Panel -> Update Now turned into "Updating..." and never
+came back; a blank black window may have opened behind the app.
+
+**Cause** - the server ran update-windows.ps1 with its input as an open pipe.
+The script ends with Read-Host "Press Enter to close", and PowerShell then
+reads that pipe, not the keyboard: nothing ever wrote to it, so the script
+never ended and the request never answered. Its output went to the pipe too,
+so the window it opened stayed empty. Restore (and Backup, after an error) end the same way.
+
+**Rule** - control scripts started by the server get no input (stdin
+'ignore' in runControlScript): Read-Host answers at once with nothing. A
+question such as "Install Node.js LTS now? Type Y" is then a no, never a yes.
+The page shows the update's steps itself (UpdateOverlay).
+
+**Guard** - none automated for the hang (it needs a real ZIP copy on Windows);
+scripts/mac-app-test.mjs checks that every step line of both update scripts is
+still recognised for the progress window.
+
+---
+
+## ERR-088 - A duplicated invoice lost its currency
+
+**Version:** v1.10.83 and later · fixed in v1.10.85
+**Reported by:** the maintainer, 14 Nov 2026: "if duplicate the invoice it should auto pick the same currency it currecnlty changes to what i am using for new"
+
+**Symptom** - Duplicate on a USD invoice opened the copy in INR (the currency
+of the last new invoice).
+
+**Cause** - the editor loads the saved defaults for new invoices from the
+server when it opens. Saved bills skipped that load (v1.10.75), but a
+duplicate or a conversion did not: the defaults arrived a moment after the
+bill's own options and replaced them, currency included.
+
+**Rule** - a bill opened from saved data (edit, duplicate, conversion) keeps
+its own options; the defaults for new invoices fill only a blank new invoice.
+
+**Guard** - smoke check "duplicating a USD invoice keeps USD".
+
+---
+
+## ERR-087 - A non-GST credit note kept its CGST/SGST columns
+
+**Version:** v1.10.84 and earlier · fixed in v1.10.85
+**Reported by:** @snvrahulkumarde-collab in #186: "in case of non gst supply customization does not allow me to remove cgst and sgst column from credit note or tax invoice"
+
+**Symptom** - GST switched off on an invoice (a non-GST supply), then the
+document type changed (or the invoice turned into a credit note): GST, and so
+the CGST/SGST columns, came back on.
+
+**Cause** - `handleTypeChange` and the convert path in InvoiceGenerator set
+`showGST` from the new type's default (`INVOICE_TYPES[type].showGST`, true for a
+credit note), throwing away the user's own choice.
+
+**Rule** - a type change keeps GST off when the user switched it off; only a
+bill of supply forces it off, and only coming from a bill of supply does the
+new type's own default apply.
+
+**Guard** - the rule is in both places in InvoiceGenerator.jsx (tagged
+`v1.10.85 (#186)`).
+
+---
+
+## ERR-086 - Nothing marked "Paid" ever reached the Cash book
+
+**Version:** v1.10.83 to v1.10.84 · fixed in v1.10.85
+**Reported by:** @snvrahulkumarde-collab in #184 ("Payment Status (paid) does not affect Cash"), confirmed by @Harsh705 for sales invoices too
+
+**Symptom** - choosing **Paid** in an invoice's or a purchase bill's status
+list recorded a payment, but the Cash book never showed it.
+
+**Cause** - `markPaidPatch` (utils.js) and `markPurchasePaid`
+(purchasePayments.js) recorded the payment with mode `other`. The Cash book
+counts only payments whose mode is cash (`isCash`), so every "Marked paid"
+payment was invisible to it, cash or not.
+
+**Rule** - a payment the app records for the user says how it was paid. Paid
+from a status list asks (Cash, UPI, Bank transfer, Cheque, Card, Other; the
+last answer first, `askPaidMode.js`); cancelling leaves the status as it was.
+
+**Guard** - `scripts/tax-test.mjs` and `scripts/purchase-payments-test.mjs`
+(the mode is stored), and `tests/smoke.mjs` "#184 marking it Paid asks how".
+
+---
+
+## ERR-085 - "Needs a Quick Start" inside the app's own window during an update
+
+**Version:** the v1.10.84 test Setup (never released) · fixed before release
+**Reported by:** the maintainer, running the new Setup over their install (2026-11-07), with a screenshot: "this window should never come"
+
+**Symptom** - while the Setup updated the app, the open app window showed the
+browser-style "Free GST Billing Software Needs a Quick Start" page (double-click
+the Desktop icon, Chrome/Edge app icons...).
+
+**Cause** - that screen is the app's own `serverDown` view (App.jsx), drawn in
+the page when `/api/profile` stops answering. An update stops the server for a
+moment. The window's guard (ERR-075 follow-up in FreeGSTBilling.cs) only looks
+at page loads, and this view appears without one, so it was never covered.
+
+**Rule** - inside the Windows Setup's window (`window.chrome.webview`, WebView2)
+the page never shows start-up instructions: it shows the start screen's
+"Starting again..." until the server answers; the window starts the server
+itself. Browsers and the ZIP launcher keep the Quick Start help.
+
+**Guard** - `tests/smoke.mjs` "v84 the app window never shows Needs a Quick
+Start": with `/api/profile` refused, a page with `window.chrome.webview` shows
+"Starting again" and no Quick Start, a plain browser shows the Quick Start.
+
+---
+
+## ERR-084 - A deleted invoice could leave the Trash at once instead of after 30 days
+
+**Version:** every version since 1.9.5 · fixed in 1.10.84
+**Found by:** checking the maintainer's question "delete invoice should go to trash folder and 30 days auto delete" (2026-11-07)
+
+**Symptom** (expected, not reported) - an invoice not changed for more than 30
+days, deleted (Clients page), was gone from the Trash bin at the next start of
+the app (or within a day), with no 30 days to restore it. The Trash bin also
+showed the invoice's old date as the date it was deleted.
+
+**Cause** - `DELETE /api/bills/:id` moves the file with `fs.renameSync`, which
+keeps the file's modified time; `purgeOldTrash` removes Trash files whose
+modified time is over 30 days old, and `/api/trash` shows that time as
+`_trashedAt`.
+
+**Rule** - a file moved into the Trash gets the current time
+(`fs.utimesSync`); anything that ages files by date must stamp them when they
+start their wait.
+
+**Guard** - `scripts/server-lock-test.mjs` (in `npm run test:unit`): a bill
+dated 60 days ago, deleted through the real server, is dated now in the Trash.
+It fails without the fix.
+
+---
+
+## ERR-083 - The app's own server could freeze on a protected folder (Controlled folder access)
+
+**Version:** every version up to 1.10.83 · fixed in 1.10.84
+**Found by:** review of the tray menu's "Make a backup now" (2026-11-05), after ERR-082
+
+**Symptom** (expected, not yet reported) - with Windows Security's "Controlled
+folder access" on, Control Panel -> Open backups folder (it makes
+`Documents\FreeGSTBill Backups`), or an extra backup folder chosen inside
+Documents / Desktop, could make the whole app stop answering; extra backups
+could stop for good without an error.
+
+**Cause** - the same as ERR-082, in server.js: 11 `fs.mkdirSync(dir, { recursive:
+true })` and 2 `fs.promises.mkdir(dir, { recursive: true })`. A refused
+recursive mkdir never returns; the sync one blocks Node's only thread (every
+request waits), the async one never settles (`extraCopyRunning` stays true).
+
+**Rule** - server code makes folders with `makeDir` / `makeDirAsync`
+(src/utils/makeDir.js: one level at a time, a refusal is a fast error). Never a
+recursive mkdir. A new file the server imports goes into the copy list in
+`scripts/build-release-zip.mjs` (its import check stopped the first build
+without makeDir.js, before anything shipped).
+
+**Guard** - `scripts/makedir-test.mjs` (in `npm run test:unit`): fails if
+server.js contains a recursive mkdir; checks nested, repeated and impossible
+folders (fast error).
+
+---
+
+## ERR-082 - Windows Setup stuck on "Preparing to Install" (Controlled folder access)
+
+**Version:** the v1.10.84 test Setup (never released) · fixed before release
+**Reported by:** the maintainer, trying the test exe on their own PC (2026-11-04)
+
+**Symptom** - the Setup window shows "Preparing to Install - Setup is preparing
+to install Free GST Billing on your computer." with an empty page and only
+Cancel (greyed out), for ever. Windows Security logged event 1123: node.exe
+"has been blocked from modifying %userprofile%\Documents by Controlled Folder
+Access".
+
+**Cause** - Windows Security's ransomware protection ("Controlled folder
+access") was on. It refuses unknown programs any write in Documents, Desktop,
+Pictures... The Setup's helper made the backup folder with
+`fs.mkdirSync(dir, { recursive: true })`, and Node's recursive mkdir on Windows
+LOOPS FOR EVER when the write is refused this way (a plain mkdir fails at once
+with ENOENT). The default books folder was also in Documents, so even a
+finished install could not have saved an invoice.
+
+**Rule** - never `mkdirSync({ recursive: true })` in code that may write in a
+user folder on Windows: make folders one level at a time (`makeDirs` in
+installer/setup-helper.mjs). Check that the app's own node.exe can write
+before anything is stopped or copied (`writable`). Default data folders go
+outside Documents/Desktop: `C:\Users\<name>\Free GST Billing`. A Desktop icon
+Windows refuses is skipped with a message, not an error.
+
+**Guard** - `scripts/installer-test.mjs`: makeDirs on a folder that cannot be
+made fails within 2 s with "Controlled folder access" in the message;
+checkWritable cleans up after itself. Checked by hand on the maintainer's PC
+(protection on): the bundled node.exe gets the clear error in 0.3 s for
+Documents and passes for the user folder.
+
+---
+
+## ERR-081 - The copy label ("ORIGINAL FOR RECIPIENT") covered the e-invoice QR code
+
+**Version:** since v1.10.83 (e-invoicing) · fixed in v1.10.84
+**Reported by:** Bir Pandey, by email "pdf rectification" (2026-11-04)
+
+**Symptom** - an e-invoice with Multi-copy on: the PDF's ORIGINAL / DUPLICATE
+label box is printed over the top of the IRN QR code.
+
+**Cause** - the copy label is drawn by jsPDF on the finished page, 4-10 mm
+from the top right. The e-invoice block is the first thing on the page and its
+QR sits in that same corner, about 3 mm from the top.
+
+**Rule** - anything placed in the page's top-right corner must leave the
+label's 4-10 mm band free when Multi-copy is on. The e-invoice block gets that
+room (`copyLabelGap` in InvoicePreview: 12 mm less any top print margin,
+scaled for the PDF text size).
+
+**Guard** - checked in a browser on a test copy: QR top 2.8 mm with labels
+off, 12.2 mm with labels on. No smoke check yet (needs an invoice with an IRN).
+
+---
+
+## ERR-080 - Unticking "Tax % column" turned GST off for the whole invoice
+
+**Version:** since the switch existed · fixed in v1.10.84
+**Reported by:** educationtoallsantosh-rgb / LordVikram, issue #152; Jdevloper275, issue #138 (2026-11-01)
+
+**Symptom** - Customize -> Items table -> untick "Tax % column (GST/VAT/etc.)"
+to hide the GST % column: instead no GST is charged at all, the tax rows go,
+and the choice carries over to new invoices. "Hide all" did the same, and
+also removed the round-off line, changing the total.
+
+**Cause** - the switch is `showGST`, which is the invoice's "charge GST" flag,
+not a display option. Its label described a column. "Hide all" listed it (and
+`showRoundOff`) among the display options it switches off.
+
+**Rule** - a switch that changes the money (GST charged, round-off) is never
+labelled or grouped as a display option, and "Hide all" only touches display
+options. `showGST` is now "Charge GST on this invoice" in its own group (Tax);
+hiding the per-line tax columns is `showTaxColumns`.
+
+**Guard** - `tests/smoke.mjs` "#152": unticking "Tax % columns" removes the %
+columns while the totals (CGST) stay identical; the GST switch carries the new
+name.
+
+---
+
+## ERR-079 - With the preview hidden, Save / Download / Print opened it and closed it again
+
+**Version:** since v1.10.26 · fixed in v1.10.84
+**Reported by:** sangwanmail-eng, issue #161 (2026-11-03)
+
+**Symptom** - Live Preview hidden; Save & Download (or Print) makes the
+preview pop open for a moment and close again.
+
+**Cause** - v1.10.26 un-hid the preview for every capture
+(`withPreviewOnScreen`), for a thermal `window.print()` path that no longer
+exists (thermal printing builds its own iframe since v1.10.42). The hidden pane
+is also `opacity: 0`, so html2canvas would capture a blank page without it.
+
+**Rule** - never change the visible layout to take a picture of it. Fix the
+picture's copy instead: `showHiddenPaneInClone` puts the pane back on-screen and
+opaque inside html2canvas's cloned document only.
+
+**Guard** - `tests/smoke.mjs` "#161": with the preview hidden, Save & Download
+never removes `split-view-focus`, and the PDF is still full size (styled).
+
+---
+
+## ERR-078 - Enter after an item put the cursor in HSN, not the next Item box
+
+**Version:** broke in v1.10.83 · fixed in v1.10.84
+**Reported by:** fulbandhemanish-droid, issue #151 (2026-11-01)
+
+**Symptom** - New Invoice: type an item, press Enter. A new row is added, but
+the cursor lands in its HSN box, so the next item cannot just be typed.
+
+**Cause** - v1.10.83 made the Item box a growing `textarea`. The code that
+focuses the new row (`addItem`) and the "click to complete" draft badge still
+looked for the row's first `input.form-input`, which is now HSN.
+
+**Rule** - find the Item box by its class, `.line-item-name`, never by tag. Any
+code that moves the cursor into a line item uses that class.
+
+**Guard** - `tests/smoke.mjs` "ERR-078": Enter on the last row adds a row and
+the cursor is in its Item box (120/120 passed on a test copy).
+
+---
+
+## ERR-077 - GSTR-1 said "Invalid client GSTIN format" for a correct GSTIN
+
+**Version:** every version with the GSTR-1 checks · fixed in v1.10.84
+**Reported by:** tomsingh0049-svg, issue #141 (2026-10-31)
+
+**Symptom** - GST Returns → GSTR-1: "Invoice 11: Invalid client GSTIN format —
+21GLZPP9877E1Z3". The number shown is a valid GSTIN (its check character is right).
+
+**Cause** - the check tests the saved text exactly. A GSTIN pasted with a space
+or an invisible character (copied from a web page, WhatsApp or Excel), or saved
+in small letters by an import, looks the same on screen but fails it, and would
+have gone into the JSON like that. Also, the check wanted a digit as the 13th
+character; after a PAN's ninth registration in a state it is a letter.
+
+**Rule** - GST Returns cleans every client GSTIN as it loads the invoices
+(`cleanGstin` in `src/utils/gstr1Json.js`: capitals, only 0-9 A-Z, when that
+leaves 15 characters), so the checks, tables, CSV and JSON all use the clean
+value. One format test (`gstinFormatOk`), with a letter or digit as the 13th
+character; `taxIdRegex` for India allows the same.
+
+**Guard** - `scripts/gstr1-json-test.mjs` (#141 section). Checked in the app on a
+test copy: invoices whose GSTIN had a trailing space, or small letters plus a
+zero-width space, show no error; a GSTIN one character short still does.
+
+---
+
+## ERR-076 - Install stopped at "Opening the app in your browser now..."
+
+**Version:** broke in v1.10.83 · fixed in v1.10.84
+**Reported by:** Vijay Darshana, by email (2026-10-31), install in `F:\Apps\Free-GST-Billing`, Windows
+
+**Symptom** - the installer printed "[OK] Install complete!", "Opening the app in
+your browser now..." and "Next time, click the Free GST Billing icon...", then
+nothing more: no "Starting server", no browser. The Desktop icon (run hidden)
+did nothing either. Updating and reinstalling the packages did not help.
+
+**Cause** - v1.10.83's `start-windows.ps1` asked WMI (`Get-CimInstance
+Win32_Process`) whether a server for this folder had started in the last two
+minutes, before it starts one. On some PCs WMI never answers (a stuck or broken
+WMI service, some antivirus), and that call has no time limit, so the script
+waited there for ever. It is the first thing after the last line shown.
+
+**Rule** - nothing on the way to opening the app may wait for WMI. The "already
+starting" check is a file in TEMP holding the id of the server process it
+started, checked with `Get-Process -Id` (no WMI). Where WMI is still needed
+(install.ps1 and uninstall stopping the server, they need the command line),
+it gets `-OperationTimeoutSec 10`.
+
+**Guard** - none automated (WMI cannot be broken on purpose in CI). Checked by
+hand on a test copy: one click starts the server; 3 clicks at once give 1 server;
+a server stopped within 2 minutes of starting is started again by the next
+click (an earlier version of this fix waited instead: the TEMP file alone,
+without the process id, is not enough).
+
+---
+
+## ERR-075 - Opening the app showed the previous version until a refresh
+
+**Version:** every version with the offline cache (since v1.10.2) · fixed in v1.10.84
+**Reported by:** the maintainer (2026-10-31): "when user run app from icon on desktop it should auto refresh itself and load correctly"
+
+**Symptom** - after an update, the window opened on the old version and switched
+to the new one a few seconds later (or only after a manual refresh). Found while
+fixing it: with the app's server stopped, the window was blank or the browser's
+"can't be reached" page instead of "Needs a Quick Start", and once the screen
+showed old saved data with a green "running" dot.
+
+**Cause** - three things:
+1. The service worker kept `index.html` in its precache and answered every page
+   open from it (`navigateFallback`), so the page and its code were the old build.
+2. `boot-guard.js` cleared the offline cache whenever a file failed to load, also
+   when the reason was simply that the server was stopped; nothing loaded after.
+   That failure came from `qr-*.js`, which the page loads at start but which was
+   left out of the precache, and whose cache rule never matched a name with "-".
+3. The heartbeat asked `GET /api/profile`, which the offline API cache answers
+   even when the server is down.
+
+**Rule** - the page is fetched from the app first (NetworkFirst, `app-page`), the
+cached copy only when the server does not answer. Every file the page loads at
+start is precached. Anything that decides "is the server running?" uses a HEAD
+request, which no offline cache answers.
+
+**Guard** - checked in a browser on a test copy: a new build shows on the first
+load with no reload; with the server stopped the app shows "Needs a Quick
+Start"; when the server starts again it carries on by itself. A smoke check for
+it is planned with the 7 Nov guards.
+
+---
+
+## ERR-074 - Products CSV import filled in only the names
+
+**Version:** every version up to v1.10.82 · fixed in v1.10.83 (the #121 import)
+**Reported by:** @ethbroken-svg (#134, 2026-10-30)
+
+**Symptom** - importing a products CSV with the columns Name, HSN/SAC,
+Purchase price, Selling price, GST %, Unit, Stock saved every name, but HSN,
+both prices and GST % stayed empty.
+
+**Cause** - the old import (InventoryView.jsx `handleCSVImport`) knew only the
+exact headings `hsn`, `rate`, `gst%`, `unit`, `stock`, and had no purchase or
+selling price at all. The app's own Products export writes `HSN/SAC`,
+`Purchase price`, `Selling price` and `GST %`, so its own file did not import
+back. Only Name, Unit and Stock matched.
+
+**Rule** - every import reads what the matching export writes, and headings
+are matched loosely (case, spaces, %, / ignored; src/utils/listCsv.js).
+
+**Guard** - scripts/csv-test.mjs "[#134]": the reported file imports with every
+column, and the Products screen's own export headings (read from
+InventoryView.jsx, so a change to them is caught) all import.
+
+---
+
+## ERR-073 - After a refresh the menu showed "GST Billing" for a moment, then the business's logo
+
+**Version:** v1.10.83 before release (the option was new) · fixed the same day
+**Reported by:** the maintainer (2026-10-30), right after trying the option
+
+**Symptom** - with "Show my business name and logo in the app's menu" ticked,
+every refresh first drew the default icon and "GST Billing", then swapped in the
+business's logo and name.
+
+**Cause** - the menu is drawn before the business profile arrives from the
+app's server (`profile` starts as null in src/App.jsx), so the first frame had
+nothing to show but the default.
+
+**Rule** - anything drawn from server data on the first frame needs a value
+for that first frame: here the last shown name and logo, kept in this browser
+(`gst_menuBrand`), replaced by the profile as soon as it arrives and cleared
+when the option is turned off.
+
+**Guard** - checked in a browser with the profile request held back 3 seconds:
+the menu showed the business name and logo throughout. A smoke check for it is
+planned with the 7 Nov guards.
+
+---
+
+## ERR-072 - The app's Desktop icon showed "Needs a Quick Start" after a restart
+
+**Version:** v1.10.2 to v1.10.82 · fixed in v1.10.83
+**Reported by:** the maintainer (2026-10-30): the icon "should have all things
+like running server" when opened next time.
+
+**Symptom** - after the computer was restarted, a Free GST Billing Software
+icon on the Desktop opened a window saying *Free GST Billing Software Needs a
+Quick Start*, and nothing started.
+
+**Cause** - that icon was not the installer's. It was made by Chrome or Edge
+from the app's own "Install as Desktop App" banner (src/App.jsx,
+`beforeinstallprompt`). A browser app icon only opens a browser window on the
+saved address; it cannot start the app's server, so the page came from the
+offline cache with no server behind it. The ZIP install's own icon opened the
+launcher, which then needed *Open App*, so the browser icon looked like the
+easier one.
+
+**Rule** - the only icon the app offers is the installer's: Windows
+`app-shortcut.ps1` (`New-AppShortcut`, which runs start-windows.ps1
+-AppWindow -Hidden; install.ps1 has a copy), Mac `Free GST Billing.app`, Linux
+`free-gst-billing.desktop`. Never offer the browser's install prompt again.
+
+**Automated (30 Oct 2026):** `npm run release:check` fails if `beforeinstallprompt` appears anywhere in src/ ("ERR-072 ...").
+
+**Guard** - start-windows.ps1 `Move-IconsToApp` turns old launcher icons into
+app icons; the "Needs a Quick Start" screen tells anyone with a browser icon
+to use the Free GST Billing icon instead.
+
+---
+
+## ERR-071 - The GST portal refused the GSTR-1 JSON ("Download the latest version of Offline tool")
+
+**Version:** every version up to v1.10.82 · fixed in v1.10.83
+**Reported by:** @abhi783821 (#133, 2026-10-30), August 2026 return
+
+**Symptom** - Returns Dashboard → GSTR-1 → Prepare Offline → Upload: "File
+could not be uploaded! Download the latest version of Offline tool to generate
+the JSON file or ensure to validate your uploaded file against the template
+published at Specification Portal."
+
+**Cause** - from the May 2025 return the portal wants the HSN summary (Table
+12) as two lists, `hsn: { hsn_b2b, hsn_b2c }`; `exportGSTR1JSON`
+(src/components/GSTReturns.jsx) still wrote one list, `hsn: { data }`. The
+file also had full item names as HSN descriptions (the limit is 30), no
+`typ: "OE"` on B2CS rows, empty tables and blank values, and the 2017-18-only
+turnover fields `gt` / `cur_gt`.
+
+**Rule** - the GSTR-1 JSON follows a maintained reference whose files the
+portal accepts: India Compliance (resilient-tech/india-compliance,
+`gst_india/utils/gstr_1/sections/*.py`, `to_gov`). When the portal changes
+a table, check that reference first. B2B = buyers with a GSTIN (SEZ too); B2C
+= no GSTIN, and exports. Blank values are stripped before writing.
+
+**Guard** - scripts/gstr1-json-test.mjs (`npm run test:unit`) and the smoke
+check "v83 #133 GSTR-1 JSON splits the HSN summary".
+
+---
+
+## ERR-070 - CSV import made a second client when the name was mistyped
+
+**Version:** every version up to v1.10.82 · fixed in v1.10.83
+**Reported by:** @surajparshad8 (#132, 2026-10-30)
+
+**Symptom** - importing invoices from a CSV with a wrong firm name for an
+existing client, but that client's correct GSTIN, created a new client with
+the wrong name instead of using the saved one.
+
+**Cause** - `salesCsvToBills` (src/utils/bulkCsv.js) looked saved clients up
+by name only. The GSTIN in the row was copied onto the invoice but never used
+to find the client.
+
+**Rule** - a GSTIN identifies a client; a name does not. Look a client up by
+GSTIN first, then by name. A GSTIN match uses the saved client and its saved
+name. Two new rows with one GSTIN are one client.
+
+**Guard** - scripts/csv-test.mjs, "[#132]" (run by `npm run test:unit`).
+
+---
+
+## ERR-069 - A client abroad, billed in dollars, got a domestic invoice with no LUT
+
+**Version:** every version up to v1.10.82 · fixed in v1.10.83
+**Reported by:** the maintainer, on their own books (2026-10-30)
+
+**Symptom** - "I am trying a foreign client invoice, I don't see where it
+will add the LUT." The invoice was in $, but it asked for a state, charged
+IGST, and showed no LUT box and no "Outside India".
+
+**Cause** - the client form starts with Country = India, so a client abroad
+was saved as Indian ("GTB Pro Cleaning Canada" had country India, another had
+none). Export, LUT and place of supply follow the client's *country*
+(`isExportOrSez`, utils/lut.js); switching the currency to $ by hand changes
+only the currency, so the invoice stayed domestic and nothing said why.
+
+**Rule** - an invoice is an export because of where the client is, never
+because of its currency. When the two disagree (foreign currency, client in
+India, not SEZ) the screen says so and offers *Set the client's country*,
+which jumps to the Country box. Never infer the country from the currency:
+an Indian client can pay in dollars.
+
+**Automated (v1.10.84):** `currencyCountryMismatch` in src/utils/fx.js decides the warning, tested by scripts/fx-test.mjs ("[ERR-069] ...").
+
+**Guard** - checked by hand on the demo (USD + Indian client shows the
+warning; its button focuses Country; Canada turns on the LUT box and
+"Outside India (export)"). The export test itself is covered by
+`scripts/lut-tds-test.mjs`.
+
+---
+
+## ERR-068 - A service (and anything never counted) showed "Out of Stock"
+
+**Version:** every version up to v1.10.82 · fixed in v1.10.83
+**Reported by:** @apfx007 (GitHub issue #121)
+
+**Symptom** - "I added printing service and it shows out of stock." The
+Products list, the Dashboard low-stock strip, the bell and the invoice toast
+all treated it as goods with 0 in stock.
+
+**Cause** - products had no Goods/Service distinction, and a blank Stock box
+saved `stock: 0` (form, bulk edit, CSV import). The screens also disagreed
+about a missing stock: the Dashboard used `p.stock ?? 0` (out of stock), the
+bell `p.stock ?? 999` (fine).
+
+**Rule** - a product with `kind: 'service'` has no stock; a missing/blank stock
+means "not counted", never 0. Every place that shows or alerts on stock goes
+through `trackedStock` / `findLowStock` (src/utils.js); every stock move goes
+through `stockUpdates` (store.js applyStockChanges), which skips services; the
+server drops `stock` from a service on save and skips it in production moves.
+Never read `p.stock` directly for display or alerts.
+
+**Guard** - `scripts/services-test.mjs` (in `npm run test:unit`): invoice save,
+cancel, purchase and stock report skip a service; untracked stock is never low
+or out; the Products/Clients sample files import back with zero errors.
+
+---
+
+## ERR-067 - "Drive C:\ is almost full. It has 0 MB free" on a nearly empty drive
+
+**Version:** v1.10.81 - v1.10.82 installers · fixed in v1.10.83
+**Reported by:** Vijay Darshana, by e-mail (29 Oct 2026), with a photo of the installer
+
+**Symptom** - the Windows installer stopped with "Drive C:\ is almost full. It
+has 0 MB free; the app needs about 400 MB" although C: had plenty of space and
+the Recycle Bin was empty.
+
+**Cause** - `Test-DiskSpace` (ensure-node.ps1) and `Get-FreeMB` (install.ps1)
+read `(Get-PSDrive C).Free`. On some PCs that property is empty; `[int]($null /
+1MB)` is 0, so "cannot tell" became "0 MB free" and the install was refused.
+
+**Rule** - free space comes from `[IO.DriveInfo]::new(root).AvailableFreeSpace`
+first, Get-PSDrive second; an empty or zero reading means "cannot tell" and
+never blocks (a truly full disk still fails later with a clear npm/copy error).
+
+**Automated (30 Oct 2026):** `npm run release:check` fails if a .ps1 uses `Get-PSDrive` without the `AvailableFreeSpace` / `-le 0` handling ("ERR-067 ...").
+
+**Guard** - both functions treat `$null` / 0 as unknown. Workaround for older
+versions: install to another drive (`$env:FREEGSTBILL_DIR = 'D:\Free GST
+Billing'` before the one-line install, or extract the ZIP on D:).
+
+---
+
+## ERR-066 - A server restart filled the Problem log with one entry per request
+
+**Version:** since v1.10.83 (Problem log) · fixed before release
+**Reported by:** the maintainer (pasted 10 Problem log entries from 29 Oct 2026)
+
+**Symptom** - while the server was stopped for a few seconds (a restart to
+load a new build), Settings logged nine "GET /api/... -> no answer, Failed to
+fetch" entries in the same second, plus one "Failed to fetch dynamically
+imported module SettingsView-...js".
+
+**Cause** - a screen loads about ten things at once; every failed request was
+its own problem because the repeat check compared the request path. The
+module error was the same restart: the screen's code file was asked for while
+the server was down, the one automatic reload landed on a server still down,
+and the 30-second loop guard then showed the error panel.
+
+**Rule** - "no answer" (status 0) is ONE problem whichever request hit it
+(`sig()` in src/utils/problemLog.js); real server errors stay separate.
+Restarting the demo or an install while a page is open is expected to log
+"cannot reach the app" once, not to be a bug.
+
+**Guard** - `scripts/errors-test.mjs`: four "no answer" requests make one
+entry; a 500 error is still its own entry.
+
+---
+
+## ERR-065 - After an update the app opened blank (or as the old version) until a second refresh
+
+**Version:** every version with the offline copy (service worker) · fixed in v1.10.83
+**Reported by:** seen on the maintainer's demo after an update (29 Oct 2026)
+
+**Symptom** - after the app files were replaced, the first open showed a blank
+page or the previous version; a second refresh fixed it.
+
+**Cause** - the browser's offline copy served the previous version's page. Its
+main code needs the PDF code file, which is left out of the offline copy to
+keep it small; the update had renamed that file, the server answered the
+missing file with the app's page (HTML), the module failed to load, and none of
+the app's own recovery code had run yet.
+
+**Rule** - (1) the new version's service worker reloads open windows when it
+takes over (public/sw-reload.js, importScripts in vite.config.js); (2)
+public/boot-guard.js, a plain script before the app, clears the offline copy
+once and reloads if the app's code cannot load; (3) the server answers 404 for
+a missing code/style file, never the app page. Data is never in that copy.
+
+**Guard** - tested by hand: an older build with different file names, updated in
+place and opened once, comes up on the new version (29 Oct 2026). The smoke
+suite boots the packaged release with the guard in place.
+
+---
+
+## ERR-064 - HSN rate suggestions filled in pre-September-2025 GST rates
+
+**Version:** since v1.10.22 (stale from 22 Sep 2025) · fixed in v1.10.83
+**Reported by:** docs review (rates checked against the 56th GST Council lists)
+
+**Symptom** - typing HSN 1806 (chocolate) set the line to 18% instead of 5%;
+2202 (soft drinks) to 28% instead of 40%; 8528 (TVs) and 2523 (cement) to 28%
+instead of 18%; 3004 (medicines) to 12% instead of 5%; garments said "< ₹1000".
+
+**Cause** - `src/utils/hsnRates.js` was a hand-written table from the 2017-2024
+rate structure. The GST Council's 56th meeting changed most of those rates from
+22 Sep 2025, and nothing tied the table to that change. Worse, the invoice
+auto-filled the suggestion over 18% / 0%, and codes whose rate depends on price,
+engine size or packing were stored as one rate.
+
+**Rule** - every entry carries the rate in force today, with the date checked
+and the sources in the file header; a code that cannot be verified is removed,
+not guessed. A code with more than one possible rate uses `rates: [...]` and is
+shown, never auto-filled (`autoFillRate()` returns null). Re-check the table
+whenever the GST Council changes rates.
+
+**Guard** - `scripts/hsnrates-test.mjs` in `npm run test:unit`: asserts current
+rates for chocolate, biscuits, water, soft drinks, TVs, cement, tyres,
+medicines, pencils, salons; that garments, footwear, cars, bikes and spectacles
+do not auto-fill; and that no entry suggests 12% or 28%.
+
+---
+
+## ERR-063 - Any screen that threw while rendering left a blank white page
+
+**Version:** since v1.0 · fixed in v1.10.83
+**Reported by:** the maintainer ("make sure it never gives any error in any case")
+
+**Symptom** - a white page with no message. ERR-043 was one case (a refresh
+while editing); any saved record with an unexpected field could do the same,
+and there was no way to report it except a screenshot of nothing.
+
+**Cause** - there was no React error boundary, so one throw while rendering
+unmounted the whole app. Failed API calls and uncaught errors were not
+recorded anywhere a user could find or send.
+
+**Rule** - every screen renders inside an `ErrorBoundary` (App.jsx, keyed by
+screen) and the app inside two more (main.jsx). A problem is logged, redacted
+(`redact()` in `src/utils/errorReport.js`: GSTIN, PAN, phone, email, UPI id,
+IFSC, account numbers, user names in paths) and offered as a pre-filled GitHub
+issue. A damaged data file is skipped AND named in errors.log. Every known
+problem links to a Troubleshooting section.
+
+**Guard** - `scripts/errors-test.mjs` (redaction, issue URL length, known
+patterns, ring buffer) in `npm run test:unit`; `node docs-site/build.mjs` fails
+if a known problem links to a missing Troubleshooting section.
 
 ---
 
@@ -786,6 +1587,8 @@ never checked npm's exit code.
 
 **Rule** - never trust a runtime by its name: check its version against
 `engines` before using it, and treat a failed install step as a failed update.
+
+**Automated (30 Oct 2026):** `npm run release:check` fails if `$MinNodeMajor` and package.json `engines.node` disagree ("ERR-060 ...").
 
 **Guard** - `_system-scripts/ensure-node.ps1` (shared by install, update and
 start) accepts Node.js 18+ only, else fetches the portable Node.js into
@@ -875,6 +1678,8 @@ list index as `doc_num`.
 codes (1 invoices, 5 credit notes, 12 delivery challans); from/to by the
 number's value.
 
+**Automated (v1.10.84):** `docIssueSummary` / `docIssueDetails` in src/utils/gstr1Json.js, tested by scripts/gstr1-json-test.mjs ("[ERR-056] Table 13 ...").
+
 **Guard** - none automated beyond the GSTR-1 checks in the smoke suite.
 
 ---
@@ -936,6 +1741,8 @@ bare code (10) instead of the portal's "10-Bihar".
 
 **Rule** - what the screen shows for a return table is grouped exactly as the
 portal's table is. Places of supply are written "NN-State" (placeOfSupplyLabel).
+
+**Audit, 30 Oct 2026:** the "Table 7 ... 10-Bihar" smoke check named below does not exist; only the unit test runs. The smoke check is planned for 7 Nov.
 
 **Guard** - unit test "Place of supply written the portal way"; smoke/e2e check
 "GSTR-1 Table 7 shows the inter-state sale under 10-Bihar".
@@ -1398,6 +2205,8 @@ defaults.
 
 **Rule** - apply presets first and the user's explicit choices after, so the
 explicit choice wins. Save a setting where the screen that uses it reads it.
+
+**Automated (v1.10.84):** `wizardResult` in src/utils/businessTypes.js, tested by scripts/businesstype-test.mjs ("[ERR-033] ..."), which fails if the preset is applied after the language again.
 
 **Guard** - none automated. By hand: run the wizard with Retail + Hindi + 80mm,
 then open a new invoice.

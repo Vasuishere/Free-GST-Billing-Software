@@ -1,9 +1,11 @@
 import { useState, useEffect, useMemo } from 'react';
 import { Calculator, Landmark, FileText, TrendingUp, Upload, Info, Check, X, ChevronRight, Briefcase, Clock, Download } from 'lucide-react';
-import { getAllBills, getAllExpenses, getAllPurchases, getProfile } from '../store';
+import { getAllBills, getAllExpenses, getAllPurchases, getProfile, getAllDebitNotes } from '../store';
+import { debitNoteTotals } from '../utils/debitNotes';
 import { formatCurrency } from '../utils';
 import { getPrintSettings } from '../utils/printSettings';
 import HelpButton from './HelpButton';
+import PageHeader from './PageHeader';
 
 // v1.10.31 — Parse the user's chosen PDF accent (hex like "#1e40af") into
 // a [r, g, b] tuple for jsPDF's setFillColor / setDrawColor. Falls back to
@@ -38,15 +40,23 @@ import {
   buildITR4FieldMap,
   effectiveDeductionCap,
   CURRENT_FY as ENGINE_FY,
+  TAX_YEARS,
+  yearLabel,
+  filingDueDates,
 } from '../utils/itr.js';
 import { getFinancialYearLabel, belongsToProfile, isCancelledBill, salesSign, localToday, parseLocalDate } from '../utils';
+import { billInInr } from '../utils/fx';
 
 // Business income is counted without GST (GST collected is not income, and GST
 // paid comes back as credit), in rupees only, from real sales: a quote or a
 // challan is not a sale and a credit note reduces sales.
 // TCS on the invoice is collected for the government too, so it is not income.
-const billTurnover = (b) => ((b.currency || 'INR') === 'INR'
-  ? salesSign(b) * ((Number(b.totalAmount) || 0) - (Number(b.totalTaxAmount) || 0) - (Number(b.data?.totals?.tcsAmount) || 0)) : 0);
+// v1.10.83 - an invoice in USD, EUR... counts at the exchange rate saved on it
+// (export income is income); one with no rate cannot be counted.
+const billTurnover = (orig) => {
+  const b = billInInr(orig);
+  return b ? salesSign(b) * ((Number(b.totalAmount) || 0) - (Number(b.totalTaxAmount) || 0) - (Number(b.data?.totals?.tcsAmount) || 0)) : 0;
+};
 const purchaseCost = (p) => (p.taxableAmount != null ? Number(p.taxableAmount) || 0
   : (Number(p.totalAmount) || 0) - (Number(p.totalTax) || 0));
 const expenseCost = (e) => (Number(e.amount) || 0) - (Number(e.gstAmount) || 0);
@@ -57,11 +67,11 @@ import { toast } from './Toast';
 // Calculator can see income figures picked up from the Bank Statement
 // Import tab, for instance, without going through a global store.
 const TABS = [
-  { key: 'calculator', label: 'Regime Calculator', icon: Calculator, help: 'Compare Old vs New (Section 115BAC) — auto-picks the cheaper regime' },
-  { key: 'presumptive', label: 'Presumptive (§44AD/ADA)', icon: Briefcase, help: 'Skip full books — declare 6/8% (business) or 50% (professional) of turnover' },
-  { key: 'advance',    label: 'Advance Tax',       icon: Clock,    help: 'Four installment schedule with §234B/C interest calculation' },
-  { key: 'bank',       label: 'Bank Statement Import', icon: Upload, help: 'Upload SBI / HDFC / ICICI / Axis / Kotak / PNB / Yes Bank CSV — auto-categorises' },
-  { key: 'summary',    label: 'ITR Summary',    icon: FileText, help: 'Consolidated view + ITR-4 Filing Summary PDF' },
+  { key: 'calculator', label: 'Regime Calculator', icon: Calculator, help: 'Compare Old vs New (Section 115BAC) — auto-picks the cheaper regime', doc: 'income-tax#regime-calculator' },
+  { key: 'presumptive', label: 'Presumptive (§44AD/ADA)', icon: Briefcase, help: 'Skip full books — declare 6/8% (business) or 50% (professional) of turnover', doc: 'income-tax#presumptive' },
+  { key: 'advance',    label: 'Advance Tax',       icon: Clock,    help: 'Four installment schedule with §234B/C interest calculation', doc: 'income-tax#advance-tax' },
+  { key: 'bank',       label: 'Bank Statement Import', icon: Upload, help: 'Upload SBI / HDFC / ICICI / Axis / Kotak / PNB / Yes Bank CSV — auto-categorises', doc: 'income-tax#bank-import' },
+  { key: 'summary',    label: 'ITR Summary',    icon: FileText, help: 'Consolidated view + ITR-4 Filing Summary PDF', doc: 'income-tax#itr-summary' },
 ];
 
 // v1.10.53 — These were local constants reading '2024-25' / '2025-26',
@@ -78,13 +88,23 @@ const TABS = [
 // Now derived from the engine, so there is exactly one answer. AY is
 // always the FY that follows.
 const CURRENT_FY = ENGINE_FY;
-const CURRENT_AY = (() => {
-  const start = parseInt(CURRENT_FY.split('-')[0], 10) + 1;
+// The assessment year that follows a financial year (before the 2025 Act).
+const ayOf = (fy) => {
+  const start = parseInt(fy.split('-')[0], 10) + 1;
   return `${start}-${String(start + 1).slice(-2)}`;
-})();
+};
+// v1.10.84 - "31 Aug 2027" for the due dates.
+const dueText = (iso) => parseLocalDate(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
 
 export default function IncomeTax() {
   const [tab, setTab] = useState('calculator');
+  // v1.10.84 - which year the figures are for: tax year 2026-27 (default) or
+  // FY 2025-26 for late and revised returns. Remembered on this PC.
+  const [fy, setFy] = useState(() => {
+    try { const y = localStorage.getItem('gst_itrYear'); return TAX_YEARS.includes(y) ? y : CURRENT_FY; } catch { return CURRENT_FY; }
+  });
+  useEffect(() => { try { localStorage.setItem('gst_itrYear', fy); } catch { /* a per-PC convenience */ } }, [fy]);
+  const ay = ayOf(fy);
   const [bills, setBills] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [purchases, setPurchases] = useState([]);
@@ -133,7 +153,8 @@ export default function IncomeTax() {
       getAllExpenses().catch(() => []),
       getAllPurchases().catch(() => []),
       getProfile().catch(() => ({})),
-    ]).then(([b, e, p, prof]) => {
+      getAllDebitNotes().catch(() => []),
+    ]).then(([b, e, p, prof, dns]) => {
       // v1.10.64 (#55) — income tax is filed per business, so only the active
       // business's invoices may contribute to its figures.
       // v1.10.67 (#66 item 12) — cancelled invoices are not income.
@@ -141,7 +162,12 @@ export default function IncomeTax() {
       // v1.10.66 (#64) — and only its own expenses and purchases. Left
       // unfiltered, one company's costs reduced another company's income.
       setExpenses((e || []).filter(r => belongsToProfile(r, prof)));
-      setPurchases((p || []).filter(r => belongsToProfile(r, prof)));
+      // v1.10.85 (#168) - goods returned to suppliers (debit notes) come off
+      // the trading purchases, in the year of the debit note: each one is
+      // listed here as a minus purchase of its taxable value.
+      const returns = (dns || []).filter(r => belongsToProfile(r, prof) && !r.cancelled)
+        .map(r => ({ id: r.id, date: r.date, taxableAmount: -debitNoteTotals(r).taxable }));
+      setPurchases([...(p || []).filter(r => belongsToProfile(r, prof)), ...returns]);
       setProfile(prof);
     });
   }, []);
@@ -154,7 +180,7 @@ export default function IncomeTax() {
     if (Number(inputs.businessIncome) > 0) return;
     const inFY = (dateStr) => {
       if (!dateStr) return false;
-      return getFinancialYearLabel(parseLocalDate(dateStr)) === CURRENT_FY; // local date, not UTC
+      return getFinancialYearLabel(parseLocalDate(dateStr)) === fy; // local date, not UTC
     };
     const sales = bills.filter(b => inFY(b.invoiceDate)).reduce((s, b) => s + billTurnover(b), 0);
     const cogs  = purchases.filter(p => inFY(p.date)).reduce((s, p) => s + purchaseCost(p), 0);
@@ -165,7 +191,7 @@ export default function IncomeTax() {
     if (estimated > 0) {
       setInputs(prev => ({ ...prev, businessIncome: Math.round(estimated), _autofillHint: true }));
     }
-  }, [bills, purchases, expenses]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bills, purchases, expenses, fy]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-save calculator inputs whenever they change
   useEffect(() => {
@@ -196,7 +222,7 @@ export default function IncomeTax() {
   //
   // MUST be declared BEFORE advanceSchedule below — v1.8.1 had this reversed,
   // causing a TDZ ReferenceError that blanked the whole Income Tax view.
-  const comparison = useMemo(() => compareRegimes(inputs), [inputs]);
+  const comparison = useMemo(() => compareRegimes({ ...inputs, fy }), [inputs, fy]);
 
   // Advance-tax schedule — depends on the total tax under the RECOMMENDED regime.
   // Defensive: if comparison hasn't yielded a valid shape yet (first render
@@ -208,27 +234,27 @@ export default function IncomeTax() {
       recTotal,
       advanceInputs.tdsCredit,
       advanceInputs.payments,
-      advanceInputs.mode
+      advanceInputs.mode,
+      fy
     );
-  }, [comparison, advanceInputs]);
+  }, [comparison, advanceInputs, fy]);
 
   return (
     <div className="dashboard-container">
-      <div className="page-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <div>
-            <h1 className="page-title">Income Tax Helper</h1>
-            <p className="page-subtitle">FY {CURRENT_FY} · AY {CURRENT_AY} — Old vs New Regime, bank-statement import, ITR summary</p>
-          </div>
-          <HelpButton title="Income tax — how to use" doc="income-tax">
-            <ul style={{ paddingLeft: '1.1rem', margin: 0 }}>
-              <li><strong>Regime Calculator</strong>: your income and deductions, old and new regime side by side.</li>
-              <li><strong>Presumptive</strong> (44AD / 44ADA / 44AE), <strong>Advance Tax</strong>, <strong>Bank Statement Import</strong> and the <strong>ITR Summary</strong> PDF.</li>
-              <li>Every figure is an estimate. Have your CA confirm it before filing.</li>
-            </ul>
-          </HelpButton>
-        </div>
-      </div>
+      {/* v1.10.86 - in the top bar; the Year box sits by the title. */}
+      <PageHeader
+        title="Income Tax Helper"
+        help={{ title: 'Income tax — how to use', doc: 'income-tax' }}
+        subtitle={`${yearLabel(fy)}: Old vs New Regime, bank-statement import, ITR summary`}
+        extras={(
+          <label className="page-bar-field">
+            Year
+            <select className="filter-select" value={fy} onChange={(e) => setFy(e.target.value)} aria-label="Which year the figures are for">
+              {TAX_YEARS.map((y) => <option key={y} value={y}>{yearLabel(y)}</option>)}
+            </select>
+          </label>
+        )}
+      />
 
       {/* v1.10.53 — The slab tables in utils/itr.js only go up to the FY
           named by CURRENT_FY. When the real financial year has moved past
@@ -239,7 +265,7 @@ export default function IncomeTax() {
           explanation. Saying it plainly is the honest option — inventing
           slab rates for a year whose Budget has not been implemented here
           would be far worse than admitting the gap. */}
-      {getFinancialYearLabel() !== CURRENT_FY && (
+      {!TAX_YEARS.includes(getFinancialYearLabel()) && (
         <div className="card" style={{
           borderLeft: '4px solid #f59e0b',
           background: 'rgba(245, 158, 11, 0.07)',
@@ -249,10 +275,10 @@ export default function IncomeTax() {
           <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'flex-start' }}>
             <Info size={18} style={{ color: '#b45309', flexShrink: 0, marginTop: 2 }} />
             <div style={{ fontSize: '0.88rem', lineHeight: 1.5 }}>
-              <strong>These figures are for FY {CURRENT_FY}, not the current FY {getFinancialYearLabel()}.</strong>
+              <strong>These figures are for {yearLabel(fy)}, not the current FY {getFinancialYearLabel()}.<HelpButton title="Which year the figures are for" doc="income-tax#which-year" size={16} /></strong>
               <div style={{ marginTop: '0.35rem', color: 'var(--text-muted)' }}>
                 The tax slabs, rebate limits and capital-gains rates built into this
-                app go up to FY {CURRENT_FY}. Rates for FY {getFinancialYearLabel()} are
+                app go up to {yearLabel(TAX_YEARS[0])}. Rates for FY {getFinancialYearLabel()} are
                 not included yet, so nothing here is calculated against them.
                 Invoices dated in FY {getFinancialYearLabel()} are also excluded from the
                 business-income figure below — enter that income manually, and
@@ -266,7 +292,7 @@ export default function IncomeTax() {
 
       {/* Sub-tab strip */}
       <div className="glass-panel" style={{ padding: '0.5rem', marginBottom: '1rem' }}>
-        <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
           {TABS.map(t => (
             <button key={t.key}
               className={`btn ${tab === t.key ? 'btn-primary' : 'btn-secondary'}`}
@@ -275,6 +301,10 @@ export default function IncomeTax() {
               title={t.help}>
               <t.icon size={15} /> {t.label}
             </button>
+          ))}
+          {/* The ? opens the guide at the tab on screen. */}
+          {TABS.filter(t => t.key === tab).map(t => (
+            <HelpButton key={t.key} title={t.label} doc={t.doc} size={16} style={{ alignSelf: 'center' }} />
           ))}
         </div>
       </div>
@@ -363,8 +393,8 @@ export default function IncomeTax() {
           inputs={inputs}
           presumptive={presumptive}
           advanceSchedule={advanceSchedule}
-          fy={CURRENT_FY}
-          ay={CURRENT_AY}
+          fy={fy}
+          ay={ay}
         />
       )}
     </div>
@@ -378,9 +408,9 @@ function PresumptiveTab({ presumptiveInputs, setPresumptiveInputs, presumptive, 
   const set = (patch) => setPresumptiveInputs(prev => ({ ...prev, ...patch }));
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(320px, 100%), 1fr))', gap: '1rem' }}>
       <div className="glass-panel p-4">
-        <h3 className="section-title" style={{ marginTop: 0 }}>Section</h3>
+        <h3 className="section-title" style={{ marginTop: 0 }}>Section<HelpButton title="Section: 44AD, 44ADA or 44AE" doc="income-tax#presumptive-sections" size={16} /></h3>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '0.5rem', marginBottom: '1rem' }}>
           {[
             { key: '44AD',  label: '§44AD',  hint: 'Trading / Retail / Manufacturing' },
@@ -426,7 +456,7 @@ function PresumptiveTab({ presumptiveInputs, setPresumptiveInputs, presumptive, 
       <div>
         {presumptive && (
           <div className="glass-panel p-4" style={{ marginBottom: '1rem' }}>
-            <h3 className="section-title" style={{ marginTop: 0 }}>Presumptive computation</h3>
+            <h3 className="section-title" style={{ marginTop: 0 }}>Presumptive computation<HelpButton title="Presumptive computation" doc="income-tax#presumptive-computation" size={16} /></h3>
             {presumptiveInputs.section !== '44AE' && (
               <>
                 <Row label="Turnover / gross receipts" value={presumptive.turnover} />
@@ -459,7 +489,7 @@ function PresumptiveTab({ presumptiveInputs, setPresumptiveInputs, presumptive, 
           <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start' }}>
             <Info size={16} style={{ flexShrink: 0, marginTop: 2, color: 'var(--primary)' }} />
             <div>
-              <strong>Why presumptive taxation?</strong>
+              <strong>Why presumptive taxation?<HelpButton title="Why presumptive taxation?" doc="income-tax#why-presumptive" size={16} /></strong>
               <ul style={{ margin: '0.25rem 0 0', paddingLeft: '1.2rem', lineHeight: 1.6 }}>
                 <li>Skip full books of account + audit (§44AB)</li>
                 <li>Skip advance-tax installments — pay 100% by 15 March</li>
@@ -498,7 +528,7 @@ function AdvanceTaxTab({ advanceInputs, setAdvanceInputs, schedule, totalTax, re
     <>
       <div className="glass-panel p-4" style={{ marginBottom: '1rem' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-          <h3 className="section-title" style={{ margin: 0 }}>Advance Tax Schedule</h3>
+          <h3 className="section-title" style={{ margin: 0 }}>Advance Tax Schedule<HelpButton title="Advance Tax Schedule" doc="income-tax#advance-schedule" size={16} /></h3>
           <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
             <label style={{ fontSize: '0.82rem', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
               <input type="checkbox" checked={advanceInputs.mode === 'presumptive'}
@@ -561,7 +591,7 @@ function AdvanceTaxTab({ advanceInputs, setAdvanceInputs, schedule, totalTax, re
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginBottom: '1rem' }}>
             <div className="glass-panel p-4">
-              <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Payments made</h4>
+              <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Payments made<HelpButton title="Payments made" doc="income-tax#advance-payments" size={16} /></h4>
               {(advanceInputs.payments || []).length === 0 && <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>No advance-tax payments recorded yet.</p>}
               {(advanceInputs.payments || []).map((p, i) => (
                 <div key={i} style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem', alignItems: 'center' }}>
@@ -579,7 +609,7 @@ function AdvanceTaxTab({ advanceInputs, setAdvanceInputs, schedule, totalTax, re
             </div>
 
             <div className="glass-panel p-4">
-              <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Interest under §234B / §234C</h4>
+              <h4 style={{ marginTop: 0, marginBottom: '0.5rem' }}>Interest under §234B / §234C<HelpButton title="Interest under 234B / 234C" doc="income-tax#interest-234" size={16} /></h4>
               <Row label="§234C — installment shortfall" value={interest234C} muted={!interest234C} />
               <Row label="§234B — post year-end delay (1% per month)" value={interest234B} muted={!interest234B} />
               <Row label="Total interest" value={interest234B + interest234C} bold />
@@ -614,11 +644,11 @@ function RegimeCalculatorTab({ inputs, setInputs, comparison, onReset }) {
   }));
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(320px, 100%), 1fr))', gap: '1rem' }}>
       {/* Left column: inputs */}
       <div className="glass-panel p-4">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-          <h3 className="section-title" style={{ margin: 0 }}>Your income</h3>
+          <h3 className="section-title" style={{ margin: 0 }}>Your income<HelpButton title="Your income" doc="income-tax#your-income" size={16} /></h3>
           <button className="btn btn-secondary" style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }} onClick={onReset}>
             <X size={14} /> Reset
           </button>
@@ -650,11 +680,11 @@ function RegimeCalculatorTab({ inputs, setInputs, comparison, onReset }) {
         <NumberInput label="House Property (rent received)" hint="Rent received less municipal tax and the 30% standard deduction. Enter home-loan interest separately under §24b below." value={inputs.housePropertyIncome} onChange={v => set({ housePropertyIncome: v })} />
         <NumberInput label="Other Sources (bank interest, dividends, etc.)" hint="Includes savings-account interest; 80TTA claims that separately." value={inputs.otherSources} onChange={v => set({ otherSources: v })} />
 
-        <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)' }}>Capital gains (special rates)</h4>
+        <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)' }}>Capital gains (special rates)<HelpButton title="Capital gains (special rates)" doc="income-tax#capital-gains" size={16} /></h4>
         <NumberInput label="STCG on listed equity (§111A)" hint="Taxed flat at 20%. Excludes debt / property STCG (those go into slab)." value={inputs.stcgAtSpecialRate} onChange={v => set({ stcgAtSpecialRate: v })} />
         <NumberInput label="LTCG on listed equity (§112A)" hint="First ₹1.25 lakh exempt; the rest taxed flat at 12.5%." value={inputs.ltcgAtSpecialRate} onChange={v => set({ ltcgAtSpecialRate: v })} />
 
-        <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)' }}>Deductions (Old Regime only)</h4>
+        <h4 style={{ marginTop: '1rem', marginBottom: '0.5rem', fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-muted)' }}>Deductions (Old Regime only)<HelpButton title="Deductions (Old Regime only)" doc="income-tax#deductions" size={16} /></h4>
         <p style={{ fontSize: '0.72rem', color: 'var(--text-muted)', marginTop: 0, marginBottom: '0.5rem' }}>
           Under New Regime (default from FY 2023-24), only Section 80CCD(2) — employer NPS contribution — is allowed.
           These deductions ONLY reduce your Old-Regime tax.
@@ -674,6 +704,7 @@ function RegimeCalculatorTab({ inputs, setInputs, comparison, onReset }) {
         <div className="glass-panel p-4" style={{ marginBottom: '1rem' }}>
           <h3 className="section-title" style={{ marginTop: 0 }}>
             Recommended: <span style={{ color: comparison.recommended === 'new' ? '#059669' : '#8b5cf6', textTransform: 'uppercase' }}>{comparison.recommended} Regime</span>
+            <HelpButton title="Recommended regime" doc="income-tax#recommended" size={16} />
           </h3>
           <p style={{ fontSize: '0.85rem', margin: '0 0 0.75rem 0' }}>
             Saves you <strong>{formatCurrency(comparison.savings)}</strong> compared to the other regime.
@@ -682,7 +713,7 @@ function RegimeCalculatorTab({ inputs, setInputs, comparison, onReset }) {
           </p>
         </div>
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+        <div className="regime-cards" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
           <RegimeCard title="Old Regime" result={comparison.old} highlighted={comparison.recommended === 'old'} color="#8b5cf6" />
           <RegimeCard title="New Regime" result={comparison.new} highlighted={comparison.recommended === 'new'} color="#059669" />
         </div>
@@ -708,7 +739,7 @@ function RegimeCard({ title, result, highlighted, color }) {
       border: highlighted ? `2px solid ${color}` : '1px solid var(--border)',
       background: highlighted ? `${color}15` : undefined,
     }}>
-      <h4 style={{ margin: 0, marginBottom: '0.5rem', color }}>{title}</h4>
+      <h4 style={{ margin: 0, marginBottom: '0.5rem', color }}>{title}<HelpButton title={title} doc="income-tax#old-vs-new" size={16} /></h4>
       <Row label="Gross Total Income" value={result.grossTotalIncome} />
       <Row label="Standard Deduction" value={-result.standardDeduction} muted={!result.standardDeduction} />
       <Row label="Chapter VI-A" value={-result.allowedDeductions} muted={!result.allowedDeductions} />
@@ -828,11 +859,11 @@ function BankImportTab({ bankImport, setBankImport, onCommit }) {
         </div>
 
         <div style={{ marginTop: '1.5rem' }}>
-          <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem' }}>How to get the CSV</h4>
+          <h4 style={{ fontSize: '0.9rem', marginBottom: '0.5rem' }}>How to get the CSV<HelpButton title="How to get the CSV" doc="income-tax#bank-csv" size={16} /></h4>
           <ul style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: 1.7, margin: 0, paddingLeft: '1.2rem' }}>
             <li><strong>Net-banking</strong> → Accounts → Statements → Download as CSV / Excel (save as CSV)</li>
             <li><strong>Mobile app</strong> → Account statement → Share → Export CSV</li>
-            <li>Choose a date range covering the current FY (1 Apr {parseInt(CURRENT_FY.split('-')[0], 10)} onwards)</li>
+            <li>Choose a date range covering the year you are working out (from 1 April)</li>
             <li>Your data is parsed in-browser — nothing is uploaded to a server</li>
           </ul>
         </div>
@@ -844,7 +875,7 @@ function BankImportTab({ bankImport, setBankImport, onCommit }) {
     <>
       <div className="glass-panel p-4" style={{ marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
-          <h3 className="section-title" style={{ margin: 0 }}>{bankImport.bankName} — {bankImport.transactions.length} transactions</h3>
+          <h3 className="section-title" style={{ margin: 0 }}>{bankImport.bankName} — {bankImport.transactions.length} transactions<HelpButton title="Reviewing the transactions" doc="income-tax#bank-review" size={16} /></h3>
           <p style={{ margin: 0, fontSize: '0.82rem', color: 'var(--text-muted)' }}>
             Review each row's category. Auto-categorised — override any you disagree with.
           </p>
@@ -869,7 +900,7 @@ function BankImportTab({ bankImport, setBankImport, onCommit }) {
       </div>
 
       {/* Transactions grid */}
-      <div className="glass-panel" style={{ overflow: 'auto', maxHeight: '60vh' }}>
+      <div className="glass-panel" style={{ overflow: 'auto', maxHeight: 'calc(60vh / var(--ui-zoom, 1))' }}>
         <table className="data-table" style={{ minWidth: '900px' }}>
           <thead>
             <tr>
@@ -925,7 +956,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
       doc.text('ITR-4 (Sugam) Filing Summary', 105, y, { align: 'center' });
       y += 6;
       doc.setFontSize(9); doc.setFont('helvetica', 'normal');
-      doc.text(`FY ${fy} · AY ${ay} · Regime: ${comparison.recommended.toUpperCase()} · Generated ${new Date().toLocaleDateString('en-IN')}`, 105, y, { align: 'center' });
+      doc.text(`${yearLabel(fy)} · Regime: ${comparison.recommended.toUpperCase()} · Generated ${new Date().toLocaleDateString('en-IN')}`, 105, y, { align: 'center' });
       y += 6;
 
       // Assessee block
@@ -1018,7 +1049,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
 
   return (
     <>
-      <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)', marginBottom: '1rem' }}>
+      <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(200px, 100%), 1fr))', marginBottom: '1rem' }}>
         <div className="stat-card">
           <div className="stat-icon stat-icon-blue"><TrendingUp size={22} /></div>
           <div><p className="stat-label">Sales excl. GST (FY {fy})</p><h2 className="stat-value">{formatCurrency(sales)}</h2></div>
@@ -1039,7 +1070,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
         <div className="glass-panel p-4">
-          <h3 className="section-title">Income breakdown</h3>
+          <h3 className="section-title">Income breakdown<HelpButton title="Income breakdown" doc="income-tax#income-breakdown" size={16} /></h3>
           <Row label="Sales / Turnover" value={sales} />
           <Row label="Less: Trading purchases" value={-trading} />
           <Row label="Less: Business expenses" value={-businessExpenses} />
@@ -1059,7 +1090,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
         </div>
 
         <div className="glass-panel p-4">
-          <h3 className="section-title">Tax snapshot</h3>
+          <h3 className="section-title">Tax snapshot<HelpButton title="Tax snapshot" doc="income-tax#tax-snapshot" size={16} /></h3>
           <p style={{ fontSize: '0.85rem', margin: '0 0 0.5rem 0' }}>
             Recommended regime: <strong style={{ color: comparison.recommended === 'new' ? '#059669' : '#8b5cf6', textTransform: 'uppercase' }}>{comparison.recommended}</strong>
           </p>
@@ -1076,8 +1107,9 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
                 <br /><br />
               </>
             )}
-            Filing due date: <strong>31 July {parseInt(fy.split('-')[1], 10) + 2000}</strong> (non-audit) ·
-            <strong> 31 October {parseInt(fy.split('-')[1], 10) + 2000}</strong> (audit / §44AB).
+            Filing due date: <strong>{dueText(filingDueDates(fy).business)}</strong> (business, no audit) ·
+            <strong> {dueText(filingDueDates(fy).salary)}</strong> (salary only, ITR-1/2) ·
+            <strong> {dueText(filingDueDates(fy).audit)}</strong> (audit).
             Advance tax installments: 15 Jun · 15 Sep · 15 Dec · 15 Mar.
           </div>
         </div>
@@ -1086,7 +1118,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
       <div className="glass-panel p-4" style={{ marginTop: '1rem', background: 'linear-gradient(135deg, rgba(30,64,175,0.05) 0%, rgba(5,150,105,0.05) 100%)', border: '1px solid var(--primary)' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
           <div>
-            <h3 className="section-title" style={{ margin: 0, color: 'var(--primary)' }}>ITR-4 (Sugam) Filing Summary PDF</h3>
+            <h3 className="section-title" style={{ margin: 0, color: 'var(--primary)' }}>ITR-4 (Sugam) Filing Summary PDF<HelpButton title="ITR-4 (Sugam) Filing Summary PDF" doc="income-tax#itr4-pdf" size={16} /></h3>
             <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: '0.25rem 0 0' }}>
               One PDF with every ITR-4 field pre-computed. Copy each value into the corresponding box on incometax.gov.in — or hand the PDF to your CA.
             </p>
@@ -1098,7 +1130,7 @@ function SummaryTab({ bills, expenses, purchases, profile, comparison, inputs, p
       </div>
 
       <div className="glass-panel p-4" style={{ marginTop: '1rem' }}>
-        <h3 className="section-title">Not included yet</h3>
+        <h3 className="section-title">Not included yet<HelpButton title="Not included yet" doc="income-tax#not-included" size={16} /></h3>
         <ul style={{ fontSize: '0.82rem', color: 'var(--text-muted)', margin: 0, paddingLeft: '1.2rem', lineHeight: 1.7 }}>
           <li><strong>Form 16 upload + parse</strong> — auto-extract salary + TDS + exemptions</li>
           <li><strong>Capital Gains module</strong> — Zerodha / Groww / ICICI Direct CSV import</li>

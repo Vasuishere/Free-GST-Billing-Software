@@ -2,12 +2,13 @@
 // milestone card every 120 days). The maintainer asked to be in front of
 // users every day: once a business has made a few invoices, the card shows
 // once a day with the live supporters total. "Not today" hides it until
-// tomorrow, "Hide for 30 days" for a month. Never a popup, never blocks work,
+// tomorrow, "Hide for 7 days" for a week. Never a popup, never blocks work,
 // never printed on an invoice. Per browser (localStorage), which is fine for a
 // reminder: losing it only means one more card.
 import { useState } from 'react';
 import { Heart } from 'lucide-react';
 import useSupporters from './useSupporters';
+import HelpButton from './HelpButton';
 import { shouldShowSupportNudge, localDay, SNOOZE_DAYS } from '../utils/supporters';
 
 const KEY = 'freegstbill_supportNudge';
@@ -26,8 +27,9 @@ const LINES = [
 
 export default function SupportNudge({ invoiceCount, onOpen }) {
   const [state, setState] = useState(read);
-  const tracker = useSupporters();
-  if (!shouldShowSupportNudge(invoiceCount, state)) return null;
+  const visible = shouldShowSupportNudge(invoiceCount, state);
+  const tracker = useSupporters(visible);
+  if (!visible) return null;
   const save = (v) => { write(v); setState(v); };
   const hideToday = () => save({ ...state, hiddenOn: localDay() });
   const now = new Date();
@@ -38,7 +40,7 @@ export default function SupportNudge({ invoiceCount, onOpen }) {
       style={{ padding: '0.9rem 1.25rem', marginBottom: '1.25rem', display: 'flex', gap: '0.9rem', alignItems: 'center', flexWrap: 'wrap' }}>
       <Heart size={22} style={{ color: '#e11d48', flexShrink: 0 }} />
       <div style={{ flex: '1 1 300px', minWidth: 0 }}>
-        <div style={{ fontWeight: 700 }}>{invoiceCount} invoices made with Free GST Billing</div>
+        <div style={{ fontWeight: 700 }}>{invoiceCount} invoices made with Free GST Billing <HelpButton title="The support card" doc="dashboard#support-card" size={16} /></div>
         <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>{line}</div>
         {tracker && tracker.totalReceived > 0 && (
           <div style={{ fontSize: '0.8rem', marginTop: '0.4rem' }}>
@@ -61,7 +63,7 @@ export default function SupportNudge({ invoiceCount, onOpen }) {
         style={{ fontSize: '0.82rem' }}>Not today</button>
       <button type="button" onClick={() => save({ ...state, snoozedUntil: now.getTime() + SNOOZE_DAYS * 86400000 })}
         style={{ background: 'none', border: 0, color: 'var(--text-muted)', cursor: 'pointer', padding: '0.25rem', fontSize: '0.78rem', textDecoration: 'underline' }}>
-        Hide for 30 days
+        Hide for 7 days
       </button>
     </div>
   );

@@ -3,8 +3,25 @@ import { createRoot } from 'react-dom/client'
 import { registerSW } from 'virtual:pwa-register'
 import App from './App.jsx'
 import AppLockGate from './components/AppLock.jsx'
+import ErrorBoundary from './components/ErrorBoundary.jsx'
+import { toast } from './components/Toast.jsx'
+import { logProblem } from './utils/problemLog'
+import { isChunkLoadError } from './utils/errorReport'
 import { restorePrefs, startMirroring } from './utils/prefsMirror'
+import { applyAppLook } from './utils/appLook'
+// v1.10.83 - Inter from the app's own files, not Google Fonts. Each file holds
+// every alphabet with a unicode-range, so the browser fetches only the parts it
+// needs (Latin; Latin-extended has the ₹ sign).
+import '@fontsource/inter/400.css'
+import '@fontsource/inter/500.css'
+import '@fontsource/inter/600.css'
+import '@fontsource/inter/700.css'
 import './index.css'
+
+// v1.10.83 - the app's code loaded: tell public/boot-guard.js, and let it
+// try again next time something goes wrong.
+window.__fgsbBooted = true;
+try { sessionStorage.removeItem('fgsb-boot-retry'); } catch { /* storage blocked */ }
 
 // v1.10.2 — Deferred SW update. Prior code called `updateSW(true)`
 // inside `onNeedRefresh` which triggers `location.reload()` immediately.
@@ -89,6 +106,11 @@ window.addEventListener('blur', () => {
 //      referencing files the SW's cache doesn't have), auto-reload
 //      once — belt-and-braces after case 1.
 if ('serviceWorker' in navigator) {
+  // v1.10.85 - the very first service worker taking control of a page that
+  // loaded from the network is not an update: that page is already current.
+  // Reloading then (about 3 s after the first open) closed any form already
+  // opened, on every fresh browser and in the smoke test's fresh books.
+  const hadController = !!navigator.serviceWorker.controller;
   navigator.serviceWorker.getRegistration().then(reg => {
     if (!reg) return;
     // Take the waiting SW live if there is one.
@@ -102,7 +124,7 @@ if ('serviceWorker' in navigator) {
     // it ourselves (already-mounted app).
     let alreadyReloaded = false;
     navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (alreadyReloaded) return;
+      if (alreadyReloaded || !hadController) return;
       alreadyReloaded = true;
       window.location.reload();
     });
@@ -131,15 +153,51 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// v1.10.83 - every other uncaught error goes to the Problem log, with a
+// toast that offers Report (Toast adds it for a just-logged problem). The
+// chunk-load case above still reloads instead. Two browser messages are
+// noise, not problems: ResizeObserver's loop notice, and "Script error."
+// from another origin, which carries no details at all.
+const NOISE = /ResizeObserver loop|^Script error\.?$/i;
+const DEV_SERVER = /\/@vite\/client|\/node_modules\/\.vite\//;
+let lastProblemToast = 0;
+const recordUncaught = (message, stack, alreadyLogged = false) => {
+  const msg = String(message || '');
+  // v1.10.86 (#204) - the Vite dev server's live-reload socket (someone running
+  // `npm run dev` in a cloud editor) is not a problem in the app.
+  if (!msg || NOISE.test(msg) || isChunkLoadError(msg) || DEV_SERVER.test(String(stack || ''))) return;
+  // apiFetch logs its own failures (with method, path and status) first.
+  if (!alreadyLogged) logProblem({ kind: 'uncaught', message: msg, stack });
+  if (Date.now() - lastProblemToast > 10_000) {
+    lastProblemToast = Date.now();
+    toast('Something went wrong. Your data is safe.', 'error');
+  }
+};
+window.addEventListener('error', (e) => {
+  try { recordUncaught(e?.error?.message || e?.message, e?.error?.stack); } catch { /* never throw from here */ }
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { recordUncaught(e?.reason?.message || e?.reason, e?.reason?.stack, e?.reason?.problemLogged); } catch { /* never throw from here */ }
+});
+
 // v1.10.77 (#84) - settings the browser has lost come back from the data
 // folder before the first render (the wizard and Region read them on start).
 restorePrefs().then((restored) => {
   startMirroring(restored)
+  // v1.10.86 - App colour, Text size and Compact lists (Settings ->
+  // Appearance), before the first paint so the app never flashes the default.
+  applyAppLook()
   createRoot(document.getElementById('root')).render(
     <StrictMode>
-      <AppLockGate>
-        <App />
-      </AppLockGate>
+      {/* v1.10.83 - two last lines against a white screen: around the
+          PIN gate, and around the app inside it. */}
+      <ErrorBoundary>
+        <AppLockGate>
+          <ErrorBoundary>
+            <App />
+          </ErrorBoundary>
+        </AppLockGate>
+      </ErrorBoundary>
     </StrictMode>,
   )
 })

@@ -1,4 +1,5 @@
 import express from 'express';
+import { installPriceUpdates } from './src/utils/productUpdates.js';
 // v1.10.0 — `cors` package no longer imported. The CORS-lockdown
 // middleware below is intentionally custom + strict (localhost only)
 // where `cors()` echoed `*` for every origin.
@@ -12,10 +13,82 @@ import { fileURLToPath } from 'url';
 // invoice-level discount, and round-off. Previously the recurring auto-fire
 // re-implemented totals inline and silently reintroduced every bug the
 // v1.10.1 extraction fixed. Same source of truth now.
-import { templateTotals, clientYearToDate, nextCounterValue, startFor, numberSeriesFor, counterKeyFor, formatDocNumber, businessKeyOf, getFinancialYearLabel, INVOICE_TYPES } from './src/utils.js';
+// v1.10.83 - same redaction as the browser's Problem log, for errors.log lines.
+import { redact } from './src/utils/errorReport.js';
+import { validateCashEntry, cleanCashEntry } from './src/utils/cashBook.js';
+import { validatePurchasePayments } from './src/utils/purchasePayments.js';
+import { templateTotals, templateItems, clientYearToDate, nextCounterValue, startFor, numberSeriesFor, counterKeyFor, formatDocNumber, businessKeyOf, getFinancialYearLabel, INVOICE_TYPES, withNewActSections } from './src/utils.js';
+import { resolveAppHome } from './src/utils/appHome.js';
+import { makeDir, makeDirAsync } from './src/utils/makeDir.js';
+import { lockProblem, bookedOn, isLockDate } from './src/utils/periodLock.js';
+import { LOCK_NAME, acquireLock, writeLock, releaseLock, portIdentity } from './src/utils/serverLock.js';
+import { SETUP_NAME, allowedDownloadUrl, checkSetupBytes, setupAssetFrom } from './src/utils/setupDownload.js';
+import { updateHintFor, updateDownloadUrlFor, updateStepFromLine } from './src/utils/installKind.js';
+import { STANDARD_TERMS } from './src/utils/termsDefaults.js';
+import { PDF_CLIP_MAX, sanitizePdfName, isPdfBytes, cleanShareTmp, clipboardCommand } from './src/utils/pdfClipboard.js';
+// v1.10.85 - phone / tablet access on the same Wi-Fi (off by default).
+import https from 'https';
+import http from 'http';
+import {
+  DEFAULT_PHONE_PORT, DEVICE_COOKIE, createPhoneGate, createPairing, createTryLimiter, hashToken, newToken, readCookie,
+  deviceCookie, cleanDeviceName, deviceLabel, lanAddresses, isPrivateIp, isLoopbackIp, shortFingerprint, hostAllowed,
+  guidePortFor,
+} from './src/utils/phoneAccess.js';
+import { makeSelfSignedCert, certStillGood } from './src/utils/selfSignedCert.js';
+import { pairPageHtml, pairPageCsp, guidePageHtml, guidePageCsp } from './src/utils/pairPage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, 'data');
+// v1.10.84 - data/, Saved Invoices/ and Trash/ live in APP_HOME: the folder
+// the Windows Setup wrote into home.txt, else this folder (the ZIP layout).
+let APP_HOME;
+try {
+  APP_HOME = resolveAppHome(__dirname);
+} catch (err) {
+  console.error(`\n  ${err.message}\n`);
+  process.exit(1);
+}
+const DATA_DIR = path.join(APP_HOME, 'data');
+// v1.10.84 - a copy installed by the Windows Setup (installer/free-gst-billing.iss
+// writes this file) updates with the new Setup, never with update-windows.ps1.
+// In the Setup's test mode the file also names the test folder.
+const INSTALLED_FILE = path.join(__dirname, 'installed.txt');
+const INSTALLED = fs.existsSync(INSTALLED_FILE);
+const INSTALL_TEST_ROOT = INSTALLED
+  ? ((/^testroot=(.+)$/m.exec(fs.readFileSync(INSTALLED_FILE, 'utf8').replace(/^\uFEFF/, '')) || [])[1] || '').trim()
+  : '';
+
+// v1.10.83 - started by Control Panel -> Restart: wait (up to 15 s) for the
+// old copy to exit so this one gets its port (and, v1.10.84, its lock).
+const afterPid = Number(process.argv[process.argv.indexOf('--after-pid') + 1]) || 0;
+if (process.argv.includes('--after-pid') && afterPid) {
+  for (let i = 0; i < 60; i++) {
+    try { process.kill(afterPid, 0); } catch { break; }
+    await new Promise(r => setTimeout(r, 250));
+  }
+}
+
+// v1.10.84 - one server per books folder (see src/utils/serverLock.js). Taken
+// before anything else runs, so a second server never writes a single file.
+const LOCK_FILE = path.join(DATA_DIR, LOCK_NAME);
+// Random per run: /api/version answers with it, so a lock is "running" only
+// when THIS server answers on its port, not anything else that happens to.
+const LOCK_ID = crypto.randomUUID();
+const LOCK_HOST = os.hostname();
+try { makeDir(DATA_DIR); } catch { /* reported below */ }
+{
+  const lock = await acquireLock(LOCK_FILE, { pid: process.pid, host: LOCK_HOST, id: LOCK_ID, identify: portIdentity });
+  if (!lock.ok) {
+    if (lock.reason === 'other-host') {
+      console.log(`\n  These books are open in Free GST Billing on another computer (${lock.held.host}).`);
+      console.log(`  Close the app there first. If it is not running there, delete ${LOCK_FILE} and open the app again.\n`);
+      process.exit(1);
+    }
+    console.log(`\n  Free GST Billing is already running for these books${lock.held?.port ? ` at http://localhost:${lock.held.port}` : ''} (process ${lock.held?.pid}).`);
+    console.log('  Not starting a second copy: two copies would overwrite each other\'s changes.\n');
+    process.exit(0);
+  }
+  process.on('exit', () => releaseLock(LOCK_FILE, LOCK_ID));
+}
 
 // Port choice — we deliberately default to a high, unusual number rather than
 // the conventional 3001. The 3000-range is heavily used by every other Node /
@@ -27,7 +100,7 @@ const DATA_DIR = path.join(__dirname, 'data');
 // wins over this default — so a single user who genuinely needs 47371 for
 // something else can edit that file and we'll respect it forever.
 const DEFAULT_PORT = 47371;
-const PORT_FILE = path.join(__dirname, 'data', 'port.txt');
+const PORT_FILE = path.join(DATA_DIR, 'port.txt');
 
 // Read the persisted port (if any) — written once on first successful start
 // and every time we get bumped off our preferred port by EADDRINUSE.
@@ -42,6 +115,19 @@ const STARTING_PORT = persistedPort || DEFAULT_PORT;
 const MAX_PORT_SCAN = 50; // 47371 → 47420 is enough headroom for any conceivable collision
 
 const app = express();
+const PHONE_HEADLESS = process.env.FGSB_PHONE_ACCESS === '1';
+
+// v1.10.85 - the first check of every request. On the 127.0.0.1 listener it
+// changes nothing; on the phone listener (HTTPS, only while "Use on phone or
+// tablet" is on) a request passes only from the local network, naming this
+// PC, from the app's own page, with a paired device's cookie
+// (src/utils/phoneAccess.js). Its state lives in PHONE ACCESS below.
+app.use(createPhoneGate({
+  isOn: () => !!phone.server,
+  deviceFor: (token) => deviceForToken(token),
+  names: () => phoneHostNames(),
+  headless: PHONE_HEADLESS,
+}));
 
 // v1.10.0 — CORS lockdown. Previously `app.use(cors())` echoed
 // Access-Control-Allow-Origin: *, which meant any site the user visited
@@ -52,7 +138,20 @@ const app = express();
 // Origin pointing at http://localhost:<port>. Everything else is
 // rejected. The Vite dev server proxies /api → us so its origin is
 // also localhost.
+// v1.10.84 (security review) - DNS rebinding guard. A web page can re-point
+// its own domain to 127.0.0.1; the browser then sends its requests here as
+// "same origin" with no Origin header, so the check below lets them through.
+// They still carry Host: evil.example, so only the app's own names are
+// answered. (Phone access, when it comes, checks its own listener's Host.)
+const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
 app.use((req, res, next) => {
+  // The phone listener checked its own Host and Origin in the gate above.
+  if (req.socket.encrypted || LOCAL_HOST_RE.test(String(req.headers.host || ''))) return next();
+  return res.status(403).json({ error: 'This app only answers http://localhost' });
+});
+
+app.use((req, res, next) => {
+  if (req.socket.encrypted) return next(); // same-origin only, checked in the gate
   const origin = req.headers.origin;
   const allow =
     !origin ||
@@ -90,10 +189,24 @@ app.use((req, res, next) => {
 });
 
 // Ensure data directory and sub-directories exist
-const DIRS = ['bills', 'clients', 'vendors', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases'];
-for (const dir of DIRS) {
-  const dirPath = path.join(DATA_DIR, dir);
-  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+const DIRS = ['bills', 'clients', 'vendors', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases', 'productions', 'purchase-orders', 'cash-book', 'debit-notes', 'bank-statements', 'stock-adjustments'];
+// v1.10.83 - a data folder the app may not write to (inside Program Files, a
+// read-only drive, antivirus "controlled folder access") or a full disk used
+// to crash here with a raw stack trace the launcher never showed. Say it in
+// words, then stop: nothing can be saved, so starting would only lose work.
+try {
+  for (const dir of DIRS) {
+    const dirPath = path.join(DATA_DIR, dir);
+    if (!fs.existsSync(dirPath)) makeDir(dirPath);
+  }
+} catch (err) {
+  const why = err.code === 'ENOSPC' ? 'The disk is full. Free some space and open the app again.'
+    : (err.code === 'EACCES' || err.code === 'EPERM') ? 'The app is not allowed to write to its data folder. Move the app folder to Documents (not Program Files), or allow it in your antivirus.'
+      : `The data folder could not be created (${err.code || err.message}).`;
+  console.error(`\n  Free GST Billing cannot start: ${why}\n  Data folder: ${DATA_DIR}\n  Help: https://dicecodes.com/free-gst-software-documentation/troubleshooting.html#${err.code === 'ENOSPC' ? 'disk-full' : 'no-permission'}\n`);
+  try { fs.appendFileSync(path.join(DATA_DIR, 'errors.log'), `[${new Date().toISOString()}] [startup] ${why} ${err.code || ''}\n`, 'utf-8'); } catch { /* the folder is the problem */ }
+  process.exit(1);
+}
 }
 
 // Helper: safe filename from ID (replace slashes, etc.)
@@ -135,6 +248,12 @@ function isPathInside(resolved, root) {
 // EACCES/EPERM strings that hint at server structure). Server-side
 // logs the full detail; client sees a stable code + generic phrase.
 function errRes(res, status, code, err) {
+  // v1.10.83 - a full disk or a refused write is something the user can fix,
+  // so it gets its own wording (the Problem log links it to the fix).
+  if (code === 'server-error' && err) {
+    if (err.code === 'ENOSPC') code = 'disk-full';
+    else if (err.code === 'EACCES' || err.code === 'EPERM') code = 'no-permission';
+  }
   if (err) {
     try {
       const ts = new Date().toISOString();
@@ -150,6 +269,8 @@ function errRes(res, status, code, err) {
     'forbidden': 'Refused',
     'invalid-path': 'Invalid path',
     'payload-too-large': 'Request body too large',
+    'disk-full': 'The disk is full: free some space and try again',
+    'no-permission': 'The app is not allowed to write to its data folder',
   };
   return res.status(status).json({ error: MESSAGES[code] || code, code });
 }
@@ -187,12 +308,34 @@ function readAllFromDir(dir) {
   const results = fs.readdirSync(dirPath)
     .filter(f => f.endsWith('.json'))
     .map(f => {
-      try { return JSON.parse(fs.readFileSync(path.join(dirPath, f), 'utf-8')); }
-      catch { return null; }
+      try {
+        // A file saved by Notepad / PowerShell 5.1 starts with a byte-order
+        // mark, which JSON.parse refuses: it is not damage, so read past it.
+        const v = JSON.parse(fs.readFileSync(path.join(dirPath, f), 'utf-8').replace(/^\uFEFF/, ''));
+        // v1.10.83 - "null", a number or a list is as damaged as a broken file:
+        // the screens expect an object and crashed on anything else.
+        if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+      } catch { /* reported below */ }
+      reportDamagedFile(dir, f);
+      return null;
     })
     .filter(Boolean);
   dirCache[dir] = { at: Date.now(), value: results };
   return results;
+}
+
+// v1.10.83 - one damaged file (power cut mid-save, a disk error, a hand
+// edit) is skipped so everything else still loads - it always was - but now
+// it is named once in errors.log, which the in-app Problem log shows with the
+// fix "restore it from a backup". Once per file per run, not every 5s read.
+const reportedDamaged = new Set();
+function reportDamagedFile(dir, file) {
+  const key = `${dir}/${file}`;
+  if (reportedDamaged.has(key)) return;
+  reportedDamaged.add(key);
+  const msg = `Skipped damaged file data/${key} (not valid JSON) - restore it from a backup`;
+  console.warn(`  ${msg}`);
+  logFatal(msg, 'data');
 }
 
 // Helper: read a single JSON file
@@ -219,6 +362,135 @@ function deleteFile(filePath) {
   const parentDir = path.basename(path.dirname(filePath));
   if (DIRS.includes(parentDir)) invalidateCache(parentDir);
 }
+
+// Recover interrupted product batches and install the save guard before any
+// business routes. A failed rollback must prevent subsequent writes everywhere.
+// v1.10.86 (review of PR #215) - whatever goes wrong here, the app still starts;
+// only "Import product updates" is then unavailable.
+try {
+  installPriceUpdates(app, { DATA_DIR, writeJSON, invalidateCache });
+} catch (err) {
+  console.warn(`[product updates] not available: ${err.message}`);
+  app.post('/api/products/price-update', (req, res) => res.status(503).json({ error: `Import product updates is not available: ${err.message}` }));
+}
+
+// ========================
+// CLOSE THE BOOKS + EDIT HISTORY (v1.10.85)
+// ========================
+// Settings -> Data -> Close the books: nothing dated on or before that day may
+// be added, changed in a way that moves the accounts or the GST returns, or
+// deleted (src/utils/periodLock.js decides what counts; payments, prints and
+// notes stay allowed). Checked here, before every save and delete of a dated
+// record, so no screen can get round it. Every save and delete that goes
+// through is written to data/edit-history/<YYYY-MM>.jsonl: when, what, which
+// number, its date and total before and after.
+const PERIOD_LOCK_KEY = 'periodLock';
+const HISTORY_DIR = path.join(DATA_DIR, 'edit-history');
+const DATED_ROUTE = /^\/api\/(bills|expenses|receipts|purchases|debit-notes|cash-book|stock-adjustments)(?:\/([^/]+))?$/i;
+const TRASH_RESTORE_ROUTE = /^\/api\/trash\/([^/]+)\/restore$/i;
+// The path as Express matches it: any case, %-decoded, no doubled or trailing slash.
+const routePath = (req) => {
+  try { return decodeURIComponent(String(req.path || '')).replace(/\/+/g, '/').replace(/(.)\/$/, '$1'); } catch { return ''; }
+};
+const lockedUpTo = () => {
+  const v = readJSON(path.join(DATA_DIR, 'meta.json'), {})[PERIOD_LOCK_KEY];
+  return isLockDate(v?.upTo) ? v.upTo : '';
+};
+const recordTotal = (kind, r) => {
+  if (!r) return null;
+  if (kind === 'bills') return Number(r.totalAmount ?? r.data?.totals?.total) || 0;
+  if (kind === 'purchases' || kind === 'debit-notes') return Number(r.total ?? r.totalAmount) || null;
+  return Number(r.amount) || 0;
+};
+const recordNumber = (kind, r) => (r ? String(r.invoiceNumber || r.dnNumber || r.receiptNo || r.description || r.name || r.productName || r.id || '').slice(0, 80) : '');
+// The last 8 MB of a month's history at most (one entry is a few hundred bytes).
+const HISTORY_TAIL = 8 * 1024 * 1024;
+const readHistoryTail = (file) => {
+  const size = fs.statSync(file).size;
+  if (size <= HISTORY_TAIL) return fs.readFileSync(file, 'utf8');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(HISTORY_TAIL);
+    fs.readSync(fd, buf, 0, HISTORY_TAIL, size - HISTORY_TAIL);
+    return buf.toString('utf8').replace(/^[^\n]*\n/, ''); // drop the cut first line
+  } finally { fs.closeSync(fd); }
+};
+const writeHistory = (entry) => {
+  try {
+    makeDir(HISTORY_DIR);
+    fs.appendFileSync(path.join(HISTORY_DIR, `${entry.at.slice(0, 7)}.jsonl`), JSON.stringify(entry) + '\n');
+  } catch (err) { console.warn('[history] could not write:', err.message); }
+};
+app.use((req, res, next) => {
+  if (req.method !== 'POST' && req.method !== 'DELETE') return next();
+  const p = routePath(req);
+  const restore = req.method === 'POST' && TRASH_RESTORE_ROUTE.exec(p);
+  const m = restore ? ['', 'bills', restore[1]] : DATED_ROUTE.exec(p);
+  if (!m) return next();
+  const kind = m[1].toLowerCase();
+  if (req.method === 'POST' && m[2] && !restore) return next(); // no such save route
+  const id = req.method === 'DELETE' || restore ? m[2] : String(req.body?.id || ''); // p is decoded already
+  const dir = path.join(DATA_DIR, kind);
+  const onFile = id ? readJSON(path.join(dir, safeFileName(id) + '.json'), null) : null;
+  const before = restore ? null : onFile;
+  const after = req.method === 'DELETE' ? null
+    : restore ? readJSON(path.join(BILL_TRASH_DIR, safeFileName(id) + '.json'), null)
+      : req.body;
+  const upTo = lockedUpTo();
+  const problem = lockProblem(kind, before, after, upTo);
+  // 423 Locked, never 409: a 409 means 'this number is taken' to the screens,
+  // which then try the next number (a back-dated invoice burned 1000 numbers).
+  if (problem) return res.status(423).json({ error: problem, code: 'period-locked', lockedUpTo: upTo });
+  res.on('finish', () => {
+    if (res.statusCode >= 400) return;
+    writeHistory({
+      at: new Date().toISOString(),
+      kind,
+      action: req.method === 'DELETE' ? 'deleted' : restore ? 'restored' : before ? 'changed' : 'added',
+      id: String(id).slice(0, 120),
+      number: recordNumber(kind, after || before),
+      date: bookedOn(kind, after || before),
+      ...(before ? { totalBefore: recordTotal(kind, before), dateBefore: bookedOn(kind, before) } : {}),
+      ...(after ? { total: recordTotal(kind, after) } : {}),
+      from: req.socket.encrypted ? 'phone' : 'pc',
+    });
+  });
+  return next();
+});
+
+// The lock date ({ upTo: 'YYYY-MM-DD' } or { upTo: '' } to open the books).
+app.get('/api/period-lock', (req, res) => res.json({ upTo: lockedUpTo() }));
+app.post('/api/period-lock', (req, res) => {
+  const upTo = String(req.body?.upTo ?? '');
+  if (upTo && !isLockDate(upTo)) return errRes(res, 400, 'bad-request');
+  // With the app's PIN on, closing or opening the books needs it.
+  const appLock = currentLock();
+  if (appLock && !checkPin(res, appLock, req.body?.pin)) return undefined;
+  const meta = readJSON(path.join(DATA_DIR, 'meta.json'), {});
+  if (upTo) meta[PERIOD_LOCK_KEY] = { upTo, at: new Date().toISOString() };
+  else delete meta[PERIOD_LOCK_KEY];
+  writeJSON(path.join(DATA_DIR, 'meta.json'), meta);
+  writeHistory({ at: new Date().toISOString(), kind: 'books', action: upTo ? 'closed' : 'opened', id: '', number: '', date: upTo, from: req.socket.encrypted ? 'phone' : 'pc' });
+  res.json({ ok: true, upTo });
+});
+
+// The latest edits, newest first (?limit=, at most 1000; this month and the
+// months before until enough are found).
+app.get('/api/edit-history', (req, res) => {
+  const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit, 10) || 200));
+  let files = [];
+  try { files = fs.readdirSync(HISTORY_DIR).filter((f) => /^\d{4}-\d{2}\.jsonl$/.test(f)).sort().reverse(); } catch { /* none yet */ }
+  const out = [];
+  for (const f of files) {
+    let lines = [];
+    try { lines = readHistoryTail(path.join(HISTORY_DIR, f)).split('\n').filter(Boolean); } catch { continue; }
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try { out.push(JSON.parse(lines[i])); } catch { /* a torn line */ }
+    }
+    if (out.length >= limit) break;
+  }
+  res.json(out);
+});
 
 // ========================
 // BILLS
@@ -308,8 +580,12 @@ app.delete('/api/bills/:id', (req, res) => {
   }
   try {
     const trashDir = path.join(DATA_DIR, 'trash');
-    if (!fs.existsSync(trashDir)) fs.mkdirSync(trashDir, { recursive: true });
+    if (!fs.existsSync(trashDir)) makeDir(trashDir);
     fs.renameSync(filePath, path.join(trashDir, fname));
+    // ERR-084: a move keeps the file's old date, and the Trash is emptied by
+    // date (30 days, purgeOldTrash) - an invoice last changed 40 days ago was
+    // gone at the next start. Its time in the Trash starts now.
+    try { const now = new Date(); fs.utimesSync(path.join(trashDir, fname), now, now); } catch { /* the date only */ }
     // The list must not serve the moved bill from cache for 5 more seconds.
     invalidateCache('bills');
     res.json({ success: true, trashed: true });
@@ -364,9 +640,23 @@ app.get('/api/clients', (req, res) => {
   res.json(clients);
 });
 
+// v1.10.86 (#214) - a client's opening balance: none, or an amount of 0 or
+// more with an "as on" date (YYYY-MM-DD) and its kind (receivable / advance).
+// Returns the problem, or ''.
+const openingBalanceProblem = (c) => {
+  if (c.openingBalance === undefined || c.openingBalance === '' || c.openingBalance === null) return '';
+  const n = Number(c.openingBalance);
+  if (!Number.isFinite(n) || n < 0 || n > 1e12) return 'Opening balance must be an amount of 0 or more.';
+  if (n > 0 && !/^\d{4}-\d{2}-\d{2}$/.test(String(c.openingBalanceDate || ''))) return 'Opening balance needs its "as on" date.';
+  if (c.openingBalanceType && !['receivable', 'advance'].includes(c.openingBalanceType)) return 'Opening balance must be owed to you or their advance.';
+  return '';
+};
+
 app.post('/api/clients', (req, res) => {
+  const problem = openingBalanceProblem(req.body || {});
+  if (problem) return res.status(400).json({ error: problem });
   const client = normaliseClientRecord({ ...req.body });
-  if (!client.id) client.id = 'cli_' + Date.now();
+  if (!client.id) client.id = 'cli_' + Date.now() + crypto.randomBytes(3).toString('hex');
   // Keep flat fields synced from billingAddress for backward-compatible readers
   if (client.billingAddress) {
     client.address = client.billingAddress.address ?? client.address ?? '';
@@ -541,18 +831,27 @@ app.get('/api/templates', (req, res) => {
     const defaultTpl = {
       id: 'default',
       name: 'Standard Terms',
-      content: '1. Payment is due within 15 days of invoice date unless otherwise agreed in writing.\n2. Interest @ 18% p.a. will be charged on overdue payments beyond the due date.\n3. The scope of work is limited to what is explicitly mentioned in the project proposal/agreement. Any additional requirements will be quoted and billed separately.\n4. All intellectual property and source code will be transferred to the client only upon receipt of full payment.\n5. We shall not be liable for any delays caused by incomplete or late submission of content, credentials, or approvals from the client\'s end.\n6. Any change requests after project approval may attract additional charges and revised timelines.\n7. This invoice is subject to the jurisdiction of courts at the service provider\'s registered location.\n8. E. & O.E.'
+      content: STANDARD_TERMS, // v1.10.86 - src/utils/termsDefaults.js (a business type rewords it)
     };
-    writeJSON(path.join(DATA_DIR, 'templates', 'default.json'), defaultTpl);
+    // v1.10.86 (#217) - a write that fails (folder missing or locked by
+    // OneDrive / antivirus) answered 500 on every Settings visit: the default
+    // terms are still returned, and the next visit tries the write again.
+    try {
+      makeDir(path.join(DATA_DIR, 'templates'));
+      writeJSON(path.join(DATA_DIR, 'templates', 'default.json'), defaultTpl);
+    } catch (err) {
+      console.warn(`[templates] could not save the default terms: ${err.code || err.message}`);
+    }
     templates = [defaultTpl];
   }
-  templates.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  // A name that is not text (a hand-edited or imported file) no longer throws.
+  templates.sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? '')));
   res.json(templates);
 });
 
 app.post('/api/templates', (req, res) => {
   const tpl = req.body;
-  if (!tpl.id) tpl.id = 'tpl_' + Date.now();
+  if (!tpl.id) tpl.id = 'tpl_' + Date.now() + crypto.randomBytes(3).toString('hex');
   const filePath = path.join(DATA_DIR, 'templates', safeFileName(tpl.id) + '.json');
   writeJSON(filePath, tpl);
   res.json({ success: true, id: tpl.id });
@@ -575,7 +874,10 @@ app.get('/api/products', (req, res) => {
 
 app.post('/api/products', (req, res) => {
   const product = req.body;
-  if (!product.id) product.id = 'prod_' + Date.now();
+  if (!product.id) product.id = 'prod_' + Date.now() + crypto.randomBytes(3).toString('hex');
+  // v1.10.83 (#121) - a service has no stock, whoever saves it (a purchase
+  // bill adds quantities to every product on it).
+  if (product.kind === 'service') delete product.stock;
   const filePath = path.join(DATA_DIR, 'products', safeFileName(product.id) + '.json');
   writeJSON(filePath, product);
   res.json({ success: true, id: product.id });
@@ -585,6 +887,91 @@ app.delete('/api/products/:id', (req, res) => {
   const filePath = path.join(DATA_DIR, 'products', safeFileName(req.params.id) + '.json');
   deleteFile(filePath);
   res.json({ success: true });
+});
+
+// ========================
+// PRODUCTION (manufacturing, v1.10.83 #115)
+// ========================
+// A production entry and the stock it moves are saved by ONE request: the
+// app works out entry.stockApplied ({ productId: change }, the same kind of
+// record an invoice keeps), and this applies it with the same arithmetic as
+// applyStockChanges in store.js. Doing it here, synchronously, means no other
+// request can run in between, and if any file write fails every file already
+// written is put back - a production is never half saved.
+const PRODUCTIONS_DIR = path.join(DATA_DIR, 'productions');
+const productFileFor = (id) => path.join(DATA_DIR, 'products', safeFileName(id) + '.json');
+
+// Validates and works out the new products. Throws { status, code } when bad.
+// skipMissing: on delete, a product removed from the catalog since is skipped
+// (there is no stock left to put back on it).
+function stockMoves(changes, skipMissing) {
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) throw { status: 400, code: 'bad-request' };
+  const out = [];
+  for (const [id, change] of Object.entries(changes)) {
+    const file = productFileFor(id);
+    if (!isPathInside(file, path.join(DATA_DIR, 'products'))) throw { status: 400, code: 'invalid-path' };
+    if (typeof change !== 'number' || !Number.isFinite(change)) throw { status: 400, code: 'bad-request' };
+    const product = readJSON(file, null);
+    if (!product) { if (skipMissing) continue; throw { status: 400, code: 'Product not found. Reload the page and try again.' }; }
+    if (product.kind === 'service') continue; // #121 - no stock to move
+    out.push({ file, before: product, after: { ...product, stock: Math.round(((Number(product.stock) || 0) + change) * 1000) / 1000 } });
+  }
+  return out;
+}
+
+// Writes the products, then runs `finish` (save or delete the entry). On any
+// failure the products already written are restored.
+function commitStock(moves, finish) {
+  const done = [];
+  try {
+    for (const m of moves) { writeJSON(m.file, m.after); done.push(m); }
+    finish();
+  } catch (err) {
+    for (const m of done) { try { writeJSON(m.file, m.before); } catch { /* logged below */ } }
+    throw err;
+  }
+}
+
+app.get('/api/productions', (req, res) => {
+  const rows = readAllFromDir('productions');
+  rows.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json(rows);
+});
+
+app.post('/api/productions', (req, res) => {
+  const entry = req.body;
+  if (!entry || typeof entry !== 'object' || typeof entry.id !== 'string' || !entry.id) return errRes(res, 400, 'bad-request');
+  const file = path.join(PRODUCTIONS_DIR, safeFileName(entry.id) + '.json');
+  if (!isPathInside(file, PRODUCTIONS_DIR)) return errRes(res, 400, 'invalid-path');
+  // Never saved twice: a second save would move the stock a second time.
+  // Editing is delete + enter again.
+  if (fs.existsSync(file)) return errRes(res, 409, 'conflict');
+  try {
+    commitStock(stockMoves(entry.stockApplied, false), () => writeJSON(file, entry));
+    invalidateCache('products');
+    res.json({ success: true, id: entry.id });
+  } catch (err) {
+    if (err?.status) return errRes(res, err.status, err.code);
+    errRes(res, 500, 'server-error', err);
+  }
+});
+
+app.delete('/api/productions/:id', (req, res) => {
+  const file = path.join(PRODUCTIONS_DIR, safeFileName(req.params.id) + '.json');
+  if (!isPathInside(file, PRODUCTIONS_DIR)) return errRes(res, 400, 'invalid-path');
+  const entry = readJSON(file, null);
+  if (!entry) return errRes(res, 404, 'not-found');
+  // Exactly the reverse of what this entry recorded it did.
+  const back = {};
+  for (const [id, change] of Object.entries(entry.stockApplied || {})) back[id] = -(Number(change) || 0);
+  try {
+    commitStock(stockMoves(back, true), () => deleteFile(file));
+    invalidateCache('products');
+    res.json({ success: true });
+  } catch (err) {
+    if (err?.status) return errRes(res, err.status, err.code);
+    errRes(res, 500, 'server-error', err);
+  }
 });
 
 // ========================
@@ -598,7 +985,7 @@ app.get('/api/expenses', (req, res) => {
 
 app.post('/api/expenses', (req, res) => {
   const expense = req.body;
-  if (!expense.id) expense.id = 'exp_' + Date.now();
+  if (!expense.id) expense.id = 'exp_' + Date.now() + crypto.randomBytes(3).toString('hex');
   const filePath = path.join(DATA_DIR, 'expenses', safeFileName(expense.id) + '.json');
   writeJSON(filePath, expense);
   res.json({ success: true, id: expense.id });
@@ -621,7 +1008,7 @@ app.get('/api/recurring', (req, res) => {
 
 app.post('/api/recurring', (req, res) => {
   const item = req.body;
-  if (!item.id) item.id = 'rec_' + Date.now();
+  if (!item.id) item.id = 'rec_' + Date.now() + crypto.randomBytes(3).toString('hex');
   const filePath = path.join(DATA_DIR, 'recurring', safeFileName(item.id) + '.json');
   writeJSON(filePath, item);
   res.json({ success: true, id: item.id });
@@ -644,7 +1031,7 @@ app.get('/api/receipts', (req, res) => {
 
 app.post('/api/receipts', (req, res) => {
   const receipt = req.body;
-  if (!receipt.id) receipt.id = 'rcp_' + Date.now();
+  if (!receipt.id) receipt.id = 'rcp_' + Date.now() + crypto.randomBytes(3).toString('hex');
   const filePath = path.join(DATA_DIR, 'receipts', safeFileName(receipt.id) + '.json');
   writeJSON(filePath, receipt);
   res.json({ success: true, id: receipt.id });
@@ -667,7 +1054,12 @@ app.get('/api/purchases', (req, res) => {
 
 app.post('/api/purchases', (req, res) => {
   const purchase = req.body;
-  if (!purchase.id) purchase.id = 'pur_' + Date.now();
+  // v1.10.83 (#123) - payments to the supplier: each more than 0 with a date,
+  // and together not more than the bill (less TDS) by more than a rupee.
+  if (!purchase || typeof purchase !== 'object' || Array.isArray(purchase)) return errRes(res, 400, 'bad-request');
+  const problem = validatePurchasePayments(purchase);
+  if (problem) return res.status(400).json({ error: problem, code: 'bad-request' });
+  if (!purchase.id) purchase.id = 'pur_' + Date.now() + crypto.randomBytes(3).toString('hex');
   const filePath = path.join(DATA_DIR, 'purchases', safeFileName(purchase.id) + '.json');
   writeJSON(filePath, purchase);
   res.json({ success: true, id: purchase.id });
@@ -679,24 +1071,296 @@ app.delete('/api/purchases/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// v1.10.83 (#112) - purchase orders, a folder of their own: GST returns and
+// reports read data/purchases, and an order is not a bill. Never deleted:
+// a PO is cancelled instead, so its number stays accounted for.
+app.get('/api/purchase-orders', (req, res) => {
+  const orders = readAllFromDir('purchase-orders');
+  orders.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.poNumber || '').localeCompare(String(a.poNumber || '')));
+  res.json(orders);
+});
+
+app.post('/api/purchase-orders', (req, res) => {
+  const order = req.body;
+  if (!order || typeof order !== 'object' || Array.isArray(order)) return errRes(res, 400, 'bad-request');
+  if (order.id !== undefined && (typeof order.id !== 'string' || !order.id.trim())) return errRes(res, 400, 'bad-request');
+  if (!order.id) order.id = 'po_' + Date.now() + crypto.randomBytes(3).toString('hex');
+  const dir = path.join(DATA_DIR, 'purchase-orders');
+  const filePath = path.join(dir, safeFileName(order.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  writeJSON(filePath, order);
+  res.json({ success: true, id: order.id });
+});
+
+// v1.10.85 (#168) - debit notes (purchase returns), a folder of their own like
+// purchase orders: GSTR-2B matching and every purchase total read
+// data/purchases, so a return can never be counted as a purchase. Cancelled
+// ones keep their number; Delete removes the file (the page puts the stock
+// back first, as for a purchase bill).
+app.get('/api/debit-notes', (req, res) => {
+  const notes = readAllFromDir('debit-notes');
+  notes.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.dnNumber || '').localeCompare(String(a.dnNumber || '')));
+  res.json(notes);
+});
+
+app.post('/api/debit-notes', (req, res) => {
+  const note = req.body;
+  if (!note || typeof note !== 'object' || Array.isArray(note)) return errRes(res, 400, 'bad-request');
+  if (note.id !== undefined && (typeof note.id !== 'string' || !note.id.trim())) return errRes(res, 400, 'bad-request');
+  if (!Array.isArray(note.items) || !note.items.length) return res.status(400).json({ error: 'A debit note needs at least one returned item', code: 'bad-request' });
+  if (!note.id) note.id = 'dn_' + Date.now() + crypto.randomBytes(3).toString('hex');
+  const dir = path.join(DATA_DIR, 'debit-notes');
+  const filePath = path.join(dir, safeFileName(note.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  writeJSON(filePath, note);
+  res.json({ success: true, id: note.id });
+});
+
+app.delete('/api/debit-notes/:id', (req, res) => {
+  const dir = path.join(DATA_DIR, 'debit-notes');
+  const filePath = path.join(dir, safeFileName(req.params.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  deleteFile(filePath);
+  res.json({ success: true });
+});
+
+// v1.10.85 - stock adjustments: stock damaged, lost, found, used in the shop
+// or an opening correction, one file each (data/stock-adjustments). The page
+// moves the product's stock (and back on delete), as for a debit note; the
+// entry keeps what it moved (stockApplied) for the stock report's earlier dates.
+const ADJ_DIR = path.join(DATA_DIR, 'stock-adjustments');
+app.get('/api/stock-adjustments', (req, res) => {
+  const list = readAllFromDir('stock-adjustments');
+  list.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json(list);
+});
+// Only the known fields are kept, and the stock it moves is worked out here
+// from its product and quantity (never taken from the request). An id already
+// on file is refused: an adjustment is never changed, only deleted.
+const realDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && !Number.isNaN(Date.parse(`${d}T00:00:00Z`))
+  && new Date(`${d}T00:00:00Z`).toISOString().slice(0, 10) === d;
+app.post('/api/stock-adjustments', (req, res) => {
+  const a = req.body;
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return errRes(res, 400, 'bad-request');
+  if (a.id !== undefined && (typeof a.id !== 'string' || !a.id.trim())) return errRes(res, 400, 'bad-request');
+  if (typeof a.productId !== 'string' || !a.productId || !Number.isFinite(a.quantity) || !a.quantity || !realDay(a.date)) {
+    return res.status(400).json({ error: 'A stock adjustment needs a product, a quantity and a date', code: 'bad-request' });
+  }
+  const id = a.id || 'adj_' + Date.now() + crypto.randomBytes(3).toString('hex');
+  const filePath = path.join(ADJ_DIR, safeFileName(id) + '.json');
+  if (!isPathInside(filePath, ADJ_DIR)) return errRes(res, 400, 'invalid-path');
+  if (fs.existsSync(filePath)) return res.status(409).json({ error: 'This stock adjustment is already saved', code: 'exists' });
+  const text = (v, n) => String(v ?? '').slice(0, n);
+  const record = {
+    id, date: a.date, productId: a.productId, productName: text(a.productName, 200), unit: text(a.unit, 20),
+    quantity: a.quantity, reason: text(a.reason, 20), note: text(a.note, 500),
+    stockApplied: { [a.productId]: a.quantity },
+    createdAt: new Date().toISOString(),
+  };
+  writeJSON(filePath, record);
+  res.json({ success: true, id, record });
+});
+// Answers with the record it removed, so the page puts back exactly the stock
+// it moved; one not on file is 404 and nothing is put back.
+app.delete('/api/stock-adjustments/:id', (req, res) => {
+  const filePath = path.join(ADJ_DIR, safeFileName(req.params.id) + '.json');
+  if (!isPathInside(filePath, ADJ_DIR)) return errRes(res, 400, 'invalid-path');
+  const record = readJSON(filePath, null);
+  if (!record) return errRes(res, 404, 'not-found');
+  deleteFile(filePath);
+  res.json({ success: true, record });
+});
+
+// v1.10.83 - the cash book's own entries (cash recorded on invoices, receipts
+// and expenses is read from those, never copied here). Checked with the same
+// rules as the form, and only known fields are stored.
+app.get('/api/cash-book', (req, res) => {
+  const entries = readAllFromDir('cash-book');
+  entries.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  res.json(entries);
+});
+
+app.post('/api/cash-book', (req, res) => {
+  const problem = validateCashEntry(req.body);
+  if (problem) return res.status(400).json({ error: problem, code: 'bad-request' });
+  const entry = cleanCashEntry(req.body);
+  if (!entry.id) entry.id = 'cash_' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+  else entry.updatedAt = new Date().toISOString();
+  const dir = path.join(DATA_DIR, 'cash-book');
+  const filePath = path.join(dir, safeFileName(entry.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  try {
+    writeJSON(filePath, entry);
+    res.json({ success: true, id: entry.id, entry });
+  } catch (err) {
+    errRes(res, 500, 'server-error', err);
+  }
+});
+
+app.delete('/api/cash-book/:id', (req, res) => {
+  const dir = path.join(DATA_DIR, 'cash-book');
+  const filePath = path.join(dir, safeFileName(req.params.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  try {
+    deleteFile(filePath);
+    res.json({ success: true });
+  } catch (err) {
+    errRes(res, 500, 'server-error', err);
+  }
+});
+
+// v1.10.85 (#175) - Bank matching: each imported bank statement, with what
+// each of its lines was matched to, ignored or added as. One file per
+// statement, kept per business (ownerGstin / ownerName, as expenses are).
+// The payments it records go on the invoices and bills themselves.
+const BANK_LINE_STATES = ['open', 'matched', 'ignored', 'expense'];
+const badBankStatement = (st) => {
+  if (!st || typeof st !== 'object' || Array.isArray(st)) return 'Invalid statement';
+  if (st.id !== undefined && (typeof st.id !== 'string' || !st.id.trim())) return 'Invalid statement';
+  if (!Array.isArray(st.lines) || st.lines.length > 2000) return 'A statement needs its lines (2,000 at most; the app saves a longer one in parts)';
+  const bad = st.lines.find((l) => !l || typeof l !== 'object' || !/^\d{4}-\d{2}-\d{2}$/.test(String(l.date || ''))
+    || !(Number(l.credit) >= 0) || !(Number(l.debit) >= 0) || !BANK_LINE_STATES.includes(l.status));
+  return bad ? 'A line of the statement is not valid' : '';
+};
+
+app.get('/api/bank-statements', (req, res) => {
+  const statements = readAllFromDir('bank-statements');
+  statements.sort((a, b) => String(b.importedAt || '').localeCompare(String(a.importedAt || '')));
+  res.json(statements);
+});
+
+app.post('/api/bank-statements', (req, res) => {
+  const statement = req.body;
+  const problem = badBankStatement(statement);
+  if (problem) return res.status(400).json({ error: problem, code: 'bad-request' });
+  if (!statement.id) statement.id = 'bst_' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+  const dir = path.join(DATA_DIR, 'bank-statements');
+  const filePath = path.join(dir, safeFileName(statement.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  try {
+    writeJSON(filePath, statement);
+    res.json({ success: true, id: statement.id });
+  } catch (err) {
+    errRes(res, 500, 'server-error', err);
+  }
+});
+
+app.delete('/api/bank-statements/:id', (req, res) => {
+  const dir = path.join(DATA_DIR, 'bank-statements');
+  const filePath = path.join(dir, safeFileName(req.params.id) + '.json');
+  if (!isPathInside(filePath, dir)) return errRes(res, 400, 'invalid-path');
+  try {
+    deleteFile(filePath);
+    res.json({ success: true });
+  } catch (err) {
+    errRes(res, 500, 'server-error', err);
+  }
+});
+
 // ========================
 // BUSINESS PROFILES (multi-business)
 // ========================
+// v1.10.85 (#125) - a company can be hidden behind its own PIN. The list
+// gives a hidden company as a bare entry (its id, `hidden`, and `isActive`
+// when it is the business open on screen), never its name, details or the
+// PIN's hash; "Open a hidden company" (POST /api/profiles/unlock) answers its
+// details and a key for this server's run, which saving or deleting it then
+// needs. It hides the company from view on a shared PC; the files are not
+// encrypted (the app lock, Settings -> Privacy & Security, guards the app).
+const profilePath = (id) => path.join(DATA_DIR, 'profiles', safeFileName(id) + '.json');
+const publicProfile = (p) => {
+  if (!p || !p.hideLock) return p;
+  const { hideLock: _lock, ...rest } = p;
+  return { ...rest, hidden: true };
+};
+// The business open on screen, by GSTIN first (two branches may share a name).
+const sameBusiness = (a, b) => !!businessKeyOf(a) && businessKeyOf(a) === businessKeyOf(b);
+const hiddenStub = (p, active) => ({ id: p.id, hidden: true, ...(sameBusiness(p, active) ? { isActive: true } : {}) });
+// Wrong hide PINs count on their own (never the lock screen's counter), on
+// the PC and on the network apart.
+const hidePinTries = createTryLimiter();
+const networkHidePinTries = createTryLimiter();
+const hideTriesFor = (req) => (req.socket.encrypted ? networkHidePinTries : hidePinTries);
+// Opened this run: profile id -> keys (in memory; a restart hides again).
+const hiddenKeys = new Map();
+const newHiddenKey = (id) => {
+  const key = crypto.randomBytes(24).toString('hex');
+  hiddenKeys.set(id, new Set([...(hiddenKeys.get(id) || []), key]));
+  return key;
+};
+const hasHiddenKey = (req, id) => {
+  const key = String(req.get('x-hidden-key') || '');
+  return !!key && !!hiddenKeys.get(id)?.has(key);
+};
+// A hidden company changes or goes only with its key.
+const hiddenLocked = (req, id) => {
+  const onFile = readJSON(profilePath(id), null);
+  return !!onFile?.hideLock && !hasHiddenKey(req, id);
+};
+
 app.get('/api/profiles', (req, res) => {
-  const profiles = readAllFromDir('profiles');
+  const active = readJSON(PROFILE_PATH, {});
+  const profiles = readAllFromDir('profiles').map((p) => (p.hideLock ? hiddenStub(p, active) : p));
   profiles.sort((a, b) => (a.businessName || '').localeCompare(b.businessName || ''));
   res.json(profiles);
 });
 
 app.post('/api/profiles', (req, res) => {
-  const prof = req.body;
-  if (!prof.id) prof.id = 'biz_' + Date.now();
-  const filePath = path.join(DATA_DIR, 'profiles', safeFileName(prof.id) + '.json');
-  writeJSON(filePath, prof);
+  // The hide PIN is set only through /api/profiles/:id/hide-pin; a save from
+  // the screen (which never has it) keeps the one on file.
+  const { hideLock: _lock, hidden: _hidden, isActive: _active, ...prof } = req.body || {};
+  if (!prof.id) prof.id = 'biz_' + Date.now() + crypto.randomBytes(3).toString('hex');
+  if (hiddenLocked(req, prof.id)) return res.status(403).json({ error: 'This company is hidden: open it with its PIN first', code: 'hidden-locked' });
+  const filePath = profilePath(prof.id);
+  const kept = readJSON(filePath, null)?.hideLock;
+  writeJSON(filePath, kept ? { ...prof, hideLock: kept } : prof);
   res.json({ success: true, id: prof.id });
 });
 
+// Hide ({ pin }) or show again ({ pin: null }) a company; changing or
+// removing a hide PIN needs the current one. Hiding answers the key, so the
+// window that hid it keeps working in it.
+app.post('/api/profiles/:id/hide-pin', (req, res) => {
+  const filePath = profilePath(req.params.id);
+  const prof = readJSON(filePath, null);
+  if (!prof) return errRes(res, 404, 'not-found');
+  const { pin, currentPin } = req.body || {};
+  if (pin !== null && !PIN_RE.test(String(pin ?? ''))) return errRes(res, 400, 'bad-request');
+  if (prof.hideLock) {
+    const tries = hideTriesFor(req);
+    const wait = tries.wait();
+    if (wait > 0) return res.status(429).json({ ok: false, error: 'Too many wrong tries', code: 'wait', wait });
+    if (!pinMatches(prof.hideLock, currentPin)) return res.status(401).json({ ok: false, error: 'wrong-pin', code: 'wrong-pin', triesLeft: tries.fail() });
+    tries.reset();
+  }
+  const next = { ...prof };
+  if (pin === null) {
+    delete next.hideLock;
+    hiddenKeys.delete(prof.id);
+  } else {
+    const salt = crypto.randomBytes(16).toString('hex');
+    next.hideLock = { salt, hash: pinHash(pin, salt), length: String(pin).length };
+  }
+  writeJSON(filePath, next);
+  return res.json({ ok: true, hidden: pin !== null, ...(pin !== null ? { key: newHiddenKey(prof.id), profile: publicProfile(next) } : {}) });
+});
+
+// "Open a hidden company": the PIN alone, so the list never names the hidden
+// companies; answers those it opens, with their keys. Five wrong tries in a
+// row make the next one wait.
+app.post('/api/profiles/unlock', (req, res) => {
+  const pin = req.body?.pin;
+  const tries = hideTriesFor(req);
+  const wait = tries.wait();
+  if (wait > 0) return res.status(429).json({ ok: false, error: 'Too many wrong tries', code: 'wait', wait });
+  const opened = readAllFromDir('profiles').filter((p) => p.hideLock && pinMatches(p.hideLock, pin));
+  if (!opened.length) return res.status(401).json({ ok: false, error: 'wrong-pin', code: 'wrong-pin', triesLeft: tries.fail() });
+  tries.reset();
+  return res.json({ ok: true, ids: opened.map((p) => p.id), profiles: opened.map((p) => ({ ...publicProfile(p), key: newHiddenKey(p.id) })) });
+});
+
 app.delete('/api/profiles/:id', (req, res) => {
+  if (hiddenLocked(req, req.params.id)) return res.status(403).json({ error: 'This company is hidden: open it with its PIN first', code: 'hidden-locked' });
   const filePath = path.join(DATA_DIR, 'profiles', safeFileName(req.params.id) + '.json');
   deleteFile(filePath);
   res.json({ success: true });
@@ -720,12 +1384,29 @@ app.get('/api/meta/:key', (req, res) => {
 });
 
 app.post('/api/meta/:key', (req, res) => {
-  if (req.params.key === LOCK_KEY) return errRes(res, 403, 'forbidden');
+  // v1.10.85 (review) - the backup folder is set only through /api/backup-folder,
+  // which checks it and is PC-only: through here a paired phone could point the
+  // daily copy of every book at a share of its own.
+  if (req.params.key === LOCK_KEY || req.params.key.toLowerCase() === BACKUP_FOLDER_KEY.toLowerCase()
+    || req.params.key.toLowerCase() === PERIOD_LOCK_KEY.toLowerCase()) return errRes(res, 403, 'forbidden'); // v1.10.85: /api/period-lock only
   if (!req.body || !('value' in req.body)) return errRes(res, 400, 'bad-request');
   const meta = readJSON(META_PATH, {});
   meta[req.params.key] = req.body.value;
   writeJSON(META_PATH, meta);
   res.json({ success: true });
+});
+
+// v1.10.84 (#145) - a hand-typed invoice number ahead of the counter moves
+// the counter up to it (never down), in one synchronous read + write.
+app.post('/api/meta/:key/raise', (req, res) => {
+  // Only number counters: any other meta value (settings) must not become a number.
+  if (!/^counter_/.test(req.params.key)) return errRes(res, 400, 'bad-request');
+  const value = Math.floor(Number(req.body?.value));
+  if (!Number.isFinite(value) || value < 1 || value > 999999999) return errRes(res, 400, 'bad-request');
+  const meta = readJSON(META_PATH, {});
+  const current = Math.max(0, Math.floor(Number(meta[req.params.key]) || 0));
+  if (value > current) { meta[req.params.key] = value; writeJSON(META_PATH, meta); }
+  res.json({ value: Math.max(value, current) });
 });
 
 // Atomic increment for invoice-number counters. Node's I/O is single-threaded
@@ -734,7 +1415,7 @@ app.post('/api/meta/:key', (req, res) => {
 // race-free across concurrent HTTP requests. Closes the
 // "two saves both reading 5, both writing 6" duplicate-invoice-number bug.
 app.post('/api/meta/:key/increment', (req, res) => {
-  if (req.params.key === LOCK_KEY) return errRes(res, 403, 'forbidden');
+  if (!/^counter_/.test(req.params.key)) return errRes(res, 403, 'forbidden');
   const meta = readJSON(META_PATH, {});
   // v1.10.78 (#93) - a tax invoice sends its start ("Start numbering from");
   // see nextCounterValue. Nothing else jumps.
@@ -776,7 +1457,9 @@ app.post(LOCAL_PREFS_ROUTE, express.json({ limit: '25mb' }), (req, res) => {
 // stored. Forgotten PIN: put a file named RESET-PIN (or RESET-PIN.txt) in the
 // app folder; the next check removes the PIN and the file.
 const PIN_RE = /^(\d{6}|\d{8})$/;
-const RESET_PIN_FILES = [path.join(__dirname, '..'), __dirname]
+// v1.10.84 - also the books folder (FGSB_HOME): an installed copy keeps its program
+// files where the user may not write (/opt, Program Files).
+const RESET_PIN_FILES = [...new Set([path.join(__dirname, '..'), __dirname, APP_HOME])]
   .flatMap((dir) => ['RESET-PIN', 'RESET-PIN.txt'].map((n) => path.join(dir, n)));
 const pinHash = (pin, salt) => crypto.scryptSync(String(pin), salt, 32).toString('hex');
 const pinMatches = (lock, pin) => {
@@ -785,8 +1468,13 @@ const pinMatches = (lock, pin) => {
   const b = Buffer.from(lock.hash, 'hex');
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
-// Five wrong PINs in a row -> wait 30 seconds before the next try.
-const pinTries = { wrong: 0, until: 0 };
+// Five wrong PINs in a row -> wait 30 seconds before the next try. One counter
+// for this PC's lock screen and for pairing a phone (v1.10.85).
+const pinTries = createTryLimiter();
+// v1.10.85 (review) - PINs typed on the network (pairing, a phone's lock
+// screen) count on their own, so a phone cannot keep this PC's lock screen
+// waiting.
+const networkPinTries = createTryLimiter();
 const currentLock = () => {
   const meta = readJSON(META_PATH, {});
   const reset = RESET_PIN_FILES.filter((f) => fs.existsSync(f));
@@ -794,6 +1482,8 @@ const currentLock = () => {
     if (meta[LOCK_KEY]) { delete meta[LOCK_KEY]; writeJSON(META_PATH, meta); }
     for (const f of reset) { try { fs.unlinkSync(f); } catch { /* removed already */ } }
     console.log('[lock] RESET-PIN file found: PIN lock removed');
+    // v1.10.85 - no PIN, no phone access (as when the PIN is turned off).
+    if (phoneState.enabled) { savePhoneState({ ...phoneState, enabled: false }); stopPhoneListener(); }
     return null;
   }
   return meta[LOCK_KEY] || null;
@@ -801,18 +1491,39 @@ const currentLock = () => {
 // Checks a PIN; answers the response itself (and returns false) when it is
 // wrong or the user must wait.
 const checkPin = (res, lock, pin) => {
-  const wait = Math.ceil((pinTries.until - Date.now()) / 1000);
-  if (wait > 0) { res.status(429).json({ ok: false, wait }); return false; }
-  if (pinMatches(lock, pin)) { pinTries.wrong = 0; return true; }
-  pinTries.wrong += 1;
-  if (pinTries.wrong >= 5) { pinTries.wrong = 0; pinTries.until = Date.now() + 30000; }
-  res.status(401).json({ ok: false, error: 'wrong-pin' });
+  const tries = res.req?.socket.encrypted ? networkPinTries : pinTries;
+  const wait = tries.wait();
+  if (wait > 0) { res.status(429).json({ ok: false, error: 'Too many wrong tries', code: 'wait', wait }); return false; }
+  if (pinMatches(lock, pin)) { tries.reset(); return true; }
+  const triesLeft = tries.fail();
+  res.status(401).json({ ok: false, error: 'wrong-pin', code: 'wrong-pin', triesLeft });
   return false;
 };
 
 app.get('/api/lock', (req, res) => {
   const lock = currentLock();
-  res.json({ enabled: !!lock, length: lock?.length || 0 });
+  // v1.10.86 - "Forgot PIN?" names the exact folder for the RESET-PIN file, on
+  // this PC only (a paired phone is told to do it on the PC; its requests come
+  // over the encrypted phone connection).
+  const onPc = lock && !req.socket.encrypted;
+  res.json({ enabled: !!lock, length: lock?.length || 0, ...(onPc ? { resetFolder: RESET_PIN_FOLDER, os: process.platform } : {}) });
+});
+// The folder named on the lock screen: the books folder, except on a ZIP copy,
+// where that is the hidden _system folder - there the visible folder above it
+// (also one of RESET_PIN_FILES' folders).
+const RESET_PIN_FOLDER = APP_HOME === __dirname && path.basename(__dirname) === '_system' ? path.dirname(__dirname) : APP_HOME;
+
+// v1.10.86 - "Forgot PIN?" -> Open the folder: the folder where RESET-PIN goes
+// (APP_HOME is one of RESET_PIN_FILES' folders and always writable). It only
+// opens the folder; making the file is still done by the person at this PC.
+// PC-only like every /api/control-panel/ route (phoneAccess.js isPcOnly).
+app.post('/api/control-panel/open-reset-folder', (req, res) => {
+  try {
+    if (isWindows) spawn('explorer.exe', [RESET_PIN_FOLDER], { detached: true }).unref();
+    else if (process.platform === 'darwin') spawn('open', [RESET_PIN_FOLDER], { detached: true }).unref();
+    else spawn('xdg-open', [RESET_PIN_FOLDER], { detached: true }).unref();
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
 });
 
 app.post('/api/lock/verify', (req, res) => {
@@ -835,7 +1546,305 @@ app.post('/api/lock/set', (req, res) => {
     meta[LOCK_KEY] = { salt, hash: pinHash(pin, salt), length: String(pin).length };
   }
   writeJSON(META_PATH, meta);
+  // v1.10.85 - no PIN, no pairing: phone access goes off with the PIN (paired
+  // devices are kept for when both are turned on again).
+  if (pin === null && phoneState.enabled) { savePhoneState({ ...phoneState, enabled: false }); stopPhoneListener(); }
   return res.json({ ok: true, enabled: pin !== null });
+});
+
+// ========================
+// PHONE / TABLET ACCESS (v1.10.85)
+// ========================
+// "Use on phone or tablet" (Settings -> Privacy & Security). Off: nothing
+// listens on the network, exactly as before. On: a second listener, HTTPS
+// with this PC's own certificate, on port 47443 of every network address
+// (src/utils/phoneAccess.js has the checks every request there must pass).
+// Pairing: the PC shows a QR code holding a one-time code (10 minutes), the
+// phone types the app's PIN and gets a long random token as an HttpOnly
+// cookie. Only the token's hash is kept, in data/phone-access/ with the
+// certificate and its private key; that folder is never put in a backup.
+//
+// A server with no screen (the NAS Docker image) sets FGSB_PHONE_ACCESS=1:
+// always on (it is the only way in), the PIN from FGSB_PIN if none is set, and
+// the pairing code for the first device is printed in its log.
+const PHONE_DIR = path.join(DATA_DIR, 'phone-access');
+const PHONE_FILE = path.join(PHONE_DIR, 'settings.json');
+const PHONE_KEY = path.join(PHONE_DIR, 'key.pem');
+const PHONE_CERT = path.join(PHONE_DIR, 'cert.pem');
+// (PHONE_HEADLESS, FGSB_PHONE_ACCESS=1, is read at the top: the gate needs it.)
+const PHONE_PORT = (() => { const n = Number(process.env.FGSB_PHONE_PORT); return Number.isInteger(n) && n >= 1024 && n <= 65535 ? n : DEFAULT_PHONE_PORT; })();
+// The tests listen on 127.0.0.1 only (no firewall question); never set otherwise.
+const PHONE_LISTEN = process.env.FGSB_PHONE_LISTEN === '127.0.0.1' ? '127.0.0.1' : '0.0.0.0';
+const PHONE_EXTRA_HOSTS = String(process.env.FGSB_PHONE_HOSTS || '').split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+const phoneHostNames = () => [os.hostname(), `${os.hostname()}.local`, ...PHONE_EXTRA_HOSTS];
+// v1.10.86 - guide / guidePort / guideSockets: the guide page (see startGuideListener).
+const phone = { server: null, sockets: new Set(), error: '', fingerprint: '', guide: null, guidePort: 0, guideSockets: new Set() };
+const pairing = createPairing();
+
+const readPhoneState = () => {
+  const s = readJSON(PHONE_FILE, null) || {};
+  return { enabled: s.enabled === true, devices: Array.isArray(s.devices) ? s.devices.filter((d) => d && d.id && /^[0-9a-f]{64}$/.test(d.hash)) : [] };
+};
+let phoneState = readPhoneState();
+function savePhoneState(next) {
+  makeDir(PHONE_DIR);
+  writeFileAtomic(PHONE_FILE, JSON.stringify(next, null, 2));
+  phoneState = next;
+}
+function deviceForToken(token) {
+  if (!token) return null;
+  const hash = hashToken(token);
+  const device = phoneState.devices.find((d) => d.hash === hash);
+  if (!device) return null;
+  // Last seen, written at most once a minute per device.
+  if (Date.now() - (device.lastSeen || 0) > 60000) {
+    try { savePhoneState({ ...phoneState, devices: phoneState.devices.map((d) => (d.id === device.id ? { ...d, lastSeen: Date.now() } : d)) }); } catch { /* best effort */ }
+  }
+  return device;
+}
+
+// Made once, renewed only when damaged or near its end: a new certificate is a
+// new fingerprint and one more browser warning on every phone.
+function phoneCertificate() {
+  try {
+    const key = fs.readFileSync(PHONE_KEY, 'utf8');
+    const cert = fs.readFileSync(PHONE_CERT, 'utf8');
+    if (certStillGood(cert, key)) return { key, cert, fingerprint256: new crypto.X509Certificate(cert).fingerprint256 };
+  } catch { /* none yet */ }
+  const isIp = (h) => /^\d+\.\d+\.\d+\.\d+$/.test(h);
+  const made = makeSelfSignedCert({ names: phoneHostNames().filter((h) => !isIp(h)), ips: [...lanAddresses(), ...PHONE_EXTRA_HOSTS.filter(isIp)], commonName: `Free GST Billing on ${os.hostname()}` });
+  makeDir(PHONE_DIR);
+  fs.writeFileSync(PHONE_KEY, made.key, { mode: 0o600 });
+  fs.writeFileSync(PHONE_CERT, made.cert);
+  console.log("[phone] Made this PC's own HTTPS certificate");
+  return made;
+}
+
+function startPhoneListener() {
+  if (phone.server) return;
+  if (!currentLock()) { phone.error = 'Set a PIN first: a phone must type it to pair.'; console.warn(`[phone] ${phone.error}`); return; }
+  let tls;
+  try { tls = phoneCertificate(); } catch (err) { phone.error = `Could not make the HTTPS certificate (${err.code || err.message}).`; logFatal(err, 'phone'); return; }
+  phone.fingerprint = tls.fingerprint256;
+  const server = https.createServer({ key: tls.key, cert: tls.cert, minVersion: 'TLSv1.2' }, app);
+  // v1.10.85 (review) - a device on the Wi-Fi cannot hold sockets open.
+  server.headersTimeout = 20000;
+  server.requestTimeout = 120000;
+  server.maxConnections = 64;
+  // Refused before the TLS handshake: anything not on the local network.
+  server.on('connection', localNetworkOnly(phone.sockets));
+  server.on('error', (err) => {
+    phone.error = err.code === 'EADDRINUSE' || err.code === 'EACCES'
+      ? `Port ${PHONE_PORT} is used by another program, so phones cannot connect. Close that program, then turn this off and on again.`
+      : `Could not open the network connection (${err.code || err.message}).`;
+    console.warn(`[phone] ${phone.error}`);
+    if (phone.server === server) { phone.server = null; stopGuideListener(); }
+  });
+  server.listen(PHONE_PORT, PHONE_LISTEN, () => {
+    phone.error = '';
+    console.log(`  Phone / tablet access is on: ${phoneUrls()[0] || `https://<this-pc-address>:${PHONE_PORT}`}`);
+    announceFirstPairing();
+    if (phone.server === server) startGuideListener();
+  });
+  phone.server = server;
+}
+
+// A connection from outside the local network is cut before anything is read.
+// v1.10.86 - perIp: at most that many open connections from one address.
+function localNetworkOnly(sockets, perIp = Infinity) {
+  return (socket) => {
+    if (!isPrivateIp(socket.remoteAddress) && !isLoopbackIp(socket.remoteAddress)) { socket.destroy(); return; }
+    let same = 0;
+    for (const s of sockets) if (s.remoteAddress === socket.remoteAddress) same += 1;
+    if (same >= perIp) { socket.destroy(); return; }
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  };
+}
+
+// v1.10.86 - the guide page: what the QR code opens first, before the
+// browser's "Your connection is not private" warning (src/utils/pairPage.js
+// guidePageHtml). Plain HTTP on the phone port + 1, open only while the phone
+// listener is. It answers GET / with that one page and nothing else: this
+// listener never reaches the app (no API, no app files, no cookies, no data),
+// with the phone listener's local-network and Host checks. The pairing code
+// rides after # in the QR link, so it is never sent over plain HTTP.
+// Not on a server with no screen (Docker): it publishes the HTTPS port only,
+// and its log links straight there. Windows Firewall allows Node.js as a
+// program (all its ports), so this second port asks nothing new.
+function guidePage(req, res) {
+  // A request with a body, or that is not GET / HEAD, gets its answer and
+  // the connection is closed (nothing here reads a body).
+  const readOnly = req.method === 'GET' || req.method === 'HEAD';
+  if (!readOnly || Number(req.headers['content-length']) > 0 || req.headers['transfer-encoding'] !== undefined) {
+    res.setHeader('Connection', 'close');
+    res.on('finish', () => req.socket.destroySoon());
+  }
+  const send = (status, text, extra = {}) => {
+    res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...extra });
+    res.end(text);
+  };
+  const ip = req.socket.remoteAddress;
+  if (!phone.server || (!isPrivateIp(ip) && !isLoopbackIp(ip))) return send(403, 'Phone access is turned off on the PC.');
+  if (!hostAllowed(req.headers.host, phoneHostNames())) return send(403, 'Open the address shown on the PC.');
+  if (!readOnly) return send(405, 'Not allowed.', { Allow: 'GET, HEAD' });
+  if (String(req.url).split('?')[0] !== '/') return send(404, 'Not found.');
+  // hostAllowed let only an IP address or this PC's name through.
+  const address = String(req.headers.host).trim().replace(/:\d+$/, '');
+  const nonce = crypto.randomBytes(16).toString('base64');
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8', 'Content-Security-Policy': guidePageCsp(nonce), 'Cache-Control': 'no-store',
+    'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+  });
+  return res.end(guidePageHtml({ fingerprint: shortFingerprint(phone.fingerprint), address, pairUrl: `https://${address}:${PHONE_PORT}/pair`, nonce }));
+}
+function startGuideListener() {
+  if (PHONE_HEADLESS || phone.guide) return;
+  // Never a port the app itself may take (its own, or its start-up range).
+  const port = guidePortFor(PHONE_PORT, activeServer?.address()?.port);
+  if (!port) { console.warn(`[phone] No phone guide page: port ${PHONE_PORT + 1} is in the app's own port range. The QR code goes straight to the HTTPS address.`); return; }
+  const server = http.createServer({ connectionsCheckingInterval: 2000, keepAliveTimeout: 2000 }, guidePage);
+  server.headersTimeout = 10000;
+  server.requestTimeout = 15000;
+  server.maxConnections = 32;
+  server.on('connection', localNetworkOnly(phone.guideSockets, 8));
+  // Not fatal: the QR code then goes straight to the HTTPS address.
+  server.on('error', (err) => {
+    console.warn(`[phone] The phone guide page could not open on port ${port} (${err.code || err.message}); the QR code goes straight to the HTTPS address.`);
+    if (phone.guide === server) phone.guide = null;
+  });
+  server.listen(port, PHONE_LISTEN, () => console.log(`  Phone guide page: ${guideUrls()[0] || `http://<this-pc-address>:${port}`}`));
+  phone.guide = server;
+  phone.guidePort = port;
+}
+function stopGuideListener() {
+  const server = phone.guide;
+  if (!server) return;
+  phone.guide = null;
+  server.close();
+  for (const socket of phone.guideSockets) socket.destroy();
+  phone.guideSockets.clear();
+}
+
+// Off means off at once: open connections are cut, not left to finish.
+function stopPhoneListener() {
+  stopGuideListener();
+  const server = phone.server;
+  if (!server) return;
+  phone.server = null;
+  pairing.clear();
+  server.close();
+  for (const socket of phone.sockets) socket.destroy();
+  phone.sockets.clear();
+  console.log('  Phone / tablet access is off.');
+}
+
+// Headless: while no device is paired, the log shows a pairing code, and a
+// fresh one once the last has run out (docker logs free-gst-billing).
+function announceFirstPairing() {
+  if (!PHONE_HEADLESS || !phone.server || phoneState.devices.length || pairing.active()) return;
+  const { code } = pairing.issue();
+  // v1.10.86 (#207) - Docker Desktop on the same PC: 127.0.0.1 works (an IP is always allowed).
+  const where = PHONE_EXTRA_HOSTS[0] || '127.0.0.1';
+  // v1.10.86 - the code after #, as in the QR code: never sent to a server.
+  console.log(`\n  Pair your first phone, tablet or PC: open https://${where}:${PHONE_PORT}/pair#code=${code}`);
+  console.log(`  (or open https://${where}:${PHONE_PORT}/pair and type the code ${code}). It works for 10 minutes; a new one is printed here after that.\n`);
+}
+if (PHONE_HEADLESS) setInterval(announceFirstPairing, 30 * 1000).unref();
+
+// The addresses a phone types. In a container its own addresses mean nothing
+// outside: there, the address a paired device came in by, or FGSB_PHONE_HOSTS.
+const phoneUrls = (req) => {
+  if (!PHONE_HEADLESS) return lanAddresses().map((ip) => `https://${ip}:${PHONE_PORT}`);
+  if (req?.socket.encrypted) return [`https://${req.headers.host}`]; // checked by the gate
+  return PHONE_EXTRA_HOSTS.map((h) => `https://${h}:${PHONE_PORT}`);
+};
+// v1.10.86 - the guide page's address for each of them (none in Docker, or
+// when its port could not open).
+const guideUrlFor = (httpsUrl) => (phone.guide?.listening ? httpsUrl.replace(/^https:/, 'http:').replace(/:\d+$/, `:${phone.guidePort}`) : '');
+const guideUrls = () => (PHONE_HEADLESS ? [] : phoneUrls().map(guideUrlFor).filter(Boolean));
+const phoneStatus = (req) => ({
+  enabled: PHONE_HEADLESS || phoneState.enabled,
+  headless: PHONE_HEADLESS,
+  listening: !!phone.server?.listening,
+  error: phone.error,
+  port: PHONE_PORT,
+  urls: phoneUrls(req),
+  fingerprint: phone.fingerprint,
+  shortFingerprint: shortFingerprint(phone.fingerprint),
+  pinSet: !!currentLock(),
+  devices: phoneState.devices.map(({ id, name, pairedAt, lastSeen }) => ({ id, name, pairedAt, lastSeen, thisDevice: req.device?.id === id })),
+});
+
+app.get('/api/phone-access', (req, res) => res.json(phoneStatus(req)));
+
+// { enabled: true | false }. On needs a PIN; off closes the listener at once.
+app.post('/api/phone-access', (req, res) => {
+  if (PHONE_HEADLESS) return res.status(409).json({ error: 'Set by FGSB_PHONE_ACCESS on this server', code: 'headless' });
+  const enabled = req.body?.enabled === true;
+  if (enabled && !currentLock()) return res.status(409).json({ error: 'Set a PIN first', code: 'pin-needed' });
+  savePhoneState({ ...phoneState, enabled });
+  if (enabled) startPhoneListener(); else stopPhoneListener();
+  // Listening finishes a moment later; the screen asks again for the result.
+  return res.json(phoneStatus(req));
+});
+
+app.post('/api/phone-access/pairing-code', (req, res) => {
+  if (!phone.server) return res.status(409).json({ error: 'Phone access is off', code: 'off' });
+  const { code, expiresAt } = pairing.issue();
+  // v1.10.86 - each address twice: the guide page (what the QR code opens:
+  // it explains the browser's warning first) and the HTTPS pairing page
+  // (shown as the fallback). The code is after #, never in a request.
+  const urls = phoneUrls(req);
+  const guide = PHONE_HEADLESS ? [] : urls.map(guideUrlFor);
+  return res.json({
+    code, expiresAt, shortFingerprint: shortFingerprint(phone.fingerprint),
+    urls: urls.map((u) => `${u}/pair#code=${code}`),
+    guideUrls: guide.map((u) => (u ? `${u}/#code=${code}` : '')),
+  });
+});
+
+app.delete('/api/phone-access/devices/:id', (req, res) => {
+  const devices = phoneState.devices.filter((d) => d.id !== req.params.id);
+  if (devices.length === phoneState.devices.length) return errRes(res, 404, 'not-found');
+  savePhoneState({ ...phoneState, devices });
+  return res.json({ ok: true });
+});
+
+// ---- the phone's side (network listener only) ----
+app.get('/pair', (req, res) => {
+  if (!req.socket.encrypted) return res.redirect('/');
+  const nonce = crypto.randomBytes(16).toString('base64');
+  res.setHeader('Content-Security-Policy', pairPageCsp(nonce));
+  res.setHeader('Cache-Control', 'no-store');
+  return res.type('html').send(pairPageHtml({ fingerprint: shortFingerprint(phone.fingerprint), nonce }));
+});
+
+app.get('/api/pair/info', (req, res) => {
+  if (!req.socket.encrypted) return errRes(res, 404, 'not-found');
+  return res.json({ paired: !!deviceForToken(readCookie(req.headers.cookie, DEVICE_COOKIE)), name: deviceLabel(req.headers['user-agent']), shortFingerprint: shortFingerprint(phone.fingerprint) });
+});
+
+// { code, pin, name }: the one-time code first (no code, no PIN check), then
+// the PIN, on the lock screen's wrong-try counter.
+app.post('/api/pair', (req, res) => {
+  if (!req.socket.encrypted) return errRes(res, 404, 'not-found');
+  const lock = currentLock();
+  if (!lock) return res.status(409).json({ error: 'There is no PIN on the PC, so pairing is turned off.', code: 'pin-needed' });
+  const codeState = pairing.check(req.body?.code);
+  if (codeState !== 'ok') {
+    return res.status(403).json({ code: 'pairing-code', error: codeState === 'expired'
+      ? 'This pairing code has run out (10 minutes). On the PC, show a new QR code and scan it again.'
+      : 'This pairing link is not valid any more. On the PC, show a new QR code and scan it again.' });
+  }
+  if (!checkPin(res, lock, req.body?.pin)) { if (res.statusCode === 401) pairing.wrongPin(); return undefined; }
+  pairing.consume();
+  const token = newToken();
+  const device = { id: crypto.randomUUID(), name: cleanDeviceName(req.body?.name, req.headers['user-agent']), hash: hashToken(token), pairedAt: Date.now(), lastSeen: Date.now() };
+  savePhoneState({ ...phoneState, devices: [...phoneState.devices, device] });
+  console.log(`[phone] Paired: ${device.name}`);
+  res.setHeader('Set-Cookie', deviceCookie(token));
+  return res.json({ ok: true });
 });
 
 // ========================
@@ -854,6 +1863,12 @@ app.get('/api/export', (req, res) => {
     receipts: readAllFromDir('receipts'),
     profiles: readAllFromDir('profiles'),
     purchases: readAllFromDir('purchases'),
+    productions: readAllFromDir('productions'), // v1.10.83 (#115)
+    purchaseOrders: readAllFromDir('purchase-orders'),
+    debitNotes: readAllFromDir('debit-notes'), // v1.10.85 (#168)
+    stockAdjustments: readAllFromDir('stock-adjustments'), // v1.10.85
+    cashBook: readAllFromDir('cash-book'),
+    bankStatements: readAllFromDir('bank-statements'), // v1.10.85 (#175)
     // v1.10.77 - never the PIN hash: a backup file can travel (email, Drive).
     meta: withoutLock(readJSON(META_PATH, {})),
     exportedAt: new Date().toISOString(),
@@ -886,6 +1901,12 @@ app.post('/api/import', (req, res) => {
     receiptCount: 0, receiptSkipped: 0,
     profileCount: 0, profileSkipped: 0,
     purchaseCount: 0, purchaseSkipped: 0,
+    productionCount: 0, productionSkipped: 0,
+    purchaseOrderCount: 0, purchaseOrderSkipped: 0,
+    debitNoteCount: 0, debitNoteSkipped: 0,
+    stockAdjustmentCount: 0, stockAdjustmentSkipped: 0,
+    cashBookCount: 0, cashBookSkipped: 0,
+    bankStatementCount: 0, bankStatementSkipped: 0,
   };
 
   // Helper: upsert one entity to a directory, honouring the overwrite flag.
@@ -893,9 +1914,11 @@ app.post('/api/import', (req, res) => {
     if (!entity?.id) return;
     const p = path.join(DATA_DIR, dirName, safeFileName(entity.id) + '.json');
     if (!overwrite && fs.existsSync(p)) { counts[skipKey]++; return; }
-    writeJSON(p, entity);
+    const keptLock = dirName === 'profiles' ? readJSON(p, null)?.hideLock : null;
+    writeJSON(p, keptLock ? { ...entity, hideLock: keptLock } : entity);
     counts[countKey]++;
   };
+  writeHistory({ at: new Date().toISOString(), kind: 'books', action: overwrite ? 'imported-replace' : 'imported', id: '', number: '', date: '', from: req.socket.encrypted ? 'phone' : 'pc' });
 
   // Profile is a singleton (single file); overwrite-gated same way.
   if (data.profile) {
@@ -913,6 +1936,19 @@ app.post('/api/import', (req, res) => {
   (data.receipts || []).forEach(r => upsertOne('receipts', r, 'receiptCount', 'receiptSkipped'));
   (data.profiles || []).forEach(p => upsertOne('profiles', p, 'profileCount', 'profileSkipped'));
   (data.purchases || []).forEach(p => upsertOne('purchases', p, 'purchaseCount', 'purchaseSkipped'));
+  // v1.10.83 (#115) - saved as they are: the products in the same backup
+  // already hold the stock these entries moved, so nothing is applied again.
+  (data.productions || []).forEach(p => upsertOne('productions', p, 'productionCount', 'productionSkipped'));
+  (data.purchaseOrders || []).forEach(p => upsertOne('purchase-orders', p, 'purchaseOrderCount', 'purchaseOrderSkipped'));
+  // v1.10.85 (#168) - saved as they are: the products in the same backup
+  // already hold the stock these returns moved.
+  (data.debitNotes || []).forEach(p => upsertOne('debit-notes', p, 'debitNoteCount', 'debitNoteSkipped'));
+  // v1.10.85 - stock adjustments, saved as they are (the products hold their stock).
+  (data.stockAdjustments || []).forEach(a => upsertOne('stock-adjustments', a, 'stockAdjustmentCount', 'stockAdjustmentSkipped'));
+  // v1.10.83 - a cash entry that fails the form's checks is skipped, not saved.
+  (data.cashBook || []).forEach(c => { if (validateCashEntry(c)) counts.cashBookSkipped++; else upsertOne('cash-book', cleanCashEntry(c), 'cashBookCount', 'cashBookSkipped'); });
+  // v1.10.85 (#175) - bank statements and their matches; one that fails the checks is skipped.
+  (data.bankStatements || []).forEach(b => { if (badBankStatement(b) || !b.id) counts.bankStatementSkipped++; else upsertOne('bank-statements', b, 'bankStatementCount', 'bankStatementSkipped'); });
 
   // meta.json — same gating. Previously always overwrote → counters could
   // regress below existing bill numbers → collision loop on next save.
@@ -920,13 +1956,26 @@ app.post('/api/import', (req, res) => {
     if (overwrite || !fs.existsSync(META_PATH)) {
       // The PIN on this PC stays as it is: a backup never sets, removes or
       // brings back an old PIN.
-      writeJSON(META_PATH, withLock(withoutLock(data.meta), readJSON(META_PATH, {})[LOCK_KEY]));
+      // v1.10.85 - nor this PC's backup folder (as a restore keeps it).
+      const here = readJSON(META_PATH, {});
+      const { [BACKUP_FOLDER_KEY]: _folder, ...fromBackup } = withLock(withoutLock(data.meta), here[LOCK_KEY]);
+      const kept = here[BACKUP_FOLDER_KEY] ? { ...fromBackup, [BACKUP_FOLDER_KEY]: here[BACKUP_FOLDER_KEY] } : fromBackup;
+      // v1.10.85 - and the books stay closed (or open) as they are on this PC.
+      const { [PERIOD_LOCK_KEY]: _theirLock, ...noPeriod } = kept;
+      writeJSON(META_PATH, here[PERIOD_LOCK_KEY] ? { ...noPeriod, [PERIOD_LOCK_KEY]: here[PERIOD_LOCK_KEY] } : noPeriod);
     } else {
       // v1.10.79 (#95) - a merge keeps what is here and adds the backup's own
       // number series and the higher of each counter, so no number is reused.
       const meta = readJSON(META_PATH, {});
       const series = { ...(data.meta.invoiceNumberSeries || {}), ...(meta.invoiceNumberSeries || {}) };
       if (Object.keys(series).length) meta.invoiceNumberSeries = series;
+      // v1.10.83 (#112) - and the backup's cost centres this PC does not have,
+      // so the documents it brings in keep their cost centre.
+      if (Array.isArray(data.meta.costCentres)) {
+        const have = new Set((meta.costCentres || []).map((c) => c?.id));
+        const added = data.meta.costCentres.filter((c) => c?.id && !have.has(c.id));
+        if (added.length) meta.costCentres = [...(meta.costCentres || []), ...added];
+      }
       for (const [k, v] of Object.entries(data.meta)) {
         if (k.startsWith('counter_') && Number(v) > (Number(meta[k]) || 0)) meta[k] = Number(v);
       }
@@ -990,8 +2039,8 @@ app.post('/api/import', (req, res) => {
 // ========================
 // Save PDF to local folder
 // ========================
-const INVOICES_DIR = path.join(__dirname, 'Saved Invoices');
-if (!fs.existsSync(INVOICES_DIR)) fs.mkdirSync(INVOICES_DIR, { recursive: true });
+const INVOICES_DIR = path.join(APP_HOME, 'Saved Invoices');
+if (!fs.existsSync(INVOICES_DIR)) makeDir(INVOICES_DIR);
 
 app.post('/api/save-pdf', express.raw({ type: 'application/pdf', limit: '20mb' }), (req, res) => {
   try {
@@ -1011,7 +2060,7 @@ app.post('/api/save-pdf', express.raw({ type: 'application/pdf', limit: '20mb' }
     const filePath = path.join(folderPath, safeName);
     if (!isPathInside(filePath, INVOICES_DIR)) return errRes(res, 400, 'invalid-path');
 
-    if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true });
+    if (!fs.existsSync(folderPath)) makeDir(folderPath);
     fs.writeFileSync(filePath, req.body);
     // v1.10.79 (#94) - a PDF saved now replaces any original kept for Undo of
     // a CANCELLED stamp, so an old copy can never come back over a new one.
@@ -1022,7 +2071,7 @@ app.post('/api/save-pdf', express.raw({ type: 'application/pdf', limit: '20mb' }
     // Don't leak absolute FS path — client only needs to know it saved
     // and where (relative). Absolute path revealed OS username +
     // install dir to any origin.
-    res.json({ saved: true, relPath: path.relative(__dirname, filePath).split(path.sep).join('/') });
+    res.json({ saved: true, relPath: path.relative(APP_HOME, filePath).split(path.sep).join('/') });
   } catch (err) {
     errRes(res, 500, 'server-error', err);
   }
@@ -1137,9 +2186,9 @@ app.post('/api/saved-pdf/cancel-mark', express.json(), async (req, res) => {
 // ========================
 // Move saved PDF to Trash
 // ========================
-const TRASH_DIR = path.join(__dirname, 'Trash');
+const TRASH_DIR = path.join(APP_HOME, 'Trash');
 
-if (!fs.existsSync(TRASH_DIR)) fs.mkdirSync(TRASH_DIR, { recursive: true });
+if (!fs.existsSync(TRASH_DIR)) makeDir(TRASH_DIR);
 
 app.post('/api/trash-pdf', express.json(), (req, res) => {
   try {
@@ -1168,7 +2217,7 @@ app.post('/api/trash-pdf', express.json(), (req, res) => {
           const trashPath = path.join(TRASH_DIR, safeClient, month);
           const trashFile = path.join(trashPath, safeName);
           if (!isPathInside(trashFile, TRASH_DIR)) return errRes(res, 400, 'invalid-path');
-          if (!fs.existsSync(trashPath)) fs.mkdirSync(trashPath, { recursive: true });
+          if (!fs.existsSync(trashPath)) makeDir(trashPath);
           try {
             fs.renameSync(filePath, trashFile);
           } catch {
@@ -1187,7 +2236,7 @@ app.post('/api/trash-pdf', express.json(), (req, res) => {
         const trashPath = path.join(TRASH_DIR, safeClient);
         const trashFile = path.join(trashPath, safeName);
         if (isPathInside(trashFile, TRASH_DIR)) {
-          if (!fs.existsSync(trashPath)) fs.mkdirSync(trashPath, { recursive: true });
+          if (!fs.existsSync(trashPath)) makeDir(trashPath);
           try {
             fs.renameSync(flatPath, trashFile);
           } catch {
@@ -1210,8 +2259,67 @@ app.post('/api/trash-pdf', express.json(), (req, res) => {
 // ========================
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8'));
 
+// The Linux packages, the Docker image and the Mac app carry install-kind.txt
+// ("deb", "appimage", "docker", "macapp"). They are updated by installing the
+// new package, so the ZIP updater never runs there and the app says what to
+// do instead (src/utils/installKind.js).
+const INSTALL_KIND = (() => {
+  try { return fs.readFileSync(path.join(__dirname, 'install-kind.txt'), 'utf-8').trim(); } catch { return ''; }
+})();
+const updateHint = (latest) => updateHintFor(INSTALL_KIND, latest);
+const UPDATE_DOWNLOAD_URL = updateDownloadUrlFor(INSTALL_KIND);
+
+// v1.10.84 - also who is answering: the process and lock id (a second server
+// checks "is the lock's server really the one on that port?") and the books
+// folder (the Windows launcher opens a running server only if it serves ITS
+// books, not an old copy's on the same port).
 app.get('/api/version', (req, res) => {
-  res.json({ current: pkg.version });
+  // Not the folder to a phone (it names the Windows user).
+  res.json({ current: pkg.version, pid: process.pid, lockId: LOCK_ID, books: req.socket.encrypted ? undefined : APP_HOME });
+});
+
+// v1.10.83 - the browser's Problem log copies each entry here, so errors.log
+// holds both sides of a failure. Redacted again (never trust the sender), one
+// line per entry, capped fields, and at most 30 a minute so a looping screen
+// cannot fill the disk (rotateErrorsIfLarge caps the file as well).
+const clientErrorTimes = [];
+app.post('/api/client-errors', (req, res) => {
+  const now = Date.now();
+  while (clientErrorTimes.length && now - clientErrorTimes[0] > 60_000) clientErrorTimes.shift();
+  if (clientErrorTimes.length >= 30) return res.status(429).json({ error: 'Too many reports', code: 'rate-limited' });
+  const b = req.body;
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return errRes(res, 400, 'bad-request');
+  const field = (v, n) => ((typeof v === 'string' || typeof v === 'number') ? redact(String(v)).replace(/\s*[\r\n]+\s*/g, ' | ').slice(0, n) : '');
+  const message = field(b.message, 500);
+  if (!message) return errRes(res, 400, 'bad-request');
+  clientErrorTimes.push(now);
+  const api = b.api && typeof b.api === 'object'
+    ? `${field(b.api.method, 10)} ${field(String(b.api.path || '').split('?')[0], 120)} -> ${Number(b.api.status) || 0} ` : '';
+  const stack = field(b.stack, 1500);
+  const line = `[${new Date().toISOString()}] [client:${field(b.kind, 20) || 'error'}] v${field(b.version, 20)} screen=${field(b.view, 30)} ${api}${message}${stack ? ` | ${stack}` : ''} | ${field(b.browser, 80)}`;
+  try {
+    rotateErrorsIfLarge();
+    fs.appendFileSync(ERRORS_LOG, line + '\n', 'utf-8');
+  } catch { /* disk full or read-only: the browser keeps its copy */ }
+  res.json({ ok: true });
+});
+
+// v1.10.83 - read-only tail of errors.log for the Problem log page: last 100
+// lines, each redacted and cut to 500 characters. Reads only the last 64 KB.
+app.get('/api/errors-log', (req, res) => {
+  try {
+    if (!fs.existsSync(ERRORS_LOG)) return res.json({ lines: [] });
+    const size = fs.statSync(ERRORS_LOG).size;
+    const len = Math.min(size, 64 * 1024);
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(ERRORS_LOG, 'r');
+    try { fs.readSync(fd, buf, 0, len, size - len); } finally { fs.closeSync(fd); }
+    let lines = buf.toString('utf-8').split(/\r?\n/);
+    if (len < size) lines = lines.slice(1); // first line is cut in half
+    res.json({ lines: lines.filter((l) => l.trim()).slice(-100).map((l) => redact(l).slice(0, 500)) });
+  } catch (err) {
+    errRes(res, 500, 'server-error', err);
+  }
 });
 
 // Naive semver compare — returns +1 if a > b, -1 if a < b, 0 if equal.
@@ -1237,6 +2345,12 @@ app.get('/api/changelog', (req, res) => {
 });
 
 app.get('/api/check-update', async (req, res) => {
+  // v1.10.83 - Offline mode (Settings → Privacy & internet): no automatic
+  // check. ?now=1 is the Check for Updates button, which the user clicked.
+  if (readJSON(LOCAL_PREFS_PATH, {}).gst_offlineMode === '1' && req.query.now !== '1') {
+    res.json({ current: pkg.version, updateAvailable: false, offlineMode: true });
+    return;
+  }
   try {
     // Two parallel fetches: package.json (definitive version source) and the
     // GitHub Releases API (for release notes). Both have a 4s timeout so a
@@ -1283,6 +2397,8 @@ app.get('/api/check-update', async (req, res) => {
       releaseUrl,
       releasePublishedAt,
       releaseTag,
+      updateHint: updateHint(latest),
+      downloadUrl: UPDATE_DOWNLOAD_URL,
     });
   } catch {
     res.json({ current: pkg.version, latest: null, updateAvailable: false, error: 'Could not check for updates' });
@@ -1297,6 +2413,7 @@ app.get('/api/check-update', async (req, res) => {
 // when running from the source repo.
 // ============================================================
 import { spawn } from 'child_process';
+import os from 'os';
 
 const isWindows = process.platform === 'win32';
 const isMac = process.platform === 'darwin';
@@ -1320,8 +2437,11 @@ const CONTROL_SCRIPT_CANDIDATES = [
   path.join(__dirname, '_system-scripts'),                       // older layouts
   path.join(__dirname, '..', '_system-scripts'),
 ];
+// v1.10.84 - found by the backup script, which every layout ships: a copy
+// installed by the Windows Setup has no update / move / uninstall scripts (it
+// updates with the new Setup, and Windows' Apps list removes it).
 const controlScriptDir = CONTROL_SCRIPT_CANDIDATES.find(
-  p => fs.existsSync(path.join(p, `update${SCRIPT_SUFFIX}`)),
+  p => fs.existsSync(path.join(p, `backup${SCRIPT_SUFFIX}`)),
 ) || null;
 
 function pickScript(name) {
@@ -1334,9 +2454,22 @@ function pickScript(name) {
 // ship update + backup only, so Restore / Move / Stop are shown as not
 // available there instead of failing when clicked.
 const CONTROL_ACTIONS = ['update', 'backup', 'restore', 'move', 'stop'];
-const controlActions = () => Object.fromEntries(CONTROL_ACTIONS.map(a => [a, !!pickScript(a)]));
+// v1.10.83 - Stop works everywhere: on macOS / Linux there is no stop script,
+// so the server stops itself (see launch-script below). The Mac and Linux
+// guides tell people to use it.
+const controlActions = () => Object.fromEntries(CONTROL_ACTIONS.map(a => [a, (a === 'stop' && !isWindows) || (a === 'update' && INSTALLED) ? true : !!pickScript(a)]));
 
-function runControlScript(scriptPath) {
+// v1.10.86 - what a running update is doing, for the page's progress window
+// (GET /api/control-panel/update-progress, asked every second while it runs).
+// The bar never goes backwards: the Windows and Unix scripts differ in order.
+let updateProgress = {};
+const setUpdateStep = (step, pct) => { updateProgress = { step, pct: Math.max(pct, updateProgress.pct || 0) }; };
+
+// v1.10.86 - onLine sees each line the script prints (the update's steps).
+// stdin is closed ('ignore'): the scripts end with Read-Host "Press Enter to
+// close", which waited for ever on the open pipe, so the request never
+// answered and the page said "Updating..." for good.
+function runControlScript(scriptPath, onLine) {
   return new Promise((resolve) => {
     if (!scriptPath) { resolve({ ok: false, error: 'Not available here: the script for this action is not in the app folder. Download the latest ZIP to get it.' }); return; }
     // v1.10.66 (#59) — update-unix.sh is plain POSIX sh, so it runs under `sh`
@@ -1350,8 +2483,12 @@ function runControlScript(scriptPath) {
       : [unixShell, [scriptPath]];
     let out = '', err = '';
     try {
-      const child = spawn(cmd, args, { detached: false, windowsHide: false });
-      child.stdout?.on('data', d => { out += d.toString(); });
+      const child = spawn(cmd, args, { detached: false, windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout?.on('data', d => {
+        out += d.toString();
+        // ponytail: a line split across two chunks may be missed; steps are short lines, so rare.
+        if (onLine) d.toString().split(/\r?\n/).forEach(onLine);
+      });
       child.stderr?.on('data', d => { err += d.toString(); });
       child.on('error', e => resolve({ ok: false, error: e.message }));
       child.on('exit', code => resolve({ ok: code === 0, exitCode: code, stdout: out.slice(-4000), stderr: err.slice(-2000) }));
@@ -1387,13 +2524,22 @@ app.get('/api/control-panel/status', (req, res) => {
   } catch { /* keep fallback */ }
   res.json({
     platform: process.platform,
+    // v1.10.86 - shown as "Windows (64-bit)": win32 is Node's name for every Windows.
+    arch: process.arch,
     node: process.version,
+    version: pkg.version,
     controlScriptsAvailable: !!controlScriptDir,
     actions: controlActions(),
     dataFolder: DATA_DIR,
     dataSizeBytes: dataSize,
     port: activePort,
     launcherType: controlScriptDir ? (isWindows ? 'hta' : (isMac ? 'command' : 'sh')) : 'none',
+    canRemove: path.basename(__dirname) === '_system' && !!pickScript('uninstall'),
+    appFolder: path.dirname(__dirname),
+    installKind: INSTALL_KIND || 'zip',
+    // v1.10.84 - installed by the Windows Setup: removed from Windows' Apps list.
+    installed: INSTALLED,
+    booksFolder: APP_HOME,
   });
 });
 
@@ -1401,6 +2547,16 @@ app.post('/api/control-panel/backup', async (req, res) => {
   const script = pickScript('backup');
   const result = await runControlScript(script);
   res.json(result);
+});
+
+// v1.10.84 - a Windows Setup copy is removed like other programs: this opens
+// Windows' Settings -> Apps -> Installed apps (the Control Panel's Remove card).
+app.post('/api/control-panel/open-apps-settings', (req, res) => {
+  if (!isWindows) return res.json({ ok: false, error: 'Only on Windows.' });
+  try {
+    spawn('explorer.exe', ['ms-settings:appsfeatures'], { detached: true }).unref();
+    res.json({ ok: true });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
 });
 
 app.post('/api/control-panel/open-data-folder', (req, res) => {
@@ -1415,7 +2571,7 @@ app.post('/api/control-panel/open-data-folder', (req, res) => {
 app.post('/api/control-panel/open-backups-folder', (req, res) => {
   const backupsHome = path.join(process.env.USERPROFILE || process.env.HOME || '', 'Documents', 'FreeGSTBill Backups');
   try {
-    if (!fs.existsSync(backupsHome)) fs.mkdirSync(backupsHome, { recursive: true });
+    if (!fs.existsSync(backupsHome)) makeDir(backupsHome);
     if (isWindows) spawn('explorer.exe', [backupsHome], { detached: true }).unref();
     else if (isMac) spawn('open', [backupsHome], { detached: true }).unref();
     else spawn('xdg-open', [backupsHome], { detached: true }).unref();
@@ -1423,14 +2579,209 @@ app.post('/api/control-panel/open-backups-folder', (req, res) => {
   } catch (e) { res.json({ ok: false, error: e.message }); }
 });
 
+// v1.10.86 - WhatsApp on the PC: the page sends the PDF here; it is written to
+// a share folder in the system temp folder and the FILE is put on the
+// clipboard, so the user presses Ctrl+V in the WhatsApp chat (a web page can
+// only hand WhatsApp text). PC-only: it lives under /api/control-panel/.
+// Never takes a path from the page; only the file just written is copied.
+const SHARE_TMP = path.join(os.tmpdir(), 'free-gst-billing-share');
+function runClipboard({ cmd, args, env, input }) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { env: { ...process.env, ...env }, windowsHide: true, stdio: [input ? 'pipe' : 'ignore', 'ignore', 'ignore'] });
+    } catch (e) { resolve(e.message); return; }
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } resolve('timed out'); }, 15000);
+    child.on('error', (e) => { clearTimeout(timer); resolve(e.code === 'ENOENT' ? 'not-supported' : e.message); });
+    child.on('exit', (code) => { clearTimeout(timer); resolve(code === 0 ? '' : `exit code ${code}`); });
+    if (input) child.stdin.end(input);
+  });
+}
+app.post('/api/control-panel/copy-pdf', express.raw({ type: 'application/pdf', limit: PDF_CLIP_MAX }), async (req, res) => {
+  if (!isPdfBytes(req.body)) return res.status(400).json({ ok: false, error: 'not-a-pdf' });
+  try {
+    if (!fs.existsSync(SHARE_TMP)) makeDir(SHARE_TMP);
+    cleanShareTmp(SHARE_TMP);
+    const fileName = sanitizePdfName(req.query.name);
+    const file = path.join(SHARE_TMP, fileName);
+    fs.writeFileSync(file, req.body);
+    const error = await runClipboard(clipboardCommand(process.platform, file));
+    res.json(error ? { ok: false, error } : { ok: true, fileName });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// v1.10.84 - a copy installed by the Windows Setup updates like other
+// programs: the new Setup is downloaded from the GitHub release and run
+// silently. It stops this server, replaces the program files (home.txt and
+// the books are not among them) and starts the app again; the page waits for
+// the new version and reloads (runUpdateNow in src/store.js). If the Setup
+// fails, it starts the version that was there again and the page says so,
+// with the Setup's log. The ZIP's
+// update-windows.ps1 is never used for an installed copy (it is not even
+// installed), and this is never used for a ZIP copy (no installed.txt).
+// Follows redirects by hand so that every hop is https and on GitHub's
+// release hosts (src/utils/setupDownload.js), never anywhere else.
+async function fetchFromGitHub(url, timeoutMs) {
+  const signal = AbortSignal.timeout(timeoutMs);
+  for (let hop = 0; hop < 6; hop += 1) {
+    if (!allowedDownloadUrl(url)) throw new Error('The download was sent to a site that is not GitHub. Nothing was run.');
+    const res = await fetch(url, { redirect: 'manual', signal, headers: { 'User-Agent': 'FreeGSTBill-updater' } });
+    if (res.status < 300 || res.status >= 400) return res;
+    url = new URL(res.headers.get('location') || '', url).href;
+  }
+  throw new Error('Too many redirects.');
+}
+
+async function updateWithSetup() {
+  // The Setup of the last update cannot delete itself: tidy those up first.
+  for (const old of fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('fgsb-update-'))) {
+    try { fs.rmSync(path.join(os.tmpdir(), old), { recursive: true, force: true }); } catch { /* in use */ }
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fgsb-update-'));
+  const exe = path.join(dir, SETUP_NAME);
+  let checked = 'test mode (a local file)';
+  setUpdateStep('Checking GitHub for the new version...', 5);
+  if (INSTALL_TEST_ROOT) {
+    // The Setup's test mode: the new Setup is a file in the test folder, so the
+    // whole update can be tried without publishing a release.
+    fs.copyFileSync(path.join(INSTALL_TEST_ROOT, SETUP_NAME), exe);
+  } else {
+    let asset;
+    try {
+      const rel = await fetch('https://api.github.com/repos/IamRamgarhia/Free-GST-Billing-Software/releases/latest', {
+        signal: AbortSignal.timeout(20000), headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'FreeGSTBill-updater' },
+      });
+      asset = rel.ok ? setupAssetFrom(await rel.json()) : null;
+    } catch {
+      throw new Error('GitHub could not be reached. Check the internet connection and try again.');
+    }
+    if (!asset) throw new Error(`The new version's Setup is not on GitHub yet. Try again later, or download ${SETUP_NAME} from the Releases page.`);
+    let res;
+    try { res = await fetchFromGitHub(asset.url, 15 * 60 * 1000); } catch (e) {
+      throw new Error(e.message.startsWith('The download') ? e.message : 'The new version could not be downloaded. Check the internet connection and try again.');
+    }
+    if (!res.ok) throw new Error(`The download failed (${res.status}). Try again later.`);
+    // v1.10.86 - read in pieces, so the page's bar shows how much has arrived.
+    const total = asset.size || Number(res.headers.get('content-length')) || 0;
+    const parts = [];
+    let got = 0;
+    for await (const part of res.body) {
+      parts.push(part);
+      got += part.length;
+      setUpdateStep(total ? `Downloading the new version... ${Math.round(got / 1048576)} of ${Math.round(total / 1048576)} MB` : 'Downloading the new version...',
+        total ? 10 + Math.floor(70 * Math.min(got / total, 1)) : 10);
+    }
+    const buf = Buffer.concat(parts);
+    setUpdateStep('Checking the download...', 82);
+    const check = checkSetupBytes(buf, asset);
+    if (!check.ok) throw new Error(`${check.problem} Nothing was run; try again later.`);
+    checked = check.checked;
+    fs.writeFileSync(exe, buf);
+  }
+  const log = path.join(dir, 'setup.log');
+  fs.writeFileSync(path.join(dir, 'checked.txt'), `Checked before running: ${checked}\r\n`);
+  const args = ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', `/LOG=${log}`];
+  if (INSTALL_TEST_ROOT) args.push(`/TESTROOT=${INSTALL_TEST_ROOT}`);
+  setUpdateStep('Starting the Setup...', 88);
+  // Detached: the Setup stops this server and must carry on without it.
+  spawn(exe, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  return { log, checked };
+}
+
 app.post('/api/control-panel/launch-script', async (req, res) => {
   // Whitelisted script actions the Control Panel exposes.
   const allowed = new Set(['update', 'restore', 'move', 'stop']);
   const action = String(req.body?.action || '');
   if (!allowed.has(action)) { res.status(400).json({ ok: false, error: 'Unknown action' }); return; }
+  if (action === 'stop' && !isWindows) {
+    // Answer first, then exit, so the page can say it stopped.
+    res.json({ ok: true, stdout: 'Stopped. Open the app again from its icon or launcher.' });
+    setTimeout(() => process.exit(0), 400);
+    return;
+  }
+  if (action === 'update') updateProgress = {};
+  if (action === 'update' && INSTALLED) {
+    try {
+      const { log, checked } = await updateWithSetup();
+      res.json({ ok: true, installer: true, version: pkg.version, log, checked, stdout: 'The new version is installing. The app restarts by itself in about a minute.' });
+    } catch (e) {
+      res.json({ ok: false, error: e.message });
+    }
+    return;
+  }
+  // v1.10.86 - hint: this copy cannot update itself (the page keeps its own message).
+  if (action === 'update' && updateHint()) { res.json({ ok: false, hint: true, error: updateHint(), downloadUrl: UPDATE_DOWNLOAD_URL }); return; }
   const script = pickScript(action);
-  const result = await runControlScript(script);
+  const onLine = action === 'update' ? (line) => { const s = updateStepFromLine(line); if (s) setUpdateStep(s.step, s.pct); } : undefined;
+  const result = await runControlScript(script, onLine);
   res.json(result);
+});
+
+app.get('/api/control-panel/update-progress', (req, res) => res.json(updateProgress));
+
+// v1.10.83 - Restart from the Control Panel ("if something is not working").
+// A new copy is started with --after-pid and waits for this one to exit, so
+// it gets the same port back. On Windows it is started through WMI, so it is
+// not inside this process's job and survives this process exiting.
+app.post('/api/control-panel/restart', (req, res) => {
+  const serverJs = path.join(__dirname, 'server.js');
+  try {
+    if (isWindows) {
+      const q = (v) => `'${String(v).replace(/'/g, "''")}'`;
+      const cmd = `"${process.execPath}" "${serverJs}" --after-pid ${process.pid}`;
+      const ps = `$si = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }; `
+        + `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${q(cmd)}; CurrentDirectory = ${q(__dirname)}; ProcessStartupInformation = $si }; `
+        + `exit $r.ReturnValue`;
+      const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], { windowsHide: true, stdio: 'ignore' });
+      child.on('error', e => { if (!res.headersSent) res.json({ ok: false, error: e.message }); });
+      child.on('exit', code => {
+        if (res.headersSent) return;
+        if (code !== 0) { res.json({ ok: false, error: `Could not start a new copy (code ${code}). Close the app and open it again from its icon.` }); return; }
+        res.json({ ok: true });
+        setTimeout(() => process.exit(0), 400);
+      });
+    } else {
+      spawn(process.execPath, [serverJs, '--after-pid', String(process.pid)], { cwd: __dirname, detached: true, stdio: 'ignore' }).unref();
+      res.json({ ok: true });
+      setTimeout(() => process.exit(0), 400);
+    }
+  } catch (e) { res.json({ ok: false, error: e.message }); }
+});
+
+// v1.10.83 - Remove the app, with the user choosing what goes. The program
+// and its icons always go; data, saved PDFs and the backups folder only when
+// ticked. The script runs from a temp copy, waits for this server to exit
+// (node.exe locks its own folder on Windows), then deletes. Only an installed
+// copy (_system/) can be removed: in the source repo this would delete the repo.
+app.post('/api/control-panel/uninstall', async (req, res) => {
+  const { data, pdfs, backups, confirm } = req.body || {};
+  if (confirm !== 'REMOVE') { res.status(400).json({ ok: false, error: 'Not confirmed' }); return; }
+  const script = pickScript('uninstall');
+  if (path.basename(__dirname) !== '_system' || !script) {
+    res.json({ ok: false, error: 'Remove works only in the installed app (the folder with _system in it).' });
+    return;
+  }
+  try {
+    const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fgsb-remove-')), path.basename(script));
+    fs.copyFileSync(script, tmp);
+    const [cmd, args] = isWindows
+      ? ['powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', tmp,
+        '-Sys', __dirname, '-ServerPid', String(process.pid),
+        ...(data ? ['-Data'] : []), ...(pdfs ? ['-Pdfs'] : []), ...(backups ? ['-Backups'] : [])]]
+      : ['sh', [tmp, __dirname, String(process.pid), data ? 'data' : '', pdfs ? 'pdfs' : '', backups ? 'backups' : '']];
+    // Windows: the script hands itself to WMI and exits, so wait for that and
+    // stay running if it failed. Unix: a detached child outlives the server.
+    const child = spawn(cmd, args, { detached: !isWindows, stdio: 'ignore', windowsHide: true });
+    if (isWindows) {
+      const code = await new Promise(resolve => { child.on('exit', resolve); child.on('error', () => resolve(-1)); });
+      if (code !== 0) { res.json({ ok: false, error: `Could not start the remove step (code ${code}). Nothing was removed.` }); return; }
+    } else child.unref();
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+    return;
+  }
+  res.json({ ok: true, kept: !data || !pdfs ? __dirname : null });
+  setTimeout(() => process.exit(0), 400);
 });
 
 // ========================
@@ -1445,6 +2796,17 @@ app.post('/api/control-panel/launch-script', async (req, res) => {
 // flips to serving the app the moment dist/ appears.
 const distPath = path.join(__dirname, 'dist');
 const indexPath = path.join(distPath, 'index.html');
+// v1.10.85 - on a phone the page's address is https://<this PC>:47443, so the
+// page's CSP names it next to localhost (ERR-007: 'self' does not reach the
+// copy html2canvas makes, and Firefox made PDFs without their styles). The
+// gate lets only an IP address or this PC's name through as the Host.
+function sendPhoneIndex(req, res) {
+  const html = fs.readFileSync(indexPath, 'utf8').replace(/http:\/\/localhost:\*/g, (m) => `${m} https://${req.headers.host}`);
+  res.setHeader('Cache-Control', 'no-cache');
+  return res.type('html').send(html);
+}
+app.use((req, res, next) => (req.socket.encrypted && req.method === 'GET' && (req.path === '/' || req.path === '/index.html') && fs.existsSync(indexPath)
+  ? sendPhoneIndex(req, res) : next()));
 app.use(express.static(distPath, { fallthrough: true })); // fallthrough = ok if dist doesn't exist
 
 // ============================================================
@@ -1455,10 +2817,14 @@ app.use(express.static(distPath, { fallthrough: true })); // fallthrough = ok if
 // ============================================================
 const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
 const BILL_TRASH_DIR = path.join(DATA_DIR, 'trash');
-function ensureDir(p) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+// Never copied into a backup (or the pre-restore snapshot), so a restore never
+// touches them either. v1.10.85 - phone-access: the HTTPS private key and the
+// paired devices stay on this PC (a backup can travel: a USB drive, Drive).
+const NOT_BACKED_UP = new Set(['backups', 'errors.log', 'port.txt', LOCK_NAME, 'phone-access']);
+function ensureDir(p) { if (!fs.existsSync(p)) makeDir(p); }
 
 function copyDirRecursive(src, dst) {
-  if (!fs.existsSync(dst)) fs.mkdirSync(dst, { recursive: true });
+  if (!fs.existsSync(dst)) makeDir(dst);
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, entry.name);
     const d = path.join(dst, entry.name);
@@ -1504,7 +2870,7 @@ const installId = () => {
 };
 const exists = (p) => fs.promises.access(p).then(() => true, () => false);
 async function copyDirAsync(src, dst) {
-  await fs.promises.mkdir(dst, { recursive: true });
+  await makeDirAsync(dst);
   for (const entry of await fs.promises.readdir(src, { withFileTypes: true })) {
     const s = path.join(src, entry.name);
     const d = path.join(dst, entry.name);
@@ -1532,7 +2898,7 @@ async function copyBackupToExtraFolder(date) {
         : 'This folder also gets backups from another computer. Give each computer its own backup folder, or their backups mix.';
       return;
     }
-    await fs.promises.mkdir(dir, { recursive: true });
+    await makeDirAsync(dir);
     // Copied under a temporary name and renamed, so a half-copied folder (disk
     // removed mid-copy) never looks like a complete backup.
     const tmp = `${dst}.partial`;
@@ -1580,7 +2946,7 @@ function runDailyBackup() {
       // Previously excluded → users restoring last week's backup lost every
       // bill they'd trashed since, breaking the 30-day soft-delete promise.
       // We still skip `backups` (no recursion) and log files.
-      if (entry.name === 'backups' || entry.name === 'errors.log' || entry.name === 'port.txt') continue;
+      if (NOT_BACKED_UP.has(entry.name)) continue;
       const src = path.join(DATA_DIR, entry.name);
       const dst = path.join(target, entry.name);
       if (entry.isDirectory()) copyDirRecursive(src, dst);
@@ -1674,13 +3040,14 @@ app.post('/api/backups/:date/restore', (req, res) => {
     // backup folder setting (the backup may be older than it).
     const lockBefore = readJSON(META_PATH, {})[LOCK_KEY];
     const backupFolderBefore = readJSON(META_PATH, {})[BACKUP_FOLDER_KEY];
+    const periodLockBefore = readJSON(META_PATH, {})[PERIOD_LOCK_KEY]; // v1.10.85
 
     // Make a snapshot of live data before touching anything.
     snapshotDir = path.join(BACKUPS_DIR, `pre-restore-${Date.now()}`);
     ensureDir(snapshotDir);
     const liveEntries = fs.readdirSync(DATA_DIR, { withFileTypes: true });
     for (const entry of liveEntries) {
-      if (entry.name === 'backups' || entry.name === 'errors.log' || entry.name === 'port.txt') continue;
+      if (NOT_BACKED_UP.has(entry.name)) continue;
       const src = path.join(DATA_DIR, entry.name);
       const dst = path.join(snapshotDir, entry.name);
       if (entry.isDirectory()) copyDirRecursive(src, dst);
@@ -1694,6 +3061,9 @@ app.post('/api/backups/:date/restore', (req, res) => {
       const src = path.join(backupDir, entry.name);
       const dst = path.join(DATA_DIR, entry.name);
       if (!isPathInside(dst, DATA_DIR)) continue;
+      if (NOT_BACKED_UP.has(entry.name)) continue;
+      // v1.10.85 - this PC's edit history is never replaced by an older one.
+      if (entry.name === 'edit-history') continue;
       if (entry.isDirectory()) {
         if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
         copyDirRecursive(src, dst);
@@ -1706,8 +3076,11 @@ app.post('/api/backups/:date/restore', (req, res) => {
       const restoredMeta = withLock(readJSON(META_PATH, {}), lockBefore);
       if (backupFolderBefore) restoredMeta[BACKUP_FOLDER_KEY] = backupFolderBefore;
       else delete restoredMeta[BACKUP_FOLDER_KEY];
+      if (periodLockBefore) restoredMeta[PERIOD_LOCK_KEY] = periodLockBefore;
+      else delete restoredMeta[PERIOD_LOCK_KEY];
       writeJSON(META_PATH, restoredMeta);
     }
+    writeHistory({ at: new Date().toISOString(), kind: 'books', action: 'backup-restored', id: '', number: '', date: String(date).slice(0, 10), from: req.socket.encrypted ? 'phone' : 'pc' });
     for (const dir of DIRS) invalidateCache(dir);
 
     // Success. The pre-restore snapshot is KEPT: it is the only copy of the
@@ -1884,8 +3257,15 @@ app.get('/api/health', (req, res) => {
 
 app.get('{*path}', (req, res) => {
   if (req.path.startsWith('/api')) return res.status(404).json({ error: 'No such endpoint' });
+  // v1.10.83 - a code or style file that is not here (an old version's, still
+  // asked for by a page from before an update) is a 404, not the app's page:
+  // the page sent as "JavaScript" broke the app with a blank screen, and the
+  // offline cache could keep that page under the code file's name.
+  if (req.path.startsWith('/assets/') || /\.(m?js|css|map|wasm|json|png|svg|ico|woff2?)$/i.test(req.path)) {
+    return res.status(404).type('text/plain').send('Not found');
+  }
   if (fs.existsSync(indexPath)) {
-    return res.sendFile(indexPath);
+    return req.socket.encrypted ? sendPhoneIndex(req, res) : res.sendFile(indexPath);
   }
   // Build not ready yet — serve friendly waiting page (auto-refreshes every 3s).
   return servePlaceholder(req, res);
@@ -1985,8 +3365,9 @@ function logFatal(err, source = 'fatal') {
 // running server keeps serving healthy requests. Per Node best-practice,
 // uncaughtException leaves the process in an unknown state, so we write the
 // log and let the OS / a wrapper script decide whether to restart.
-process.on('uncaughtException', (err) => logFatal(err, 'uncaughtException'));
-process.on('unhandledRejection', (err) => logFatal(err, 'unhandledRejection'));
+// v1.10.83 - and say so in the console window, not only in the file.
+process.on('uncaughtException', (err) => { console.error(`  Unexpected error (the app keeps running): ${err?.message || err}`); logFatal(err, 'uncaughtException'); });
+process.on('unhandledRejection', (err) => { console.error(`  Unexpected error (the app keeps running): ${err?.message || err}`); logFatal(err, 'unhandledRejection'); });
 
 // Note: /api/health used to live below the SPA catch-all here, so the
 // catch-all was swallowing every request to it and returning "No such
@@ -1995,23 +3376,57 @@ process.on('unhandledRejection', (err) => logFatal(err, 'unhandledRejection'));
 // Try ports starting from STARTING_PORT (persisted preference) until one is available.
 // Bound to 127.0.0.1 explicitly so the server can NEVER be reached from the LAN —
 // every byte stays on the user's machine, which the privacy promise depends on.
+// v1.10.85 - always, Docker too: FGSB_ALLOW_UNSAFE_LAN (every address, no
+// login) is gone. Other devices reach the app only through phone access
+// (PHONE / TABLET ACCESS above: HTTPS, pairing, PIN).
+const LISTEN_HOST = '127.0.0.1';
+if (process.env.FGSB_ALLOW_UNSAFE_LAN) {
+  console.warn('  FGSB_ALLOW_UNSAFE_LAN is no longer used: the app answers 127.0.0.1 only. For phones and other PCs set FGSB_PHONE_ACCESS=1 and FGSB_PIN (see docker-compose.yml).');
+}
+// FGSB_PIN (a server with no screen): the app's PIN, used only while none is set.
+if (PHONE_HEADLESS && process.env.FGSB_PIN && !currentLock()) {
+  const pin = String(process.env.FGSB_PIN).trim();
+  if (PIN_RE.test(pin)) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    writeJSON(META_PATH, { ...readJSON(META_PATH, {}), [LOCK_KEY]: { salt, hash: pinHash(pin, salt), length: pin.length } });
+    console.log('  PIN set from FGSB_PIN. You can now delete that line: the PIN is kept with the books.');
+  } else console.warn('  FGSB_PIN must be 6 or 8 digits; no PIN was set.');
+}
 let activeServer = null;
 function startServer(port) {
-  const server = app.listen(port, '127.0.0.1', () => {
+  // v1.10.84 - Express 5 calls this callback with the error too (a busy
+  // port): then it is not listening, and the 'error' handler below moves on
+  // to the next port. Before, the busy port was written to port.txt first.
+  const server = app.listen(port, LISTEN_HOST, (listenErr) => {
+    if (listenErr) return;
     activeServer = server;
     // Persist the chosen port — the .bat launcher reads this for the browser URL.
     // Writing on EVERY successful boot means: if our preferred 47371 was busy and
     // we landed on 47372 instead, next launch tries 47372 first (cuts collision
     // scans in half on repeated reboots of whatever was holding 47371).
     try { fs.writeFileSync(PORT_FILE, String(port), 'utf-8'); } catch { /* ignore */ }
-    console.log(`\n  Free GST Billing Software running at http://localhost:${port}`);
+    // v1.10.84 - the lock now says where this server answers.
+    writeLock(LOCK_FILE, { pid: process.pid, port: server.address().port, at: Date.now(), host: LOCK_HOST, id: LOCK_ID });
+    // v1.10.86 (#207) - in Docker that address works only inside the container;
+    // say how to open the app instead (Docker Desktop's Run button skips the
+    // settings in docker-compose.yml, and then nothing is reachable).
+    if (INSTALL_KIND === 'docker') {
+      console.log('\n  Free GST Billing Software is running in Docker.');
+      if (!PHONE_HEADLESS) console.warn("  It cannot be opened yet: start it with docker-compose.yml (docker compose up -d), not with Docker Desktop's Run button. The compose file opens port 47443 and sets your PIN.");
+      else if (!currentLock()) console.warn('  It cannot be opened yet: set FGSB_PIN in docker-compose.yml to 6 or 8 digits (not CHANGE-ME), then run docker compose up -d again.');
+      else console.log(`  Open https://127.0.0.1:${PHONE_PORT} on this computer, or https://<this computer's address>:${PHONE_PORT} on another device (https, not http). The browser warns once that the connection is not private: choose Advanced, then Continue.`);
+    } else console.log(`\n  Free GST Billing Software running at http://localhost:${port}`);
     console.log(`  Data stored in: ${DATA_DIR}\n`);
+    // v1.10.85 - and the phone listener, when it was left on.
+    if (PHONE_HEADLESS || phoneState.enabled) startPhoneListener();
   });
   server.on('error', (err) => {
-    if (err.code === 'EADDRINUSE' && port < STARTING_PORT + MAX_PORT_SCAN) {
+    // v1.10.83 - EACCES too: Windows reserves port ranges for Hyper-V / WSL
+    // and refuses them with "access denied" rather than "in use".
+    if ((err.code === 'EADDRINUSE' || err.code === 'EACCES') && port !== 0 && port < STARTING_PORT + MAX_PORT_SCAN) {
       console.log(`  Port ${port} is busy, trying ${port + 1}...`);
       startServer(port + 1);
-    } else if (err.code === 'EADDRINUSE') {
+    } else if ((err.code === 'EADDRINUSE' || err.code === 'EACCES') && port !== 0) {
       // We've exhausted the scan range. Tell the OS to pick anything free — at
       // this point the user has 50+ apps fighting for the 47371-47421 range,
       // which we treat as "do whatever works" rather than failing to start.
@@ -2032,6 +3447,7 @@ function startServer(port) {
 // (clean kill) get a 3-second window to flush.
 function gracefulShutdown(signal) {
   console.log(`\n  Received ${signal}, closing connections...`);
+  stopPhoneListener();
   if (!activeServer) { process.exit(0); return; }
   const force = setTimeout(() => {
     console.warn('  Force-exiting after 3s grace period');
@@ -2137,7 +3553,7 @@ const templateHasEnded = (tpl, today) =>
 function generateFromTemplate(tpl, today) {
       // The business this template bills for: the one it was assigned to
       // (ownerGstin), else its saved profile id / name, else the active one.
-      const profiles = readAllFromDir('profiles');
+      const profiles = readAllFromDir('profiles').map(publicProfile); // never the hide PIN's hash
       let profile = profiles.find(p => p.gstin && tpl.ownerGstin && p.gstin === tpl.ownerGstin)
                  || profiles.find(p => p.id && tpl.profileId && p.id === tpl.profileId)
                  || profiles.find(p => p.businessName && p.businessName === (tpl.profileBusinessName || tpl.ownerName))
@@ -2171,7 +3587,9 @@ function generateFromTemplate(tpl, today) {
       // Recurring screen, so the amount it shows is the amount billed.
       // The client's sales so far this year, for the ₹50L TCS/TDS threshold.
       const ytd = clientYearToDate(readAllFromDir('bills'), tpl.clientName, today);
-      const totals = templateTotals(tpl, profile, { tcsCumulativeThisYear: ytd, tdsCumulativeThisYear: ytd });
+      // v1.10.85 (#180) - a template made before 1 April 2026 bills under the 2025 Act's sections.
+      const opts = withNewActSections(tpl.invoiceOptions || {}, invoiceDate);
+      const totals = templateTotals({ ...tpl, invoiceOptions: opts }, profile, { tcsCumulativeThisYear: ytd, tdsCumulativeThisYear: ytd });
       const totalAmount = totals.total;
       const taxTotal = totals.totalTaxAmount;
       // Due date: the same number of days after the invoice date as on the
@@ -2208,7 +3626,8 @@ function generateFromTemplate(tpl, today) {
           details: { invoiceNumber, invoiceDate, dueDate, placeOfSupply: tpl.placeOfSupply || '' },
           // Normalize item.name from legacy description field (v1.6.7-and-earlier
           // templates used `description` — auto-fired bills rendered blank rows).
-          items: (tpl.items || []).map(i => ({
+          // v1.10.85 (#190) - with their part of a before-GST bill discount.
+          items: templateItems({ ...tpl, invoiceOptions: opts }).map(i => ({
             ...i,
             name: i.name || i.description || '',
           })),
@@ -2217,7 +3636,7 @@ function generateFromTemplate(tpl, today) {
           customTerms: tpl.customTerms || '',
           customNotes: tpl.customNotes || '',
           extraSections: tpl.extraSections || [],
-          invoiceOptions: tpl.invoiceOptions || {},
+          invoiceOptions: opts,
           taxInclusive: !!tpl.taxInclusive,
         },
       };
@@ -2280,6 +3699,7 @@ app.post('/api/recurring/:id/generate', (req, res) => {
   }
 });
 
+// (--after-pid, the wait for the old copy on Restart, is at the top: before the lock.)
 startServer(STARTING_PORT);
 // Fire once after a short delay so the listener is up first; then once a day
 // for users whose server stays up >24h.

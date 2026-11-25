@@ -11,6 +11,10 @@ node_modules
 dist
 dist-ssr
 release-build
+# scripts/build-linux.mjs: downloads (checksum-verified) and staging
+.cache/
+# Node.js for the Windows Setup, downloaded and checked by scripts/build-installer.mjs
+.installer-cache
 *.local
 
 # Invoice data (personal/financial - keep local only)
@@ -43,3 +47,6 @@ public/tesseract/
 
 # Built documentation site (regenerate with: node docs-site/build.mjs)
 docs-site/out/
+
+# Playwright MCP browser-tool scratch files
+.playwright-mcp/

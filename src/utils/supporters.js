@@ -7,7 +7,7 @@
 export const SUPPORTERS_URL = 'https://raw.githubusercontent.com/IamRamgarhia/Free-GST-Billing-Software/main/supporters.json';
 
 // The note UPI apps fill in when the QR is scanned, so the maintainer can see
-// who paid: "Free GST Billing support - Kaveri Stationers". Kept to letters,
+// who paid: "Free GST Billing support - DiceCodes". Kept to letters,
 // digits, spaces, "." and "-" (some UPI apps refuse anything else) and to 50
 // characters, which every app accepts.
 const NOTE_BASE = 'Free GST Billing support';
@@ -51,10 +51,10 @@ export const parseSupporters = (raw) => {
 
 // The Dashboard's daily support card (SupportNudge): shown once a business has
 // made a few invoices, once a day. state = { hiddenOn: 'YYYY-MM-DD' ("Not
-// today"), snoozedUntil: ms ("Hide for 30 days"), never } - never was the old
+// today"), snoozedUntil: ms ("Hide for 7 days"), never } - never was the old
 // "Don't show again" (before v1.10.80) and is still honoured.
 export const SUPPORT_NUDGE_MIN_INVOICES = 10;
-export const SNOOZE_DAYS = 30;
+export const SNOOZE_DAYS = 7; // v1.10.86 (maintainer): a reminder after 7 days, not 30
 export const localDay = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 export const shouldShowSupportNudge = (invoiceCount, state = {}, now = new Date()) => {
   if (invoiceCount < SUPPORT_NUDGE_MIN_INVOICES || state.never) return false;

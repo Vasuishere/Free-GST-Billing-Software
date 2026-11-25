@@ -11,7 +11,9 @@
 // the fix breaks every sum a user runs over an exported column.
 
 import { toCsvCell, toCsvLine } from '../src/utils.js';
-import { dateOrderNote, parseCsv, toIsoDate, toNum, salesCsvToBills, billsToSalesCsv, purchaseCsvToRecords, purchasesToCsv, SALES_TEMPLATE, PURCHASE_TEMPLATE } from '../src/utils/bulkCsv.js';
+import { dateOrderNote, parseCsv, toIsoDate, toNum, salesCsvToBills, billsToSalesCsv, purchaseCsvToRecords, purchasesToCsv, SALES_TEMPLATE, PURCHASE_TEMPLATE, receivedByInvoice, newProductsFromBills, marketplaceOrdersTable } from '../src/utils/bulkCsv.js';
+import { productsCsvToList, clientsCsvToList } from '../src/utils/listCsv.js';
+import { readFileSync } from 'fs';
 
 let passed = 0, failed = 0;
 function eq(actual, expected, label) {
@@ -103,6 +105,14 @@ console.log('\n[Review] Import never merges different invoices or double-books a
   const back = salesCsvToBills(billsToSalesCsv(src.bills), { profile: prof });
   eq(`${src.bills[0].totalAmount}`, `${Math.round(3 * 290.3 * 1.18 - 50)}`, 'Bill discount and round-off are applied on import');
   eq(back.bills[0].totalAmount, src.bills[0].totalAmount, 'An exported invoice re-imports to the same total');
+  // v1.10.85 (#190) - "Bill Discount Before GST" = Yes: a trade discount, GST on the reduced value.
+  const trade = salesCsvToBills(head.replace('GST %\n', 'GST %,Bill Discount,Bill Discount Before GST\n') + '10,2026-10-01,Alpha Traders,Punjab,Pens,10,100,18,100,Yes\n', { profile: prof });
+  eq(`${trade.bills[0].data.totals.taxableAmount}|${trade.bills[0].totalAmount}`, '900|1062', 'Bill Discount Before GST: GST on 900 (1,000 - 100), total 1,062');
+  eq(trade.bills[0].data.items[0].billDiscShare, 100, 'and the saved line carries its part (GSTR-1 reads it)');
+  const tradeBack = salesCsvToBills(billsToSalesCsv(trade.bills), { profile: prof });
+  eq(tradeBack.bills[0].totalAmount, 1062, 'it re-imports to the same total');
+  const cash = salesCsvToBills(head.replace('GST %\n', 'GST %,Bill Discount,Bill Discount Before GST\n') + '11,2026-10-01,Alpha Traders,Punjab,Pens,10,100,18,100,No\n', { profile: prof });
+  eq(cash.bills[0].totalAmount, 1080, 'No (or blank): after GST as before, 1,180 - 100');
 
   const existing = [{ supplierName: 'Ravi Paper Mart', supplierGstin: '03AAAAA1111A1Z1', invoiceNumber: 'RP-9' }];
   const p = purchaseCsvToRecords('Invoice Number,Invoice Date,Supplier Name,Item Name,Quantity,Rate\nRP-9,2026-10-01,ravi paper mart,A4 Paper,10,250\n', { existing });
@@ -119,6 +129,153 @@ console.log('\n[Review] Day-first and month-first dates');
   eq(`${us.bills.length}/${us.errors.length}`, '0/1', '...so not even its ambiguous rows are imported with swapped dates');
   const p = purchaseCsvToRecords('Invoice Number,Invoice Date,Supplier Name,Item Name,Rate\nX1,03/04/2026,S,Paper,5\n', {});
   eq(`${p.purchases.length}/${p.warnings.length}`, '1/1', 'Purchases get the same warning');
+}
+
+console.log('\n[#132] A GSTIN already saved finds that client, whatever the name');
+{
+  const profile = { country: 'India', state: 'Punjab' };
+  const head = 'Invoice Number,Invoice Date,Client Name,Client GSTIN,Item Name,Rate,GST %\n';
+  const clients = [{ id: 'c1', name: 'Sharma Traders', gstin: '03AAACS1234A1Z5', state: 'Punjab', phone: '98100' }];
+  const r = salesCsvToBills(head + 'A1,2026-10-01,Sharma Tradres,03aaacs1234a1z5,Pens,100,18\n', { profile, clients });
+  eq(r.newClients.length, 0, 'a mistyped name with a saved GSTIN adds no new client');
+  eq(r.bills[0].clientName, 'Sharma Traders', '...and the invoice goes to the saved client, by its saved name');
+  eq(r.bills[0].data.client.phone, '98100', '...with the saved client details');
+  const two = salesCsvToBills(head + 'B1,2026-10-01,New Co,03BBBCN1234B1Z5,Pens,100,18\nB2,2026-10-02,New Company,03BBBCN1234B1Z5,Ink,50,18\n', { profile });
+  eq(two.newClients.length, 1, 'two new rows with one GSTIN make one new client, not two');
+  eq(two.bills.map((b) => b.clientName).join('|'), 'New Co|New Co', '...and both invoices use its first name');
+  eq(salesCsvToBills(head + 'C1,2026-10-01,Sharma Traders,,Pens,100,18\n', { profile, clients }).newClients.length, 0, 'no GSTIN on the row: still found by name');
+}
+
+console.log('\n[#134] The Products export imports back, every column');
+{
+  // The exact file from the report: v1.10.82's own Products export, filled in
+  // in Excel (saved as CSV UTF-8, so with a byte-order mark).
+  const v82 = '﻿Name,HSN/SAC,Purchase price,Selling price,GST %,Unit,Stock\r\nPVC 2 PIPE 4KG ISI AST,39172390,822,822,18,Ft,0\r\n';
+  const p = productsCsvToList(v82, []).products[0];
+  eq(JSON.stringify([p.hsn, p.purchasePrice, p.sellingPrice, p.taxPercent, p.unit, p.stock]), JSON.stringify(['39172390', 822, 822, 18, 'Ft', 0]),
+    'HSN/SAC, both prices and GST % are read, not only the name');
+  // Today's export headings, read from the Products screen itself, so a change
+  // to them that the import does not follow fails here.
+  const src = readFileSync(new URL('../src/components/InventoryView.jsx', import.meta.url), 'utf8');
+  // v1.10.85 - the price-level columns (", ...levelCsvHeaders(levels)") are
+  // added only while Price levels is on; scripts/price-levels-test.mjs reads them.
+  const headers = JSON.parse((/headers=\{(\[[^\]]*\])\}/.exec(src) || [])[1].replace(/,\s*\.\.\.\w+\(\w+\)/g, '').replace(/'/g, '"'));
+  const row = { Name: 'Pen', Type: 'Goods', 'HSN/SAC': '9608', 'Purchase price': 6, 'Selling price': 10, 'GST %': 12, Unit: 'Nos', Stock: 40 };
+  const now = productsCsvToList([toCsvLine(headers), toCsvLine(headers.map((h) => row[h] ?? ''))].join('\n'), []).products[0];
+  eq(JSON.stringify([now?.hsn, now?.purchasePrice, now?.sellingPrice, now?.taxPercent, now?.unit, now?.stock]), JSON.stringify(['9608', 6, 10, 12, 'Nos', 40]),
+    `the screen's own export headings (${headers.join(', ')}) all import`);
+}
+
+console.log('\n[#134] Importing products again fills in what is empty, never overwrites');
+{
+  // As left by v1.10.82: only Name, Unit and Stock were read.
+  const existing = [
+    { id: 'p1', name: 'DiceCodes PVC Pipe', hsn: '', purchasePrice: 0, sellingPrice: 0, rate: 0, taxPercent: 0, unit: 'Ft', stock: 5, description: '' },
+    { id: 'p2', name: 'DiceCodes Pen ', hsn: '9608', purchasePrice: 0, sellingPrice: 10, rate: 10, taxPercent: 12, unit: 'Nos', description: 'blue' },
+    { id: 'p3', name: 'DiceCodes Exempt Book', hsn: '4901', purchasePrice: 40, sellingPrice: 50, rate: 50, taxPercent: 0, unit: 'Nos', stock: 2, description: 'x' },
+  ];
+  const file = [
+    'Name,HSN/SAC,Purchase price,Selling price,GST %,Unit,Stock,Description',
+    'DiceCodes PVC Pipe,39172390,822,850,18,Mtr,90,new',
+    'dicecodes pen,9999,6,99,18,Box,40,red',
+    'DiceCodes Exempt Book,4902,41,51,5,Box,9,y',
+    'DiceCodes Pen,1111,7,1,1,Kg,1,z',
+    'DiceCodes Brand New,4820,1,2,12,Nos,3,',
+  ].join('\n');
+  const r = productsCsvToList(file, existing);
+  eq(r.products.map((p) => p.name).join('|'), 'DiceCodes Brand New', 'a new name is added as before');
+  eq(r.updates.map((p) => p.id).join('|'), 'p1|p2', 'saved products with empty details are updated (same id, no duplicate)');
+  const [pipe, pen] = r.updates;
+  eq(JSON.stringify([pipe.hsn, pipe.purchasePrice, pipe.sellingPrice, pipe.rate, pipe.taxPercent, pipe.unit, pipe.stock, pipe.description]), JSON.stringify(['39172390', 822, 850, 850, 18, 'Ft', 5, 'new']),
+    'the empty HSN, prices, GST % and description are filled; unit and stock already set are kept');
+  eq(JSON.stringify([pen.name, pen.hsn, pen.purchasePrice, pen.sellingPrice, pen.taxPercent, pen.unit, pen.description, pen.stock]), JSON.stringify(['DiceCodes Pen ', '9608', 6, 10, 12, 'Nos', 'blue', 40]),
+    'only the empty purchase price and the untracked stock are filled; every value already there stays');
+  eq(r.skipped, 2, 'nothing to fill (the 0% book has its HSN, so 0% is its rate) and a repeat in the file: skipped');
+  eq(existing[0].hsn, '', 'the saved list itself is not changed');
+}
+
+console.log('\n[#130] Files exported from Vyapar (layouts seen in real exports)');
+{
+  const profile = { country: 'India', state: 'Punjab', gstin: '03ABCDE1234F1Z5' };
+  // Newer "Item Details" sheet: title rows above the header, "Tax Percent"
+  // beside "Tax", an Excel date number, a cancelled sale, a Total row.
+  const newer = [
+    ['DiceCodes'], ['Sale Report: 01/10/2026 to 31/10/2026'],
+    ['Date', 'Invoice No./Txn No.', 'Party Name', 'Item Name', 'Item Code', 'HSN/SAC', 'Category', 'Description', 'Quantity', 'Unit', 'UnitPrice', 'Discount Percent', 'Discount', 'Tax Percent', 'Tax', 'Transaction Type', 'Amount'],
+    ['46325', 'V-1', 'Riya Sharma', 'Pen', 'P1', '9608', 'Stationery', 'Blue ink', '10', 'Nos', '20', '0', '0', '18', '36', 'Sale', '236'],
+    ['30/10/2026', 'V-2', 'Arjun', 'Ink', '', '3215', '', '', '1', 'Nos', '100', '0', '0', '12', '12', 'Sale[Cancelled]', '112'],
+    ['Total', '', '', '', '', '', '', '', '11', '', '', '', '', '', '48', '', '348'],
+  ];
+  const sale = [
+    ['DiceCodes'], ['Sale Report'],
+    ['Date', 'Order No', 'Invoice No', 'Party Name', 'GSTIN', 'Party Phone No.', 'Transaction Type', 'Total Amount', 'Payment Type', 'Received/Paid Amount', 'Balance Due'],
+    ['30/10/2026', '', 'V-1', 'Riya Sharma', '', '98765 43210', 'Sale', '236', 'Cash', '100', '136'],
+    ['Total', '', '', '', '', '', '', '236', '', '100', '136'],
+  ];
+  const r = salesCsvToBills(newer, { profile, received: receivedByInvoice(sale) });
+  eq(r.errors.join(' | '), '', 'no errors: title rows and the Total row are not data');
+  eq(r.bills.map((b) => b.invoiceNumber).join(','), 'V-1', 'the cancelled sale is left out...');
+  eq(r.warnings.some((w) => /1 cancelled invoice was left out/.test(w)), true, '...and the preview says so');
+  const b = r.bills[0];
+  eq(b.invoiceDate, '2026-10-30', 'an Excel date number becomes the date');
+  eq(`${b.data.items[0].rate}|${b.data.items[0].taxPercent}|${b.data.items[0].hsn}`, '20|18|9608', '"Tax Percent" is the rate, not the "Tax" amount beside it');
+  eq(b.totalAmount, 236, 'the total matches Vyapar\'s');
+  eq(`${b.status}|${b.paidAmount}|${b.payments.length}`, 'partial|100|1', 'what the Sale Report says was received becomes a payment');
+  // Older "Sale Items" sheet: discount and GST as "amount (rate%)".
+  const older = [
+    ['Date', 'Party Name', 'Invoice No.', 'Item Name', 'Item code', 'HSN/SAC', 'Quantity', 'Price/Unit', 'Discount', 'GST', 'Amount'],
+    ['05/12/2025', 'Cash Sale', '17', 'Notebook', '', '4820', '2', '50', '10 (10.0%)', '16.2 (18.0%)', '106.2'],
+  ];
+  const o = salesCsvToBills(older, { profile });
+  eq(o.errors.join(' | '), '', 'older layout reads without errors');
+  eq(`${o.bills[0].data.items[0].discount}|${o.bills[0].data.items[0].taxPercent}|${o.bills[0].totalAmount}`, '10|18|106.2',
+    '"10 (10.0%)" is a ₹10 discount and "16.2 (18.0%)" is 18% GST');
+  eq(o.bills[0].status, 'unpaid', 'without a Sale Report nothing is marked paid');
+  // Item and party files.
+  const items = productsCsvToList([
+    ['Item Code', 'Item Name*', 'HSN', 'Sale Price', 'Purchase Price', 'Opening Stock Quantity', 'Minimum Stock Quantity', 'Item Location', 'Tax Rate', 'Tax Inclusive (Y/N)'],
+    ['P1', 'Pen', '9608', '23.6', '15', '100', '10', 'Shelf 2', 'GST@18%', 'Y'],
+    ['P2', 'Register', '4820', '80', '60', '', '', '', '12%', 'N'],
+  ]);
+  eq(items.errors.join(' | '), '', 'Vyapar item file reads without errors');
+  eq(items.products.map((p) => `${p.name}:${p.sellingPrice}:${p.taxPercent}:${p.stock ?? '-'}`).join(' '), 'Pen:20:18:100 Register:80:12:-',
+    '"GST@18%" and "12%" read as rates; an inclusive price has its tax taken out');
+  const parties = clientsCsvToList([
+    ['Party Name', 'GSTIN', 'Phone No.', 'Email Id', 'Billing Address', 'State'],
+    ['Riya Sharma', '', '9876543210', 'riya@example.com', '4 Mall Road, Ludhiana', 'Punjab'],
+  ]);
+  eq(parties.clients.map((c) => `${c.name}|${c.phone}|${c.address}`).join(), 'Riya Sharma|9876543210|4 Mall Road, Ludhiana', 'Vyapar party columns map onto clients');
+  eq(toIsoDate('45383'), '2024-04-01', 'a date number in a CSV too');
+  eq(toIsoDate('2026'), '', 'a plain year is not a date');
+}
+
+// #172 / #179 (v1.10.85): a Flipkart orders report (made-up rows) becomes tax
+// invoices: GST-inclusive Invoice Amount, tax RATES in IGST/CGST/SGST ("NA"),
+// mm/dd/yy dates, order ID + tracking ID in the order details; returns noted.
+{
+  const head = 'Ordered On,Shipment ID,ORDER ITEM ID,Order Id,HSN CODE,Order State,Order Type,FSN,SKU,Product,Invoice No.,CGST,IGST,SGST,Invoice Date (mm/dd/yy),Invoice Amount,Selling Price Per Item,Shipping and Handling Charges,Quantity,Price inc. FKMP Contribution & Subsidy,Buyer name,Ship to name,Address Line 1,Address Line 2,City,State,PIN Code,Dispatch After date,Dispatch by date,Form requirement,Tracking ID';
+  const rows = [
+    'Oct 26 2026,S1,I1,OD100001,7323,Delivered,NON_FBF,F1,SKU1,Steel Tiffin,FKTEST0001,NA,5,NA,10/26/26,210,180,0,2,210,Asha Test,Asha Test,Line 1,,Pune,Maharashtra,411001,,,,FMPC0000001',
+    'Oct 27 2026,S2,I2,OD100002,3923,Returned,NON_FBF,F2,SKU2,Plastic Box,FKTEST0002,9,NA,9,10/27/26,118,100,0,1,118,Ravi Test,Ravi Test,Line 2,,Jaipur,Rajasthan,302001,,,,FMPC0000002',
+  ];
+  const r = salesCsvToBills([head, ...rows].join('\n'), { profile: { businessName: 'DiceCodes', state: 'Rajasthan', gstin: '08ABCDE1234F1Z5' } });
+  const [a, b] = r.bills;
+  eq(r.bills.length, 2, '#172 a Flipkart orders report imports one invoice per order');
+  eq(`${a.invoiceNumber}|${a.invoiceDate}|${a.totalAmount}|${a.data.items[0].rate}|${a.data.items[0].taxPercent}`, 'FKTEST0001|2026-10-26|210|105|5', '#172 GST-inclusive amount, rate = amount / qty, IGST rate, mm/dd/yy date');
+  eq(`${a.data.details.buyerOrderNo}|${a.data.details.dispatchDocNo}|${a.data.details.dispatchedThrough}`, 'OD100001|FMPC0000001|Flipkart', '#172 order ID and AWB land in the order details');
+  eq(`${b.data.items[0].taxPercent}|${b.totalAmount}`, '18|118', '#172 CGST + SGST rates add up (9 + 9)');
+  eq(r.warnings.some((w) => /1 order was returned/.test(w)), true, '#172 returned orders are counted in a note');
+  eq(marketplaceOrdersTable('Invoice Number,Client Name\n1,X'), null, '#172 an ordinary CSV is not taken for a Flipkart file');
+}
+
+// #170: an invoice import adds new items to Products, never changes saved ones.
+{
+  const bills = [{ data: { items: [{ name: 'Mouse ', hsn: '8471', unit: 'Pcs', rate: 250, taxPercent: 18 }, { name: 'Pen drive', rate: 399, taxPercent: 12 }] } },
+    { data: { items: [{ name: 'mouse', rate: 1 }, { name: 'Cable', rate: 99, taxPercent: 18, cessPercent: 1 }] } }];
+  const out = newProductsFromBills(bills, [{ name: 'Pen Drive' }]);
+  eq(out.map((p) => p.name).join(','), 'Mouse,Cable', '#170 only new item names, once each');
+  eq(`${out[0].hsn}|${out[0].unit}|${out[0].sellingPrice}|${out[0].taxPercent}|${out[0].stock}`, '8471|Pcs|250|18|0', '#170 the new product keeps HSN, unit, rate, GST; stock 0');
+  eq(out[1].cessPercent, 1, '#170 cess carried over');
 }
 
 console.log('\n────────────────────────────────────────');

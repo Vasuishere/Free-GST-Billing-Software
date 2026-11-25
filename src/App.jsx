@@ -1,7 +1,14 @@
 import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
-import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, HardDrive, Menu, Heart } from 'lucide-react';
-import { getAllProfiles, saveProfile, getEnabledModules, getAllBills, getAllProducts, getStockAlertSettings, getAllClients, runUpdateNow, getLockStatus } from './store';
-import { isModuleEnabled, getUpcomingFilings, countsAsSales, localToday, toLocalIsoDate, DOCS_URL } from './utils';
+import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, Menu, Heart, Banknote } from 'lucide-react';
+import { getAllProfilesWithHidden, saveProfile, getEnabledModules, getMenuOrder, getMenuHidden, getMenuDots, onMenuChanged, getAllBills, getAllProducts, getAllRecurring, getStockAlertSettings, runUpdateNow, getLockStatus, visibleProfiles, hasHiddenProfiles, openHiddenCompanies, hideCompaniesAgain, isOpenedHidden, DATA_SAVED_EVENT } from './store';
+import { isModuleEnabled, localToday, DOCS_URL, trackedStock } from './utils';
+import { orderedMenu } from './utils/businessTypes';
+import SidebarMenu, { NavDot } from './components/SidebarMenu';
+import MenuCustomise, { onOpenCustomiseMenu } from './components/MenuCustomise';
+import { hiddenItems } from './utils/menuGroups';
+import { findAttention, menuDots, rollupDot, readFiledMarks, readNewSeen, markNewSeen, NEW_IN } from './utils/attention';
+import { getPrintSettings } from './utils/printSettings';
+import { notifyUpdate, canAskToNotify, askToNotify } from './utils/updateNotice';
 // v1.10.4 — Route-level lazy loading. Prior App.jsx synchronously
 // imported all 12 views (~15k LOC combined), so a first-paint on
 // Dashboard downloaded and parsed GSTReturns (1952), InvoiceGenerator
@@ -18,27 +25,36 @@ import { isModuleEnabled, getUpcomingFilings, countsAsSales, localToday, toLocal
 // once fetched.
 import Dashboard from './components/Dashboard';
 import InvoiceGenerator from './components/InvoiceGenerator';
-import SetupWizard from './components/SetupWizard';
 import ToastContainer, { toast } from './components/Toast';
-import ConfirmModalContainer from './components/ConfirmModal';
+import UpdateOverlay from './components/UpdateOverlay';
+import ErrorBoundary from './components/ErrorBoundary';
+import ConfirmModalContainer, { promptAction } from './components/ConfirmModal';
 import WelcomeGuide from './components/WelcomeGuide';
+import { WhatsNewAfterUpdate, SEEN_KEY as WHATS_NEW_SEEN_KEY } from './components/WhatsNewSlides';
 const SettingsView = lazy(() => import('./components/SettingsView'));
+// v1.10.86 - loaded on first Ctrl+K (it carries the How do I… list and the help index).
+const QuickSearch = lazy(() => import('./components/QuickSearch'));
 const ClientsView = lazy(() => import('./components/ClientsView'));
 const InventoryView = lazy(() => import('./components/InventoryView'));
 const ReportsView = lazy(() => import('./components/ReportsView'));
 const ExpenseTracker = lazy(() => import('./components/ExpenseTracker'));
 const RecurringInvoices = lazy(() => import('./components/RecurringInvoices'));
 const ReceiptVoucher = lazy(() => import('./components/ReceiptVoucher'));
+const CashBook = lazy(() => import('./components/CashBook'));
 const GSTReturns = lazy(() => import('./components/GSTReturns'));
 const IncomeTax = lazy(() => import('./components/IncomeTax'));
 const PurchaseBills = lazy(() => import('./components/PurchaseBills'));
-const ControlPanel = lazy(() => import('./components/ControlPanel'));
 const SupportView = lazy(() => import('./components/SupportView'));
 import StarBanner from './components/StarBanner';
 import AppFooter from './components/AppFooter';
-import LockButton from './components/LockButton';
+import OfflineModeButton from './components/OfflineModeButton';
+import PhonePairButton from './components/PhonePairButton';
+import { isOfflineMode } from './utils/offlineMode';
+import { startView } from './utils/listPrefs';
+import HelpButton from './components/HelpButton';
+import ActionsMenu from './components/ActionsMenu';
 import { lockNow } from './utils/appLock';
-import { getPrintSettings } from './utils/printSettings';
+import { PageBarSlots, fitPageBar } from './components/pageBarSlots';
 
 const openDocs = () => window.open(DOCS_URL, '_blank', 'noopener,noreferrer');
 
@@ -59,11 +75,19 @@ function ViewLoading() {
   );
 }
 
+const MENU_BRAND_KEY = 'gst_menuBrand';
+
+// v1.10.86 - the Control Panel moved into Settings -> App & updates: an old
+// ?view=controlpanel link or a saved gst_currentView opens that tab instead.
+const fromControlPanel = (view) => {
+  if (view !== 'controlpanel') return view;
+  try { sessionStorage.setItem('gst_settingsTab', 'section-updates'); } catch { /* storage blocked */ }
+  return 'settings';
+};
+
 function App() {
-  // v1.9.3 — Setup Wizard shown on first-run (before onboardingComplete = true)
-  const [showWizard, setShowWizard] = useState(() => {
-    try { return !getPrintSettings().onboardingComplete; } catch { return false; }
-  });
+  // v1.10.86 - the second first-run window (SetupWizard: business type, paper,
+  // language) is gone; the welcome asks the business type itself.
   const [currentView, setCurrentView] = useState(() => {
     // PWA manifest "shortcuts" deep-link in via ?view=X (e.g. right-clicking
     // the pinned taskbar icon → "New Invoice" opens /?view=new). Honour that
@@ -72,19 +96,35 @@ function App() {
       const params = new URLSearchParams(window.location.search);
       const v = params.get('view');
       // v1.10.74 - 'controlpanel' added so ?view=controlpanel deep links work too.
-      const valid = ['dashboard', 'new', 'clients', 'vendors', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'reports', 'filing', 'incometax', 'settings', 'controlpanel', 'support'];
+      const valid = ['dashboard', 'new', 'clients', 'vendors', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'cashbook', 'reports', 'filing', 'incometax', 'settings', 'controlpanel', 'support'];
       if (v && valid.includes(v)) {
         // Strip the query string so a refresh doesn't keep snapping back to
         // the shortcut target — only the *first* navigation honours it.
         window.history.replaceState({}, '', window.location.pathname);
-        return v;
+        return fromControlPanel(v);
       }
     } catch { /* sandboxed history API — fall through */ }
     // 'guide' was the built-in User Guide (removed in v1.10.75).
     const last = sessionStorage.getItem('gst_currentView');
-    return last && last !== 'guide' ? last : 'dashboard';
+    // v1.10.86 - a new tab or window opens on the screen chosen in Customise
+    // Dashboard ("Open the app on"); a reload keeps the screen it was on.
+    return last && last !== 'guide' ? fromControlPanel(last) : startView();
   });
   const [profile, setProfile] = useState(null);
+  // v1.10.83 - the menu's own name and logo, as last shown (see `brand` below).
+  const [menuBrandCache] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(MENU_BRAND_KEY) || 'null'); } catch { return null; }
+  });
+  useEffect(() => {
+    if (!profile) return; // not loaded yet: keep what was there
+    try {
+      const name = String(profile.businessName || '').trim();
+      if (!profile.showInMenu || !name) { localStorage.removeItem(MENU_BRAND_KEY); return; }
+      const keep = { showInMenu: true, businessName: name, logo: profile.logo || '' };
+      try { localStorage.setItem(MENU_BRAND_KEY, JSON.stringify(keep)); }
+      catch { localStorage.setItem(MENU_BRAND_KEY, JSON.stringify({ ...keep, logo: '' })); } // a very large logo: the name at least
+    } catch { /* browser storage off: the menu simply waits for the profile */ }
+  }, [profile]);
   const [editingBill, setEditingBill] = useState(() => {
     try {
       const saved = sessionStorage.getItem('gst_editingBill');
@@ -95,9 +135,7 @@ function App() {
     return localStorage.getItem('freegstbill_theme') === 'dark';
   });
   const [showWelcome, setShowWelcome] = useState(false);
-  const [showInstallBanner, setShowInstallBanner] = useState(false);
   const [serverDown, setServerDown] = useState(false);
-  const deferredPrompt = useRef(null);
   const retryTimer = useRef(null);
 
   const [serverStatus, setServerStatus] = useState('checking'); // 'checking' | 'online' | 'offline'
@@ -112,16 +150,22 @@ function App() {
   // after that dismissal will re-show the banner.
   const [updateInfo, setUpdateInfo] = useState(null);
   const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [notifyAsked, setNotifyAsked] = useState(false);
   const updateBannerVisible = updateInfo?.updateAvailable
     && localStorage.getItem('freegstbill_dismissedUpdate') !== updateInfo.latest;
 
   useEffect(() => {
     let cancelled = false;
     const check = async () => {
+      // The server also skips it when Offline mode is on, but it reads the
+      // copy in the data folder, which can lag behind this browser's.
+      if (isOfflineMode()) return;
       try {
         const res = await fetch('/api/check-update');
         const data = await res.json();
         if (!cancelled) setUpdateInfo(data);
+        // v1.10.84 - and a Windows notification, once per version (if allowed).
+        if (!cancelled && data?.updateAvailable && localStorage.getItem('freegstbill_dismissedUpdate') !== data.latest) notifyUpdate(data.latest);
       } catch { /* offline — quietly skip */ }
     };
     // First check ~5 seconds after mount so it doesn't fight the initial load.
@@ -135,8 +179,17 @@ function App() {
   // Computed from server data on app boot + every 10 minutes; tucked under a
   // bell icon next to dark-mode toggle in the sidebar. Each section is one
   // click away from the relevant page.
-  const [notifications, setNotifications] = useState({ overdue: [], dueSoon: [], lowStock: [], filings: [], autoFire: null });
+  const [notifications, setNotifications] = useState({ overdue: [], dueSoon: [], lowStock: [], filings: [], autoFire: null, recurringDue: [] });
   const [showNotifs, setShowNotifs] = useState(false);
+  // v1.10.86 - "New" dots on screens with new features (utils/attention.js
+  // NEW_IN), until each is opened once. A new install (no What's new seen,
+  // setup not done) starts with all of them seen.
+  const [newSeen, setNewSeen] = useState(() => {
+    let fresh = false;
+    try { fresh = !localStorage.getItem(WHATS_NEW_SEEN_KEY) && getPrintSettings().onboardingComplete !== true; } catch { /* storage blocked */ }
+    return readNewSeen(fresh);
+  });
+  useEffect(() => { setNewSeen(s => markNewSeen(s, currentView)); }, [currentView]);
 
   // v1.10.62 — reported (#53, @sangwanmail-eng): "Notifications should clear
   // after check."
@@ -169,6 +222,7 @@ function App() {
     lowStock: notifications.lowStock.map(p => `${p.id || p.name}:${p.stock ?? ''}`).sort().join('|'),
     filings: notifications.filings.map(f => f.label || f.id || String(f)).sort().join('|'),
     autoFire: notifications.autoFire?.count > 0 ? `autofire:${notifications.autoFire.count}` : '',
+    recurringDue: notifications.recurringDue.map(t => `${t.id}:${t.nextDate}`).sort().join('|'),
   }), [notifications]);
 
   // A section counts toward the badge only when it has content AND that
@@ -179,10 +233,11 @@ function App() {
     + (isLive('dueSoon') ? notifications.dueSoon.length : 0)
     + (isLive('lowStock') ? notifications.lowStock.length : 0)
     + (isLive('filings') ? notifications.filings.length : 0)
-    + (isLive('autoFire') ? 1 : 0);
+    + (isLive('autoFire') ? 1 : 0)
+    + (isLive('recurringDue') ? notifications.recurringDue.length : 0);
 
   // How many sections are currently showing something that could be cleared.
-  const dismissableCount = ['overdue', 'dueSoon', 'lowStock', 'filings', 'autoFire']
+  const dismissableCount = ['overdue', 'dueSoon', 'lowStock', 'filings', 'autoFire', 'recurringDue']
     .filter(isLive).length;
 
   const markAllNotifsRead = () => {
@@ -191,39 +246,31 @@ function App() {
     try { localStorage.setItem(DISMISS_KEY, JSON.stringify(next)); } catch { /* private mode */ }
   };
 
+  // v1.10.86 - the bell and the menu's red dots both come from findAttention
+  // (utils/attention.js). Looked at on start, on every screen change, a moment
+  // after a bill / product / template / purchase is saved, and every 10 min.
+  const profileRef = useRef(null);
+  profileRef.current = profile;
+  const profileKey = `${profile?.gstin || ''}|${profile?.businessName || ''}`;
   useEffect(() => {
     let cancelled = false;
+    let saveTimer = null;
     const compute = async () => {
       try {
-        const [bills, products, stockAlertCfg] = await Promise.all([
+        const [bills, products, stockAlertCfg, templates] = await Promise.all([
           getAllBills().catch(() => []),
           getAllProducts().catch(() => []),
           getStockAlertSettings().catch(() => ({ enabled: true, threshold: 5 })),
+          getAllRecurring().catch(() => []),
         ]);
         if (cancelled) return;
         // Local dates: toISOString() is UTC (yesterday in India until 05:30),
         // while the server stamps lastRecurringAutoFire with its local date.
         const today = localToday();
-        const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 3);
-        const tomorrowStr = toLocalIsoDate(tomorrow);
-        // v1.10.67 (#66 item 12) — never chase payment for a cancelled invoice;
-        // nor for a quotation, proforma, challan or credit note (countsAsSales).
-        const overdue = bills.filter(b => {
-          const d = b.data?.details?.dueDate;
-          return d && d < today && b.status !== 'paid' && countsAsSales(b);
+        const prof = profileRef.current;
+        const { overdue, dueSoon, lowStock, filings, recurringDue } = findAttention({
+          bills, products, stockCfg: stockAlertCfg, templates, profile: prof, filed: readFiledMarks(prof),
         });
-        const dueSoon = bills.filter(b => {
-          const d = b.data?.details?.dueDate;
-          return d && d >= today && d <= tomorrowStr && b.status !== 'paid' && countsAsSales(b);
-        });
-        // Honour the user's stock-alert preferences. When disabled, the filter
-        // returns nothing — bell badge drops to 0 for the stock category.
-        // When enabled, use the configured threshold (default 5).
-        const stockThreshold = Number(stockAlertCfg?.threshold ?? 5);
-        const lowStock = stockAlertCfg?.enabled === false
-          ? []
-          : products.filter(p => (p.stock ?? 999) <= stockThreshold);
-        const filings = getUpcomingFilings().filter(f => f.daysAway <= 10);
         // Recurring auto-fire breadcrumb — set by server.js processDueRecurring().
         // Only "fresh" (today's) auto-fires count as a notification; older ones
         // would otherwise stay sticky forever.
@@ -235,59 +282,39 @@ function App() {
             if (j.value && j.value.date === today && j.value.count > 0) autoFire = j.value;
           }
         } catch { /* fine */ }
-        setNotifications({ overdue, dueSoon, lowStock, filings, autoFire });
+        setNotifications({ overdue, dueSoon, lowStock, filings, autoFire, recurringDue });
       } catch { /* offline / server down — leave previous counts */ }
     };
     compute();
     const interval = setInterval(compute, 10 * 60 * 1000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [currentView]); // recompute on view change so the bell stays fresh after the user records a payment
+    // Not while an invoice is open: its auto-save would redraw the app
+    // between keystrokes. Leaving the editor looks again anyway.
+    const onSaved = () => { if (currentView === 'new') return; clearTimeout(saveTimer); saveTimer = setTimeout(compute, 1500); };
+    window.addEventListener(DATA_SAVED_EVENT, onSaved);
+    return () => { cancelled = true; clearInterval(interval); clearTimeout(saveTimer); window.removeEventListener(DATA_SAVED_EVENT, onSaved); };
+  }, [currentView, profileKey]); // recompute on view change so the bell stays fresh after the user records a payment
 
   // ---- Keyboard shortcuts + command palette ----
   // Ctrl+K opens a Spotlight-style command palette; Ctrl+N starts a new
   // invoice from anywhere; Ctrl+/ shows the full shortcuts list. Ctrl+S /
   // Ctrl+P live in InvoiceGenerator (they need invoice-form context). All
   // global handlers also accept Meta (⌘) for macOS users.
+  // v1.10.86 - the search itself (results, "How do I…", keyboard) is
+  // components/QuickSearch.jsx; it reads invoices, clients and products each
+  // time it opens.
   const [showPalette, setShowPalette] = useState(false);
-  const [paletteQuery, setPaletteQuery] = useState('');
-  const [paletteIdx, setPaletteIdx] = useState(0);
-  // v1.9.4 — pre-load searchable content so Ctrl+K acts as a true global
-  // search across invoices, clients, products, and settings sections.
-  // Small cost (fires once on mount + when palette opens); big UX win.
-  const [searchCorpus, setSearchCorpus] = useState({ bills: [], clients: [], products: [] });
-  useEffect(() => {
-    Promise.all([
-      getAllBills().catch(() => []),
-      getAllClients().catch(() => []),
-      getAllProducts().catch(() => []),
-    ]).then(([bills, clients, products]) => {
-      setSearchCorpus({
-        bills: bills.slice(0, 100),
-        clients: clients.slice(0, 200),
-        products: products.slice(0, 200),
-      });
-    });
-  }, [showPalette]); // refresh when palette opens
   const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
-
-  // Palette useMemo + dependent effects are declared further down, AFTER
-  // `navItems` and `handleNewInvoice` exist. Declaring them up here would
-  // throw "Cannot access 'X' before initialization" at render time because
-  // useMemo's dependency array is evaluated synchronously every render.
 
   // v1.10.69 - see runUpdateNow() in store.js for why this is no longer a link.
   const [updating, setUpdating] = useState(false);
+  // v1.10.86 - the progress window (UpdateOverlay) shows the steps and any
+  // error; on success the page reloads on the new version by itself.
   const handleUpdateNow = async () => {
     setUpdating(true);
-    toast('Updating… your data is backed up first. This takes about a minute.', 'info', 8000);
+    setShowUpdateModal(false);
     const result = await runUpdateNow();
     setUpdating(false);
-    if (result.ok) {
-      setShowUpdateModal(false);
-      toast('Update finished. Reload the page to use the new version.', 'success', 10000);
-    } else {
-      toast(`Update failed — ${result.error}`, 'error', 10000);
-    }
+    if (result.hint) toast(result.error, 'info', 10000);
   };
 
   const dismissUpdate = () => {
@@ -313,13 +340,19 @@ function App() {
 
     const checkServer = async () => {
       try {
-        const res = await fetch('/api/profile', { signal: AbortSignal.timeout(8000) });
-        if (res.ok) {
+        // v1.10.84 - is the app's server really running? A GET can be answered
+        // by the offline copy (the api-cache), so with the server stopped the
+        // app showed old data with a green "running" dot. HEAD reaches the
+        // server or fails.
+        const live = await fetch('/api/profile', { method: 'HEAD', cache: 'no-store', signal: AbortSignal.timeout(8000) });
+        if (live.ok) {
           if (cancelled) return;
           misses = 0;
           setServerDown(false);
           setServerStatus('online');
           if (!profileLoaded.current) {
+            const res = await fetch('/api/profile', { signal: AbortSignal.timeout(8000) });
+            if (!res.ok) throw new Error('not ok');
             profileLoaded.current = true;
             const p = await res.json();
             setProfile(p);
@@ -350,28 +383,10 @@ function App() {
     };
   }, []);
 
-  // Capture PWA install prompt. Banner re-appears 14 days after dismissal
-  // (was: dismissed forever — too aggressive, users who closed it during
-  // a busy moment never saw it again).
-  useEffect(() => {
-    const dismissedAt = localStorage.getItem('freegstbill_pwa_dismissed_at');
-    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
-      || window.navigator.standalone === true; // iOS Safari
-    if (isStandalone) return;
-    // 14-day cool-down on dismissal
-    if (dismissedAt) {
-      const days = (Date.now() - Number(dismissedAt)) / 86400000;
-      if (days < 14) return;
-    }
-
-    const handler = (e) => {
-      e.preventDefault();
-      deferredPrompt.current = e;
-      setShowInstallBanner(true);
-    };
-    window.addEventListener('beforeinstallprompt', handler);
-    return () => window.removeEventListener('beforeinstallprompt', handler);
-  }, []);
+  // v1.10.83 - the "Install as Desktop App" banner is gone. The browser icon
+  // it made opens only a browser window: it cannot start the app's server, so
+  // after a restart it showed "Needs a Quick Start". The installers' own
+  // Free GST Billing icon starts the server and opens the app.
 
   useEffect(() => {
     sessionStorage.setItem('gst_currentView', currentView);
@@ -390,14 +405,28 @@ function App() {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
     localStorage.setItem('freegstbill_theme', darkMode ? 'dark' : 'light');
+    // v1.10.85 - the Windows Setup's window turns its title bar dark too.
+    try { window.chrome?.webview?.postMessage(`theme:${darkMode ? 'dark' : 'light'}`); } catch { /* not the Setup's window */ }
   }, [darkMode]);
 
   // Load all saved business profiles
   useEffect(() => {
     if (serverStatus === 'online') {
-      getAllProfiles().then(setAllProfiles).catch(() => {});
+      getAllProfilesWithHidden().then(setAllProfiles).catch(() => {});
     }
+    // v1.10.85 (#125) - Settings hid or showed a company.
+    const reload = () => getAllProfilesWithHidden().then(setAllProfiles).catch(() => {});
+    window.addEventListener('fgsb:profiles-changed', reload);
+    return () => window.removeEventListener('fgsb:profiles-changed', reload);
   }, [serverStatus]);
+
+  // v1.10.85 - a save refused because the books are closed for its date:
+  // the server's reason, once, whatever screen it came from.
+  useEffect(() => {
+    const say = (e) => toast(e.detail?.error || 'The books are closed for that date (Settings -> Data).', 'error');
+    window.addEventListener('fgsb:period-locked', say);
+    return () => window.removeEventListener('fgsb:period-locked', say);
+  }, []);
 
   // Close profile menu on outside click
   useEffect(() => {
@@ -411,13 +440,48 @@ function App() {
     return () => document.removeEventListener('mousedown', handler);
   }, [showProfileMenu]);
 
+  // v1.10.85 (#125) - companies hidden behind their own PIN stay out of the
+  // list until it is typed; a switch elsewhere hides them again.
+  const shownProfiles = visibleProfiles(allProfiles);
+  const anyHidden = hasHiddenProfiles(allProfiles);
+  const openHidden = async () => {
+    setShowProfileMenu(false);
+    const pin = await promptAction({ title: 'Open a hidden company', message: 'Type the PIN of the company you want to open.', inputType: 'password', placeholder: '6 or 8 digits', confirmLabel: 'Open' });
+    if (!pin) return;
+    try {
+      const ids = await openHiddenCompanies(pin.trim());
+      const list = await getAllProfilesWithHidden();
+      setAllProfiles(list);
+      const first = visibleProfiles(list).find((p) => p.id === ids[0]);
+      if (first) await handleSwitchProfile(first);
+    } catch (e) {
+      toast(e?.body?.code === 'wait' ? `Too many wrong tries. Wait ${e.body.wait} seconds.` : 'That PIN does not open a company.', 'error');
+    }
+  };
+
   const handleSwitchProfile = async (bp) => {
+    hideCompaniesAgain(bp.id);
     setShowProfileMenu(false);
     const loaded = { ...bp };
     delete loaded.id;
+    delete loaded.hidden;
+    delete loaded.isActive;
     await saveProfile(loaded);
     setProfile(loaded);
   };
+
+  // A restart while a hidden company was open must not reopen it: move to the
+  // first company that is not hidden. Once, on the first list from the server
+  // (review: run on every switch, a stale `isActive` kept switching for ever).
+  const hiddenStartChecked = useRef(false);
+  useEffect(() => {
+    if (hiddenStartChecked.current || !allProfiles.length) return;
+    hiddenStartChecked.current = true;
+    if (!allProfiles.some((p) => p.hidden && p.isActive && !isOpenedHidden(p.id))) return;
+    const fallback = shownProfiles.find((p) => !p.hidden);
+    if (fallback) handleSwitchProfile(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allProfiles]);
 
   // v1.10.66 (#64 item 1) — identifies the active business for the screens
   // keyed on it below. GSTIN first, the same rule belongsToProfile() uses to
@@ -432,7 +496,8 @@ function App() {
   const [navOpen, setNavOpen] = useState(false);
   const closeNavAfterPick = (e) => {
     const picked = e.target.closest('button');
-    if (picked && !picked.classList.contains('profile-switcher-btn')) setNavOpen(false);
+    // v1.10.86 - nor opening / closing a menu group or arranging the menu.
+    if (picked && !picked.classList.contains('profile-switcher-btn') && !picked.hasAttribute('data-keep-open')) setNavOpen(false);
   };
 
   // v1.10.76 - a fresh editor for every invoice opened, so nothing (such as
@@ -452,6 +517,18 @@ function App() {
     sessionStorage.removeItem('gst_invoiceDraft');
     setEditingBill(null);
     setCurrentView('new');
+  };
+
+  // v1.10.86 - from a client's account: a new invoice with that client filled
+  // in (InvoiceGenerator picks it up once its defaults are loaded), and the
+  // payment receipt form opened for them.
+  const handleNewInvoiceFor = (client) => {
+    try { sessionStorage.setItem('gst_newInvoiceFor', JSON.stringify({ id: client?.id || '', name: client?.name || '' })); } catch { /* storage blocked */ }
+    handleNewInvoice();
+  };
+  const handleRecordPaymentFor = (clientName) => {
+    try { sessionStorage.setItem('gst_receiptFor', clientName || ''); } catch { /* storage blocked */ }
+    setCurrentView('receipts');
   };
 
   const handleEditInvoice = (bill) => {
@@ -480,31 +557,14 @@ function App() {
     setCurrentView('new');
   };
 
-  const handleInstallPWA = async () => {
-    if (!deferredPrompt.current) return;
-    deferredPrompt.current.prompt();
-    const result = await deferredPrompt.current.userChoice;
-    if (result.outcome === 'accepted') {
-      setShowInstallBanner(false);
-    }
-    deferredPrompt.current = null;
-  };
-
-  const dismissInstallBanner = () => {
-    setShowInstallBanner(false);
-    // Timestamp-based dismissal — the 14-day cool-down in the install-prompt
-    // effect uses this to decide whether to re-show. Old boolean key kept for
-    // back-compat with v1.6.0 — readers that find only the legacy key treat
-    // it as "permanently dismissed" (same as today's behaviour for them).
-    localStorage.setItem('freegstbill_pwa_dismissed_at', String(Date.now()));
-  };
-
-  const handleConvertToInvoice = (bill) => {
+  // v1.10.85 (#135) - also quotation -> sales order, and a sales order's
+  // challan / invoice (prepared by utils/salesOrders.js dispatchDraft).
+  const handleConvertToInvoice = (bill, type = 'tax-invoice') => {
     setEditorKey((k) => k + 1);
     sessionStorage.removeItem('gst_invoiceDraft');
     const clone = JSON.parse(JSON.stringify(bill));
     clone._isDuplicate = true;
-    clone._convertToType = 'tax-invoice';
+    clone._convertToType = clone._convertToType || type;
     setEditingBill(clone);
     setCurrentView('new');
   };
@@ -513,11 +573,24 @@ function App() {
   // when settings save, which triggers a re-render via the profile state.
   const enabledModules = getEnabledModules();
   const showIfModule = (moduleId) => isModuleEnabled(moduleId, enabledModules);
+  // v1.10.83 - a switch or a new order in Settings → Features redraws the
+  // sidebar straight away.
+  const [, setMenuTick] = useState(0);
+  useEffect(() => onMenuChanged(() => setMenuTick(t => t + 1)), []);
+  // v1.10.86 - "Customise menu" (the pencil at the top of the sidebar, or
+  // Settings -> Features). Items taken out there leave the sidebar only:
+  // navItems / bottomIds keep them, so Ctrl+K search still finds them.
+  const [showMenuEditor, setShowMenuEditor] = useState(false);
+  useEffect(() => onOpenCustomiseMenu(() => setShowMenuEditor(true)), []);
+  const menuHidden = hiddenItems(getMenuHidden());
+  // Sidebar items in the saved order; hidden ones dropped. `module: null`
+  // items (Settings, Support & About, Lock app) are always shown.
+  const menu = orderedMenu(getMenuOrder()).filter(m => !m.module || showIfModule(m.module));
 
   // If the user just disabled the module backing the current view, kick them to dashboard
   // so they don't land on an empty page after toggling.
   useEffect(() => {
-    const map = { new: 'invoicing', clients: 'clients', vendors: 'purchases', inventory: 'inventory', expenses: 'expenses', purchases: 'purchases', recurring: 'recurring', receipts: 'receipts', reports: 'reports', filing: 'gstReturns' };
+    const map = { new: 'invoicing', clients: 'clients', vendors: 'purchases', inventory: 'inventory', expenses: 'expenses', purchases: 'purchases', recurring: 'recurring', receipts: 'receipts', cashbook: 'cashBook', reports: 'reports', filing: 'gstReturns', incometax: 'incomeTax' };
     const moduleForView = map[currentView];
     if (moduleForView && !isModuleEnabled(moduleForView, enabledModules)) {
       setCurrentView('dashboard');
@@ -525,108 +598,128 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentView, JSON.stringify(enabledModules)]);
 
-  const navItems = [
-    { id: 'dashboard', icon: Home, label: 'Dashboard', module: 'dashboard' },
-    { id: 'new', icon: Plus, label: 'New Invoice', onClick: handleNewInvoice, module: 'invoicing' },
-    { id: 'clients', icon: Users, label: 'Clients & Vendors', module: 'clients' },
-    { id: 'inventory', icon: Package, label: 'Products', module: 'inventory' },
-    { id: 'expenses', icon: Wallet, label: 'Expenses', module: 'expenses' },
-    { id: 'purchases', icon: ShoppingCart, label: 'Purchases', module: 'purchases' },
-    { id: 'recurring', icon: RefreshCw, label: 'Recurring', module: 'recurring' },
-    { id: 'receipts', icon: Receipt, label: 'Receipts', module: 'receipts' },
-    { id: 'reports', icon: BarChart3, label: 'Reports', module: 'reports' },
-    { id: 'filing', icon: BookOpen, label: 'GST Returns', module: 'gstReturns' },
-    { id: 'incometax', icon: Calculator, label: 'Income Tax', module: 'incomeTax' },
+  // v1.10.83 - order, labels and switches come from MENU_ITEMS (utils.js);
+  // only the icons and click handlers live here.
+  const NAV_EXTRAS = {
+    dashboard: { icon: Home, label: 'Dashboard' },
+    new: { icon: Plus, label: 'New Invoice', onClick: handleNewInvoice },
+    clients: { icon: Users, label: 'Clients & Vendors' },
+    inventory: { icon: Package, label: 'Products' },
+    expenses: { icon: Wallet, label: 'Expenses' },
+    purchases: { icon: ShoppingCart, label: 'Purchases' },
+    recurring: { icon: RefreshCw, label: 'Recurring' },
+    receipts: { icon: Receipt, label: 'Receipts' },
+    cashbook: { icon: Banknote, label: 'Cash book' },
+    reports: { icon: BarChart3, label: 'Reports' },
+    filing: { icon: BookOpen, label: 'GST Returns' },
+    incometax: { icon: Calculator, label: 'Income Tax' },
     // v1.10.75 - opens the online documentation, which covers every screen
     // and stays current; the old built-in guide had fallen far behind.
-    { id: 'guide', icon: HelpCircle, label: 'User Guide', module: 'dashboard', onClick: openDocs }, // gated by dashboard so it's always available
-  ].filter(item => showIfModule(item.module));
-
-  // Command palette actions — declared here (not earlier) because the deps
-  // array references `navItems` and `handleNewInvoice`, which are consts.
-  // Reading a const before its declaration triggers a Temporal Dead Zone
-  // ReferenceError ("Cannot access 'X' before initialization") at runtime.
-  const paletteActions = useMemo(() => {
-    const acts = [
-      { label: 'New Invoice', hint: 'Ctrl+N', category: 'action', run: () => { handleNewInvoice(); } },
-    ];
-    navItems.forEach(item => {
-      if (item.id === 'new') return; // already covered above
-      acts.push({ label: `Go to ${item.label}`, hint: '', category: 'nav', run: item.onClick || (() => setCurrentView(item.id)) });
-    });
-    acts.push({ label: 'Go to Settings', hint: '', category: 'nav', run: () => setCurrentView('settings') });
-    // v1.10.74 - Control Panel has its own sidebar button but was missing here.
-    acts.push({ label: 'Go to Control Panel', hint: '', category: 'nav', run: () => setCurrentView('controlpanel') });
-    acts.push({ label: 'Go to Support & About', hint: '', category: 'nav', run: () => setCurrentView('support') });
-    acts.push({ label: 'Toggle dark mode', hint: '', category: 'action', run: () => setDarkMode(d => !d) });
-    acts.push({ label: 'Show keyboard shortcuts', hint: 'Ctrl+/', category: 'help', run: () => setShowShortcutsHelp(true) });
-    if (updateInfo?.updateAvailable) {
-      acts.push({ label: `View update — v${updateInfo.latest}`, hint: '', category: 'update', run: () => setShowUpdateModal(true) });
-    }
-    // v1.9.4 — cross-app search: invoices, clients, products
-    // v1.10.5 — audit H24 fix. Prior code dispatched
-    // `CustomEvent('fgsb-open-bill', { detail: b.id })` but no one
-    // listened for it — selecting an invoice in the palette silently
-    // dropped the ID and just landed on Dashboard. Now: reuse
-    // handleEditInvoice() directly, which is already the canonical way
-    // to open a bill for editing (works from Dashboard row-click too).
-    searchCorpus.bills.forEach(b => {
-      acts.push({
-        label: `📄 ${b.invoiceNumber || 'INV-?'} — ${b.clientName || 'No client'}`,
-        hint: b.invoiceDate ? new Date(b.invoiceDate).toLocaleDateString('en-IN') : '',
-        category: 'invoice',
-        run: () => handleEditInvoice(b),
-      });
-    });
-    searchCorpus.clients.forEach(c => {
-      acts.push({
-        label: `👤 ${c.name} — client${c.gstin ? ' · GSTIN: ' + c.gstin : ''}`,
-        hint: c.phone || c.email || '',
-        category: 'client',
-        run: () => setCurrentView('clients'),
-      });
-    });
-    searchCorpus.products.forEach(p => {
-      acts.push({
-        label: `📦 ${p.name} — product${p.hsn ? ' · HSN: ' + p.hsn : ''}`,
-        hint: (p.stock ?? 0) + ' in stock',
-        category: 'product',
-        run: () => setCurrentView('inventory'),
-      });
-    });
-    // Settings sections (jump to specific area)
-    // v1.10.74 - these all used to just open Settings at the top. Each now
-    // names its section id; after Settings mounts (it's lazy-loaded, so retry
-    // briefly) we click that section's "Jump to" chip, which already scrolls
-    // below the sticky bars.
-    const openSettingsAt = (sectionId) => {
-      setCurrentView('settings');
-      let tries = 0;
-      const jump = () => {
-        const chip = document.querySelector(`.settings-jumpnav a[href="#${sectionId}"]`);
-        if (chip && document.getElementById(sectionId)) chip.click();
-        else if (++tries < 30) setTimeout(jump, 100);
-      };
-      setTimeout(jump, 50);
-    };
-    const settingsJumps = [
-      ['Company profile', 'section-company'], ['Payment accounts', 'section-company'],
-      ['Print & PDF Settings', 'section-print'], ['PDF Style Editor', 'section-print'],
-      ['Business type presets', 'section-print'], ['Section labels', 'section-print'],
-      ['Watermarks', 'section-print'], ['Multi-copy print', 'section-print'],
-      ['Digital signature', 'section-company'], ['Company letterhead', 'section-print'],
-      ['Modules', 'section-modules'], ['Region preference', 'section-region'],
-      ['Google Drive backup', 'section-cloud'], ['App updates', 'section-updates'],
-    ];
-    settingsJumps.forEach(([s, sectionId]) => {
-      acts.push({ label: `⚙️ Settings → ${s}`, hint: '', category: 'settings', run: () => openSettingsAt(sectionId) });
-    });
-    return acts;
-  }, [navItems, updateInfo, handleNewInvoice, searchCorpus]);
-
-  const filteredPalette = paletteActions.filter(a =>
-    !paletteQuery.trim() || a.label.toLowerCase().includes(paletteQuery.toLowerCase())
+    guide: { icon: HelpCircle, label: 'User Guide', onClick: openDocs },
+  };
+  const navItems = menu.filter(m => m.section === 'main').map(m => ({ id: m.id, ...NAV_EXTRAS[m.id] }));
+  const bottomIds = menu.filter(m => m.section === 'bottom').map(m => m.id);
+  // v1.10.86 - red dots in the menu: the bell's live sections (so "Mark all
+  // as read" clears both), an update, and "New" on screens still in the menu.
+  // Only items that are switched on; one taken out of the menu shows on its
+  // group's header (SidebarMenu), and anything at all on the phone's ☰ button.
+  const shownIds = [...navItems.map(i => i.id), ...bottomIds];
+  const allDots = getMenuDots() ? menuDots(notifications, {
+    live: isLive, autoFire: notifications.autoFire,
+    update: updateBannerVisible ? updateInfo.latest : null,
+    unseenNew: Object.keys(NEW_IN.items).filter(id => !newSeen.includes(id) && !menuHidden.includes(id)),
+  }) : {};
+  const dots = Object.fromEntries(Object.entries(allDots).filter(([id]) => shownIds.includes(id)));
+  const anyDot = rollupDot(Object.keys(dots), dots);
+  // v1.10.86 - icons and names for the Customise menu window, as in the sidebar.
+  const menuExtras = { ...NAV_EXTRAS, support: { icon: Heart, label: 'Support & About' }, settings: { icon: Settings, label: 'Settings' } };
+  // v1.10.86 - a Settings tab / section from the sidebar (as openSettingsAt below).
+  const openSettingsSection = (sectionId) => {
+    try { sessionStorage.setItem('gst_settingsTab', sectionId); } catch { /* storage blocked */ }
+    setCurrentView('settings');
+    setTimeout(() => window.dispatchEvent(new CustomEvent('fgsb:settings-open', { detail: sectionId })), 80);
+  };
+  // v1.10.83 - small buttons at the top right of every screen (asked for:
+  // "dark mode button should be on top, not in the sidebar").
+  const topIds = menu.filter(m => m.section === 'top').map(m => m.id);
+  // v1.10.83 - the business's own name and logo at the top of the menu, when
+  // it says so (Settings → Branding, or the first-run setup).
+  // The profile comes from the server a moment after the first paint; until
+  // then the menu uses the name and logo it showed last time (kept in this
+  // browser), so a refresh does not flash "GST Billing" before the logo.
+  const brand = profile || menuBrandCache;
+  const ownBrand = !!brand?.showInMenu && !!String(brand?.businessName || '').trim();
+  // The window's title bar shows the page and the business, like a desktop
+  // program ("Invoices - Dice Codes"), not the long search-engine title.
+  const pageLabel = (NAV_EXTRAS[currentView] || menu.find(m => m.id === currentView))?.label;
+  const windowName = String(brand?.businessName || '').trim() || 'Free GST Billing';
+  // v1.10.84 - and says so when an update is waiting (the taskbar shows it too).
+  const updateNote = updateBannerVisible ? ` (update ${updateInfo.latest} available)` : '';
+  useEffect(() => {
+    document.title = (pageLabel ? `${pageLabel} - ${windowName}` : windowName) + updateNote;
+  }, [pageLabel, windowName, updateNote]);
+  // v1.10.86 - a search box you can see (it opens the Ctrl+K quick search);
+  // a search icon on a phone (CSS hides the words).
+  const openPalette = () => setShowPalette(true);
+  const searchBox = (
+    <button type="button" className="topbar-search" onClick={openPalette}
+      title="Search or jump to a page (Ctrl+K)" aria-label="Search or jump to a page (Ctrl+K)">
+      <Search size={16} />
+      {/* v1.10.86 - shorter: the page title and its buttons share this line now. */}
+      <span className="topbar-search-text">Search…</span>
+      <kbd className="topbar-search-kbd">Ctrl+K</kbd>
+    </button>
   );
+  // v1.10.86 - the page title and the page's buttons sit in the top bar, in
+  // these two boxes (components/PageHeader.jsx fills them). The bar steps down
+  // (search icon, then a ⋯ menu, then a second line) only when it must.
+  const [barTitleEl, setBarTitleEl] = useState(null);
+  const [barActionsEl, setBarActionsEl] = useState(null);
+  const barSlots = useMemo(() => (barTitleEl && barActionsEl ? { title: barTitleEl, actions: barActionsEl } : null), [barTitleEl, barActionsEl]);
+  const barRef = useRef(null);
+  useEffect(() => {
+    const bar = barRef.current;
+    if (!bar || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(() => fitPageBar(bar));
+    ro.observe(bar);
+    for (const el of bar.children) ro.observe(el); // the title and buttons change with the screen
+    return () => ro.disconnect();
+  }, [barTitleEl, barActionsEl]);
+  const topActions = topIds.map(id => ({
+    // v1.10.86 - Help (?) is a small menu: the user guide and the keyboard shortcuts.
+    guide: (
+      <ActionsMenu key={id} label="Help" icon={HelpCircle} iconSize={18} className="topbar-btn" items={[
+        { label: 'User guide (opens in your browser)', icon: BookOpen, onClick: openDocs },
+        { label: 'Keyboard shortcuts (Ctrl+/)', icon: Command, onClick: () => setShowShortcutsHelp(true) },
+      ]} />
+    ),
+    /* Opens the list of overdue / due-soon invoices, GST filing deadlines and
+       low-stock items, each a click away from the page that fixes it. */
+    notifications: (
+      <button key={id} type="button" className="topbar-btn" onClick={() => setShowNotifs(s => !s)}
+        title="Notifications" aria-label={notifTotal > 0 ? `Notifications: ${notifTotal}` : 'Notifications'}>
+        <Bell size={18} />
+        {notifTotal > 0 && <span className="topbar-badge">{notifTotal > 99 ? '99+' : notifTotal}</span>}
+      </button>
+    ),
+    /* v1.10.86 - the pairing QR code, or why it cannot be shown yet. */
+    phone: <PhonePairButton key={id} className="topbar-btn topbar-phone" onOpenSettings={() => {
+      try { sessionStorage.setItem('gst_settingsTab', 'section-phone'); } catch { /* storage blocked */ }
+      setCurrentView('settings');
+      setTimeout(() => window.dispatchEvent(new CustomEvent('fgsb:settings-open', { detail: 'section-phone' })), 80);
+    }} />,
+    /* v1.10.83 - Offline mode on / off, and what it changes. */
+    offline: <OfflineModeButton key={id} className="topbar-btn" onOpenSettings={() => {
+      try { sessionStorage.setItem('gst_settingsTab', 'section-privacy'); } catch { /* storage blocked */ }
+      setCurrentView('settings');
+    }} />,
+    darkMode: (
+      <button key={id} type="button" className="topbar-btn" onClick={() => setDarkMode(d => !d)}
+        title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'} aria-label={darkMode ? 'Light mode' : 'Dark mode'}>
+        {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+      </button>
+    ),
+  })[id]);
 
   // Global keyboard shortcuts. Lives down here for the same TDZ reason —
   // the handler closes over `handleNewInvoice` which is declared above only.
@@ -639,8 +732,6 @@ function App() {
       if (e.key === 'k' || e.key === 'K') {
         e.preventDefault();
         setShowPalette(p => !p);
-        setPaletteQuery('');
-        setPaletteIdx(0);
       } else if (e.key === '/') {
         e.preventDefault();
         setShowShortcutsHelp(s => !s);
@@ -707,30 +798,33 @@ function App() {
     return () => { observer.disconnect(); window.removeEventListener('keydown', onEsc); };
   }, [showPalette]);
 
-  // Palette-only arrow / Enter / Esc nav. Filtered list dep keeps the
-  // handler in sync with the user's current query.
-  useEffect(() => {
-    if (!showPalette) return;
-    const onKey = (e) => {
-      if (e.key === 'Escape') { e.preventDefault(); setShowPalette(false); return; }
-      if (e.key === 'ArrowDown') { e.preventDefault(); setPaletteIdx(i => Math.min(i + 1, filteredPalette.length - 1)); }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); setPaletteIdx(i => Math.max(i - 1, 0)); }
-      else if (e.key === 'Enter') {
-        e.preventDefault();
-        const action = filteredPalette[paletteIdx];
-        if (action) { action.run(); setShowPalette(false); }
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [showPalette, paletteIdx, filteredPalette]);
+  // v1.10.84 (maintainer, 7 Nov: "this window should never come") - inside the
+  // Windows Setup's own window (WebView2 gives every page window.chrome.webview)
+  // the window starts the app again by itself, and an update stops it for a
+  // moment. No instructions there: the start screen's look until it answers
+  // (the check below every 5 s brings the app back by itself). A browser or
+  // the ZIP's launcher still gets the Quick Start help.
+  if (serverDown && typeof window !== 'undefined' && window.chrome?.webview) {
+    return (
+      <div className="app-window-starting" role="status" aria-live="polite" style={{
+        position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', flexDirection: 'column',
+        alignItems: 'center', justifyContent: 'center', gap: '1rem',
+        background: darkMode ? '#0f172a' : '#f0f2f5', color: darkMode ? '#e2e8f0' : '#0f172a',
+      }}>
+        <img src="/icons/icon-192.png" alt="" width={72} height={72} onError={(e) => { e.currentTarget.style.display = 'none'; }} />
+        <h2 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600 }}>Free GST Billing</h2>
+        <div className="server-down-waiting"><div className="server-down-spinner" /><span>Starting again…</span></div>
+        <p style={{ position: 'absolute', bottom: 28, margin: 0, fontSize: '0.8rem', color: darkMode ? '#94a3b8' : '#64748b' }}>by DiceCodes</p>
+      </div>
+    );
+  }
 
   if (serverDown) {
     return (
       <div className="server-down-overlay">
         <div className="server-down-modal">
           <FileText size={48} color="#3b82f6" />
-          <h2>Free GST Billing Software Needs a Quick Start</h2>
+          <h2>Free GST Billing Software Needs a Quick Start <HelpButton title="Needs a Quick Start" doc="shortcuts#app-not-running" size={16} /></h2>
           <p>
             Your data is <strong>100% safe</strong> on your computer — nothing is lost.
             The app just needs to be started once.
@@ -746,9 +840,13 @@ function App() {
           <div className="server-down-steps">
             <p className="server-down-hint">How to start it:</p>
             <ol>
-              <li>Double-click <strong>Free GST Billing</strong> on your Desktop, then click <strong>Open App</strong></li>
+              <li>Double-click the <strong>Free GST Billing</strong> icon on your Desktop (the blue <strong>B</strong>)</li>
               <li>Or search <strong>"Free GST Billing"</strong> in the Start Menu</li>
             </ol>
+            {/* v1.10.83 - an icon made by the browser ("Install as Desktop App",
+                removed in this version) opens this window but cannot start the
+                app. Say so, or people keep clicking it. */}
+            <p className="server-down-hint">Opened this from a Chrome or Edge app icon? That icon cannot start the app. Use the Free GST Billing icon instead; you can remove the other one (right-click it, then Uninstall).</p>
           </div>
           <p className="server-down-safe">All your invoices, clients, and data are safely stored on your computer. They are never deleted or shared.</p>
           <div className="server-down-waiting">
@@ -767,61 +865,45 @@ function App() {
           if (p) setProfile(p);
           setShowWelcome(false);
         }} />
+        {/* v1.10.86 - mounted (and blocked) during the welcome so a new install
+            marks this version's slides as seen: none right after setup. */}
+        <WhatsNewAfterUpdate blocked />
         <ToastContainer />
         <ConfirmModalContainer />
       </>
     );
   }
 
-  // v1.10.33 — "Finish setup" bottom-right pill. Shown when the user
-  // hit Skip on the wizard (onboardingSkipped=true) so they can come
-  // back later without hunting through Settings. Hidden after they
-  // finish setup (finish() clears the flag) or if they explicitly said
-  // "None of these — I'll configure manually".
-  const showResumeSetupPill = (() => {
-    try {
-      const ps = getPrintSettings();
-      return !showWizard && ps.onboardingComplete === true && ps.onboardingSkipped === true;
-    } catch { return false; }
-  })();
-
   return (
     <div className={`app-layout${sidebarAutoHide ? ' sidebar-autohide' : ''}`}>
-      {showWizard && <SetupWizard onClose={() => setShowWizard(false)} />}
-      {showResumeSetupPill && (
-        <button type="button"
-          onClick={() => setShowWizard(true)}
-          title="Come back to the setup wizard — pick a business type, paper size, and language."
-          style={{
-            // Above the docked Save bar on Settings, so it never covers Save.
-            position: 'fixed', bottom: currentView === 'settings' ? '5.5rem' : '1.25rem', right: '1.25rem', zIndex: 9998,
-            padding: '0.6rem 1rem', borderRadius: 999,
-            background: 'var(--primary)', color: '#fff', border: 'none',
-            fontSize: '0.85rem', fontWeight: 600, cursor: 'pointer',
-            boxShadow: '0 6px 20px rgba(30,64,175,0.35), 0 2px 4px rgba(0,0,0,0.15)',
-            display: 'flex', alignItems: 'center', gap: '0.4rem',
-          }}>
-          ✨ Finish setup
-        </button>
-      )}
+      {/* v1.10.86 - "What's new" slides, once after an update (never during the
+          first-run welcome, which renders above instead of this layout). */}
+      <WhatsNewAfterUpdate blocked={showWelcome} />
       {/* v1.10.66 (#59) — phone-only top bar with the menu button. CSS hides it
           on wider screens, where the sidebar is always shown. */}
       <div className="mobile-topbar">
         <button type="button" className="mobile-topbar-btn" onClick={() => setNavOpen(true)}
-          aria-label="Open menu" aria-expanded={navOpen}>
+          aria-label={anyDot ? `Open menu: ${anyDot.text}` : 'Open menu'} title={anyDot?.text} aria-expanded={navOpen}>
           <Menu size={22} />
+          {/* v1.10.86 - a dot when something inside the menu has one. */}
+          <NavDot dot={anyDot} />
         </button>
         <span className="mobile-topbar-title">GST Billing</span>
         <span className="mobile-topbar-business">{profile?.businessName || ''}</span>
+        {searchBox}
+        {topActions}
       </div>
       {navOpen && <div className="sidebar-backdrop" onClick={() => setNavOpen(false)} aria-hidden="true" />}
       <div className={`sidebar${navOpen ? ' sidebar-open' : ''}`} onClick={closeNavAfterPick}>
         <div className="sidebar-brand">
-          <div className="sidebar-logo">
-            <FileText size={22} />
+          <div className={`sidebar-logo${ownBrand && brand.logo ? ' sidebar-logo-own' : ''}`}>
+            {ownBrand && brand.logo ? <img src={brand.logo} alt="" />
+              : ownBrand ? <span className="sidebar-logo-letter">{brand.businessName.trim().charAt(0).toUpperCase()}</span>
+                : <FileText size={22} />}
           </div>
-          <div>
-            <h2 className="sidebar-title">GST Billing</h2>
+          {/* "by DiceCodes" always stays, under their name too. */}
+          <div className="sidebar-brand-text">
+            <h2 className={`sidebar-title${ownBrand ? ' sidebar-title-own' : ''}`} title={ownBrand ? `${brand.businessName} - Free GST Billing` : undefined}>{ownBrand ? brand.businessName : 'GST Billing'}</h2>
             <p className="sidebar-subtitle">by DiceCodes</p>
           </div>
           {/* Auto-hide as a ☰ button (was a text checkbox): pressed = the menu
@@ -833,30 +915,38 @@ function App() {
             <Menu size={18} />
           </button>
         </div>
+        {/* v1.10.86 (maintainer) - the promise sits under the app name in the
+            menu, on every screen size (it was in the top bar). */}
+        <div className="sidebar-free-row">
+          <span className="topbar-free" title="Free forever: no paid version, no locked features, no ads, no tracking. Works on this computer, even offline.">Free forever</span>
+        </div>
 
         <div className="profile-switcher" ref={profileMenuRef} style={{ position: 'relative' }}>
           <div className="profile-switcher-row">
             <button
               className="profile-switcher-btn"
-              onClick={() => allProfiles.length > 1 && setShowProfileMenu(v => !v)}
-              title={allProfiles.length > 1 ? 'Switch business profile' : profile?.businessName || 'My Business'}
-              style={{ cursor: allProfiles.length > 1 ? 'pointer' : 'default' }}
+              onClick={() => setShowProfileMenu(v => !v)}
+              title={shownProfiles.length > 1 || anyHidden ? 'Switch business, or edit its details' : 'Edit business details'}
+              aria-haspopup="menu" aria-expanded={showProfileMenu}
             >
               <Building2 size={14} />
               <span className="profile-switcher-name">{profile?.businessName || 'My Business'}</span>
-              {allProfiles.length > 1 && <ChevronDown size={13} style={{ marginLeft: 'auto', opacity: 0.6 }} />}
+              {/* v1.10.86 - always opens: "Edit business details" is in it (the pencil is now Customise menu). */}
+              <ChevronDown size={13} style={{ marginLeft: 'auto', opacity: 0.6 }} />
             </button>
+            {/* v1.10.86 - opens Customise menu (was: edit the business, now in the list on the left). */}
             <button
+              type="button"
               className="profile-switcher-edit"
-              onClick={() => { setShowProfileMenu(false); setCurrentView('settings'); }}
-              title="Edit business profile"
+              onClick={() => { setShowProfileMenu(false); setShowMenuEditor(true); }}
+              title="Customise menu" aria-label="Customise menu"
             >
               <Pencil size={13} />
             </button>
           </div>
           {showProfileMenu && (
             <div className="profile-switcher-menu">
-              {allProfiles.map(bp => (
+              {shownProfiles.map(bp => (
                 <button
                   key={bp.id || bp.businessName}
                   className={`profile-switcher-item${bp.businessName?.trim().toLowerCase() === profile?.businessName?.trim().toLowerCase() ? ' active' : ''}`}
@@ -865,6 +955,17 @@ function App() {
                   {bp.businessName}
                 </button>
               ))}
+              <button
+                className="profile-switcher-item profile-switcher-details"
+                onClick={() => { setShowProfileMenu(false); openSettingsSection('section-company'); }}
+              >
+                <Pencil size={13} /> Edit business details
+              </button>
+              {anyHidden && (
+                <button className="profile-switcher-item profile-switcher-manage" onClick={openHidden}>
+                  Open a hidden company...
+                </button>
+              )}
               <button
                 className="profile-switcher-item profile-switcher-manage"
                 onClick={() => { setShowProfileMenu(false); setCurrentView('settings'); }}
@@ -876,15 +977,9 @@ function App() {
         </div>
 
         <nav className="sidebar-nav">
-          {navItems.map(item => (
-            <button
-              key={item.id}
-              className={`nav-btn ${currentView === item.id ? 'nav-btn-active' : ''}`}
-              onClick={item.onClick || (() => setCurrentView(item.id))}
-            >
-              <item.icon size={18} /> {item.label}
-            </button>
-          ))}
+          {/* v1.10.86 - in groups that open and close; arranged in Customise menu (the pencil). */}
+          <SidebarMenu items={navItems.filter(i => !menuHidden.includes(i.id))} currentView={currentView} dots={dots}
+            onPick={(item) => (item.onClick ? item.onClick() : setCurrentView(item.id))} />
           <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
             {/* Update-available banner — only shows when GitHub has a newer version
                 AND the user hasn't already dismissed THIS specific version. New
@@ -913,87 +1008,54 @@ function App() {
                 }} />
               </button>
             )}
-            {/* Notification bell — opens a popover listing overdue / due-soon
-                invoices, GST filing deadlines, and low-stock items. Each row
-                is a single click away from the page that fixes it. */}
-            <button
-              className="nav-btn"
-              onClick={() => setShowNotifs(s => !s)}
-              title="Notifications"
-              style={{ position: 'relative' }}
-            >
-              <Bell size={18} />
-              Notifications
-              {notifTotal > 0 && (
-                <span className="nav-badge" style={{
-                  position: 'absolute', top: '8px', right: '12px',
-                  minWidth: 18, height: 18, padding: '0 5px', borderRadius: '9px',
-                  background: 'var(--danger)', color: '#fff',
-                  fontSize: '0.65rem', fontWeight: 700,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                }}>{notifTotal > 99 ? '99+' : notifTotal}</span>
-              )}
-            </button>
-            {/* v1.10.80 (#98) - only when a PIN is set. */}
-            <LockButton className="nav-btn" label="Lock app" />
-            <button
-              className="nav-btn"
-              onClick={() => setDarkMode(!darkMode)}
-              title={darkMode ? 'Light Mode' : 'Dark Mode'}
-            >
-              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
-              {darkMode ? 'Light Mode' : 'Dark Mode'}
-            </button>
-            <button
-              className={`nav-btn nav-btn-support${currentView === 'support' ? ' nav-btn-support-active' : ''}`}
-              onClick={() => setCurrentView('support')}
-              title="Who makes this app, and how to help"
-            >
-              <Heart size={18} /> Support &amp; About
-            </button>
-            <button
-              className={`nav-btn ${currentView === 'controlpanel' ? 'nav-btn-active' : ''}`}
-              onClick={() => setCurrentView('controlpanel')}
-              title="Update, backup, restore, move to another PC"
-            >
-              <HardDrive size={18} /> Control Panel
-            </button>
-            <button
-              className={`nav-btn ${currentView === 'settings' ? 'nav-btn-active' : ''}`}
-              onClick={() => setCurrentView('settings')}
-              style={updateBannerVisible ? { position: 'relative' } : undefined}
-            >
-              <Settings size={18} /> Settings
-              {updateBannerVisible && (
-                <span className="nav-badge" style={{
-                  position: 'absolute', top: '8px', right: '12px',
-                  width: 8, height: 8, borderRadius: '50%',
-                  background: '#f59e0b',
-                }} title="Update available" />
-              )}
-            </button>
-            <div className={`server-status server-status-${serverStatus}`}>
-              <span className="server-status-dot" />
-              {serverStatus === 'online' ? 'App Ready' : serverStatus === 'offline' ? 'App Not Running' : 'Connecting...'}
-            </div>
+            {/* v1.10.83 - in the order chosen in Settings → Features; switched-off
+                ones are already left out of bottomIds. */}
+            {bottomIds.filter(id => !menuHidden.includes(id)).map(id => ({
+              support: (
+                <button key={id}
+                  className={`nav-btn nav-btn-support${currentView === 'support' ? ' nav-btn-support-active' : ''}`}
+                  onClick={() => setCurrentView('support')}
+                  title="Who makes this app, and how to help"
+                >
+                  <Heart size={18} /> Support &amp; About
+                </button>
+              ),
+              settings: (
+                <button key={id}
+                  className={`nav-btn ${currentView === 'settings' ? 'nav-btn-active' : ''}`}
+                  onClick={() => setCurrentView('settings')}
+                  title={dots.settings?.text}
+                >
+                  <Settings size={18} /> Settings
+                  {/* v1.10.86 - the menu's red dot (was an amber one, for updates only). */}
+                  <NavDot dot={dots.settings} />
+                </button>
+              ),
+            })[id])}
           </div>
         </nav>
       </div>
 
-      {showInstallBanner && (
-        <div className="pwa-install-banner">
-          <Download size={18} />
-          <span>
-            <strong>Install as Desktop App</strong> — own icon, no browser, opens instantly. Right-click the icon for quick-jump to New Invoice / GST Returns.
-          </span>
-          <button className="pwa-install-btn" onClick={handleInstallPWA}>Install App</button>
-          <button className="pwa-dismiss-btn" onClick={dismissInstallBanner} title="Remind me later (re-shows in 14 days)"><X size={16} /></button>
-        </div>
+      {/* v1.10.86 - outside the sidebar, so on a phone it is not inside the slide-in menu. */}
+      {showMenuEditor && (
+        <MenuCustomise extras={menuExtras} onClose={() => setShowMenuEditor(false)}
+          onOpenFeatures={() => { setShowMenuEditor(false); openSettingsSection('section-modules'); }} />
       )}
       <div className="main-content">
+        <div className="app-topbar" ref={barRef}>
+          <div className="page-bar-title" ref={setBarTitleEl} />
+          {searchBox}
+          <div className="page-bar-actions" ref={setBarActionsEl} />
+          <div className="topbar-global">{topActions}</div>
+        </div>
+        <PageBarSlots.Provider value={barSlots}>
+        {/* v1.10.83 - a screen that throws shows "ran into a problem" here
+            instead of blanking the app; keyed by screen so the sidebar works
+            and opening another screen starts clean. */}
+        <ErrorBoundary key={currentView} onHome={() => setCurrentView('dashboard')}>
         {currentView !== 'new' && <StarBanner />}
         {currentView === 'dashboard' && (
-          <Dashboard onNew={handleNewInvoice} onEdit={handleEditInvoice} onPrint={handlePrintInvoice} onDuplicate={handleDuplicateInvoice} onConvert={handleConvertToInvoice} onOpenProducts={() => setCurrentView('inventory')} onOpenSettings={() => setCurrentView('settings')} onOpenGuide={openDocs} onOpenSupport={() => setCurrentView('support')} activeProfile={profile} />
+          <Dashboard onNew={handleNewInvoice} onEdit={handleEditInvoice} onPrint={handlePrintInvoice} onDuplicate={handleDuplicateInvoice} onConvert={handleConvertToInvoice} onOpenProducts={() => setCurrentView('inventory')} onOpenPurchases={() => setCurrentView('purchases')} onOpenSettings={() => setCurrentView('settings')} onOpenGuide={openDocs} onOpenSupport={() => setCurrentView('support')} activeProfile={profile} />
         )}
         {currentView === 'new' && (
           <InvoiceGenerator
@@ -1007,15 +1069,20 @@ function App() {
         <Suspense fallback={<ViewLoading />}>
         {(currentView === 'clients' || currentView === 'vendors') && (
           <ClientsView
+            key={businessKey}
             initialTab={currentView === 'vendors' ? 'vendors' : 'clients'}
             onNew={handleNewInvoice}
+            onNewFor={handleNewInvoiceFor}
+            onRecordPayment={handleRecordPaymentFor}
             onEdit={handleEditInvoice}
             onDuplicate={handleDuplicateInvoice}
+            onPrint={handlePrintInvoice}
             onOpenPurchases={() => setCurrentView('purchases')}
           />
         )}
         {currentView === 'inventory' && (
-          <InventoryView />
+          // v1.10.83 (#115) - remounted per business, like the screens below, so its production list follows the switch.
+          <InventoryView key={businessKey} onOpenPurchases={() => setCurrentView('purchases')} />
         )}
         {/* v1.10.66 (#64 item 1) — `key={businessKey}` remounts these screens
             when the business changes. Each reads the business once when it
@@ -1026,7 +1093,7 @@ function App() {
           <ExpenseTracker key={businessKey} />
         )}
         {currentView === 'purchases' && (
-          <PurchaseBills key={businessKey} />
+          <PurchaseBills key={businessKey} onOpenGstReturns={() => setCurrentView('filing')} />
         )}
         {currentView === 'recurring' && (
           <RecurringInvoices key={businessKey} onEdit={handleEditInvoice} />
@@ -1034,11 +1101,14 @@ function App() {
         {currentView === 'receipts' && (
           <ReceiptVoucher key={businessKey} />
         )}
+        {currentView === 'cashbook' && (
+          <CashBook key={businessKey} onOpenView={setCurrentView} />
+        )}
         {currentView === 'reports' && (
           <ReportsView key={businessKey} />
         )}
         {currentView === 'filing' && (
-          <GSTReturns key={businessKey} />
+          <GSTReturns key={businessKey} onOpenPurchases={() => setCurrentView('purchases')} />
         )}
         {currentView === 'incometax' && (
           <IncomeTax key={businessKey} />
@@ -1046,15 +1116,14 @@ function App() {
         {currentView === 'settings' && (
           <SettingsView onSaved={(p) => setProfile(p)} />
         )}
-        {currentView === 'controlpanel' && (
-          <ControlPanel />
-        )}
         {currentView === 'support' && (
           <SupportView />
         )}
         </Suspense>
         {/* Version + DiceCodes line: Dashboard only, so it never takes space on working screens. */}
         {currentView === 'dashboard' && <AppFooter onOpenSupport={() => setCurrentView('support')} />}
+        </ErrorBoundary>
+        </PageBarSlots.Provider>
       </div>
 
       {/* Update modal — release notes + Export-backup-first nudge + Update Now */}
@@ -1064,7 +1133,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setShowNotifs(false)}>
           <div className="modal-content" style={{ maxWidth: '480px' }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-              <h3 className="section-title" style={{ margin: 0 }}>Notifications</h3>
+              <h3 className="section-title" style={{ margin: 0 }}>Notifications <HelpButton title="Notifications" doc="shortcuts#notifications" size={16} /></h3>
               <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
                 {/* v1.10.62 (#53) — clears everything currently shown. Each
                     section remembers exactly WHAT was cleared, so a genuinely
@@ -1096,6 +1165,18 @@ function App() {
                       <strong>{notifications.autoFire.count} recurring invoice{notifications.autoFire.count !== 1 ? 's' : ''} auto-generated today</strong>
                       <div style={{ fontSize: '0.72rem', opacity: 0.85, marginTop: '0.2rem' }}>
                         Check the Dashboard for the new bills · review and download PDFs as needed
+                      </div>
+                    </div>
+                  </button>
+                )}
+                {/* v1.10.86 - a due template the server did not make (the app was off, or it failed). */}
+                {isLive('recurringDue') && (
+                  <button type="button" className="notice notice-warn" onClick={() => { setShowNotifs(false); setCurrentView('recurring'); }} style={{ cursor: 'pointer', border: 'none', textAlign: 'left' }}>
+                    <span className="notice-icon">🔁</span>
+                    <div style={{ flex: 1 }}>
+                      <strong>{notifications.recurringDue.length} recurring invoice{notifications.recurringDue.length !== 1 ? 's' : ''} due to be made</strong>
+                      <div style={{ fontSize: '0.72rem', opacity: 0.85, marginTop: '0.2rem' }}>
+                        {notifications.recurringDue.slice(0, 3).map(t => t.clientName || 'No client').join(' · ')} · open Recurring and use Generate Now
                       </div>
                     </div>
                   </button>
@@ -1139,7 +1220,7 @@ function App() {
                     <div style={{ flex: 1 }}>
                       <strong>{notifications.lowStock.length} product{notifications.lowStock.length !== 1 ? 's' : ''} low on stock</strong>
                       <div style={{ fontSize: '0.72rem', opacity: 0.85, marginTop: '0.2rem' }}>
-                        {notifications.lowStock.slice(0, 3).map(p => `${p.name} (${p.stock} left)`).join(' · ')}
+                        {notifications.lowStock.slice(0, 3).map(p => `${p.name} (${trackedStock(p)} left)`).join(' · ')}
                       </div>
                     </div>
                   </button>
@@ -1150,48 +1231,15 @@ function App() {
         </div>
       )}
 
-      {/* Command palette — Ctrl/Cmd+K. Spotlight-style: type to filter actions,
-          ↑/↓ to navigate, Enter to run, Esc to close. */}
+      {/* Quick search - Ctrl/Cmd+K or the search box (v1.10.86: components/QuickSearch.jsx). */}
       {showPalette && (
-        <div className="modal-overlay" onClick={() => setShowPalette(false)}>
-          <div className="modal-content" style={{ maxWidth: '520px', padding: 0, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.75rem 1rem', borderBottom: '1px solid var(--border-color)' }}>
-              <Search size={16} style={{ color: 'var(--text-muted)' }} />
-              <input autoFocus type="text" placeholder="Type a command or page name…"
-                value={paletteQuery}
-                onChange={e => { setPaletteQuery(e.target.value); setPaletteIdx(0); }}
-                className="form-input" style={{ border: 0, background: 'transparent', flex: 1, fontSize: '0.95rem' }} />
-              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Esc</span>
-            </div>
-            <div style={{ maxHeight: '360px', overflowY: 'auto' }}>
-              {filteredPalette.length === 0 && (
-                <p style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '1.25rem', margin: 0, fontSize: '0.85rem' }}>
-                  Nothing matches "{paletteQuery}".
-                </p>
-              )}
-              {filteredPalette.map((a, i) => (
-                <button key={a.label} type="button"
-                  onClick={() => { a.run(); setShowPalette(false); }}
-                  onMouseEnter={() => setPaletteIdx(i)}
-                  style={{
-                    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                    width: '100%', padding: '0.6rem 1rem', border: 0, cursor: 'pointer',
-                    background: i === paletteIdx ? 'var(--bg-tertiary)' : 'transparent',
-                    color: 'var(--text-primary)', textAlign: 'left', fontSize: '0.88rem',
-                  }}>
-                  <span>{a.label}</span>
-                  {a.hint && <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{a.hint}</span>}
-                </button>
-              ))}
-            </div>
-            <div style={{ padding: '0.4rem 1rem', borderTop: '1px solid var(--border-color)', fontSize: '0.7rem', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span><Command size={11} style={{ verticalAlign: 'middle', marginRight: 4 }} />Ctrl+K to toggle · ↑↓ navigate · Enter run</span>
-              <button type="button" onClick={() => { setShowPalette(false); setShowShortcutsHelp(true); }} style={{ background: 'none', border: 0, color: 'var(--primary)', cursor: 'pointer', fontSize: '0.7rem' }}>
-                All shortcuts (Ctrl+/)
-              </button>
-            </div>
-          </div>
-        </div>
+        <Suspense fallback={null}>
+          <QuickSearch onClose={() => setShowPalette(false)}
+            navItems={navItems} topIds={topIds} updateInfo={updateInfo}
+            onNewInvoice={handleNewInvoice} onEditInvoice={handleEditInvoice} onView={setCurrentView}
+            onSettings={openSettingsSection} onDarkMode={() => setDarkMode(d => !d)}
+            onShortcuts={() => setShowShortcutsHelp(true)} onUpdate={() => setShowUpdateModal(true)} onOpenDocs={openDocs} />
+        </Suspense>
       )}
 
       {/* Keyboard-shortcuts help — Ctrl/Cmd+/. Single-pane reference. */}
@@ -1199,17 +1247,22 @@ function App() {
         <div className="modal-overlay" onClick={() => setShowShortcutsHelp(false)}>
           <div className="modal-content" style={{ maxWidth: '480px' }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-              <h3 className="section-title" style={{ margin: 0 }}>Keyboard Shortcuts</h3>
+              <h3 className="section-title" style={{ margin: 0 }}>Keyboard Shortcuts <HelpButton title="Keyboard shortcuts" doc="shortcuts#keyboard" size={16} /></h3>
               <button className="icon-btn" onClick={() => setShowShortcutsHelp(false)} title="Close"><X size={18} /></button>
             </div>
             <table className="kv-list">
               <tbody>
-                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>K</kbd></td><td>Open command palette (jump to any page)</td></tr>
-                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>N</kbd></td><td>New invoice</td></tr>
-                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>S</kbd></td><td>Save current invoice (when on the invoice form)</td></tr>
-                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>P</kbd></td><td>Download PDF (when on the invoice form)</td></tr>
+                {/* v1.10.86 - each one checked in the code: App.jsx (K, /, N, Shift+L)
+                    and InvoiceGenerator.jsx (S, P, Enter, Shift+D, Shift+F). */}
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>K</kbd></td><td>Search or jump to a page (the search box at the top)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>N</kbd></td><td>New invoice (when not typing in a box)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>S</kbd></td><td>Save the invoice (on New Invoice)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>P</kbd></td><td>Download the PDF (on New Invoice)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>Enter</kbd></td><td>Add an item row (on New Invoice)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>Shift</kbd>&nbsp;+&nbsp;<kbd>D</kbd></td><td>Copy the last item row (on New Invoice)</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>Shift</kbd>&nbsp;+&nbsp;<kbd>F</kbd></td><td>Hide or show the preview (on New Invoice)</td></tr>
                 <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>Shift</kbd>&nbsp;+&nbsp;<kbd>L</kbd></td><td>Lock the app (when a PIN is set)</td></tr>
-                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>/</kbd></td><td>Toggle this help</td></tr>
+                <tr><td><kbd>Ctrl</kbd>&nbsp;+&nbsp;<kbd>/</kbd></td><td>Show or hide this list</td></tr>
                 <tr><td><kbd>Esc</kbd></td><td>Close any open modal</td></tr>
               </tbody>
             </table>
@@ -1226,7 +1279,7 @@ function App() {
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '0.5rem', marginBottom: '0.5rem' }}>
               <div>
                 <h3 className="section-title" style={{ marginTop: 0, marginBottom: '0.25rem' }}>
-                  Update available — v{updateInfo.latest}
+                  Update available — v{updateInfo.latest} <HelpButton title="Updating the app" doc="update#update-window" size={16} />
                 </h3>
                 <p style={{ fontSize: '0.78rem', color: 'var(--text-muted)', margin: 0 }}>
                   You're on v{updateInfo.current}
@@ -1259,7 +1312,7 @@ function App() {
             <div className="notice notice-warn" style={{ marginBottom: '1rem' }}>
               <span className="notice-icon">💡</span>
               <div>
-                <strong>Recommended:</strong> export a backup before updating, just in case. <button type="button" className="btn-link" onClick={() => { setShowUpdateModal(false); setCurrentView('settings'); }} style={{ background: 'none', border: 0, color: 'var(--primary)', textDecoration: 'underline', cursor: 'pointer', font: 'inherit', padding: 0 }}>Open Settings → Data Management</button> and click <em>Export Backup…</em>.
+                <strong>Recommended:</strong> export a backup before updating, just in case. <button type="button" className="btn-link" onClick={() => { setShowUpdateModal(false); openSettingsSection('section-data'); }} style={{ background: 'none', border: 0, color: 'var(--primary)', textDecoration: 'underline', cursor: 'pointer', font: 'inherit', padding: 0 }}>Open Settings → Data &amp; Backups</button> and click <em>Export Backup…</em>.
               </div>
             </div>
 
@@ -1275,12 +1328,28 @@ function App() {
                   View on GitHub
                 </a>
               )}
-              <button type="button" className="btn btn-primary" disabled={updating} onClick={handleUpdateNow}>
-                <Download size={16} /> {updating ? 'Updating…' : 'Update Now'}
-              </button>
+              {/* The .deb, AppImage, Docker and Mac app copies update by installing the new package (server.js updateHint). */}
+              {updateInfo.downloadUrl && (
+                <a href={updateInfo.downloadUrl} target="_blank" rel="noopener noreferrer" className="btn btn-primary" style={{ textDecoration: 'none' }}>
+                  <Download size={16} /> Download the new Mac app
+                </a>
+              )}
+              {!updateInfo.updateHint && (
+                <button type="button" className="btn btn-primary" disabled={updating} onClick={handleUpdateNow}>
+                  <Download size={16} /> {updating ? 'Updating…' : 'Update Now'}
+                </button>
+              )}
             </div>
+            {!notifyAsked && canAskToNotify() && (
+              <p style={{ fontSize: '0.78rem', marginTop: '0.6rem', marginBottom: 0 }}>
+                <button type="button" className="btn-link" onClick={() => { setNotifyAsked(true); askToNotify(updateInfo.latest); }}
+                  style={{ background: 'none', border: 0, color: 'var(--primary)', textDecoration: 'underline', cursor: 'pointer', font: 'inherit', padding: 0 }}>
+                  Tell me with a Windows notification when the next update comes out
+                </button>
+              </p>
+            )}
             <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '0.6rem', marginBottom: 0 }}>
-              <em>Update Now</em> backs up your data, then fetches the newest release. It takes about a minute — leave this window open, then reload the page when it finishes.
+              {updateInfo.updateHint || <><em>Update Now</em> backs up your data, then fetches the newest release. It takes about a minute — leave this window open; the app opens again on the new version by itself.</>}
             </p>
           </div>
         </div>
@@ -1288,6 +1357,7 @@ function App() {
 
       <ToastContainer />
       <ConfirmModalContainer />
+      <UpdateOverlay />
     </div>
   );
 }
