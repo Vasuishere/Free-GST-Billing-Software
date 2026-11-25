@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
-import { Users, Search, FileText, ChevronDown, ChevronUp, Trash2, X, MessageCircle, Mail, Plus, Edit3, Copy, Upload, Download } from 'lucide-react';
+import { Users, Building2, Search, FileText, ChevronDown, ChevronUp, Trash2, X, MessageCircle, Mail, Plus, Edit3, Copy, Upload, Download } from 'lucide-react';
 import HelpButton from './HelpButton';
+import VendorsView from './VendorsView';
 import { getAllClients, getAllBills, deleteClient, saveClient, deleteBill, saveBill, getProfile, deleteReceipt, applyStockChanges, trashSavedPdf } from '../store';
 import { formatCurrency, INVOICE_TYPES, markPaidPatch, markUnpaidPatch, salesSign, countsAsSales, isCancelledBill, amountDue, localToday, parseLocalDate, appliedStock, stockDelta } from '../utils';
 import { getPrintSettings } from '../utils/printSettings';
@@ -35,7 +36,11 @@ const STATUS_COLORS = {
   cancelled: { label: 'Cancelled', color: '#64748b', bg: '#f1f5f9' },
 };
 
-export default function ClientsView({ onEdit, onDuplicate, onNew }) {
+export default function ClientsView({ onEdit, onDuplicate, onNew, onOpenPurchases, initialTab = 'clients' }) {
+  const [activeTab, setActiveTab] = useState(initialTab);
+  useEffect(() => {
+    setActiveTab(initialTab);
+  }, [initialTab]);
   const [clients, setClients] = useState([]);
   const [bills, setBills] = useState([]);
   const [search, setSearch] = useState('');
@@ -695,10 +700,22 @@ export default function ClientsView({ onEdit, onDuplicate, onNew }) {
         await saveClient({
           name,
           address: row.address || '',
+          city: row.city || '',
+          pin: row.pin || '',
           state: row.state || '',
+          country: row.country || profileCountry || '',
           gstin: row.gstin || '',
           email: row.email || '',
           phone: row.phone || '',
+          billingAddress: {
+            address: row.address || '',
+            city: row.city || '',
+            pin: row.pin || '',
+            state: row.state || '',
+            country: row.country || profileCountry || 'India',
+          },
+          shippingAddresses: [],
+          _v: 2,
         });
         imported++;
       }
@@ -756,33 +773,69 @@ export default function ClientsView({ onEdit, onDuplicate, onNew }) {
       <div className="page-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           <div>
-            <h1 className="page-title">Clients</h1>
-            <p className="page-subtitle">Client-wise invoice ledger and outstanding</p>
+            <h1 className="page-title">{activeTab === 'vendors' ? 'Vendors & Suppliers' : 'Clients'}</h1>
+            <p className="page-subtitle">
+              {activeTab === 'vendors'
+                ? 'Vendor onboarding, overdue payables, and purchase bill history'
+                : 'Client-wise invoice ledger and outstanding'}
+            </p>
           </div>
-          <HelpButton title="Clients — how to use" doc="clients">
-            <ul style={{ paddingLeft: '1.1rem', margin: 0 }}>
-              <li><strong>Click a client name</strong> to see every invoice, payment, and credit note in one place.</li>
-              <li><strong>Statement PDF</strong> — a full account ledger with running balance. Send it when a client disputes a bill.</li>
-              <li><strong>Aging PDF</strong> — outstanding invoices bucketed by 0-30 / 31-60 / 61-90 / 90+ days. Use it for collection calls.</li>
-              <li><strong>Aging strip</strong> — the same buckets inline so you can see who's slow to pay at a glance.</li>
-              <li><strong>Import CSV</strong> — bulk-load clients from a spreadsheet (columns: name, address, state, gstin, email, phone). To back up clients, use Settings → Data Management → Export Backup.</li>
-              <li><strong>WhatsApp / Email</strong> — quick outreach without leaving the app.</li>
-            </ul>
-          </HelpButton>
+          {activeTab === 'clients' && (
+            <HelpButton title="Clients — how to use" doc="clients">
+              <ul style={{ paddingLeft: '1.1rem', margin: 0 }}>
+                <li><strong>Click a client name</strong> to see every invoice, payment, and credit note in one place.</li>
+                <li><strong>Statement PDF</strong> — a full account ledger with running balance. Send it when a client disputes a bill.</li>
+                <li><strong>Aging PDF</strong> — outstanding invoices bucketed by 0-30 / 31-60 / 61-90 / 90+ days. Use it for collection calls.</li>
+                <li><strong>Aging strip</strong> — the same buckets inline so you can see who's slow to pay at a glance.</li>
+                <li><strong>Import CSV</strong> — bulk-load clients from a spreadsheet (columns: name, address, state, gstin, email, phone). To back up clients, use Settings → Data Management → Export Backup.</li>
+                <li><strong>WhatsApp / Email</strong> — quick outreach without leaving the app.</li>
+              </ul>
+            </HelpButton>
+          )}
         </div>
-        <div className="flex gap-2">
-          <input type="file" accept=".csv" ref={csvInputRef} style={{ display: 'none' }} onChange={handleCSVImport} />
-          <button className="btn btn-secondary" onClick={() => csvInputRef.current?.click()}>
-            <Upload size={16} /> Import CSV
-          </button>
-          <button className="btn btn-secondary" onClick={() => openAddClient()}>
-            <Plus size={18} /> Add Client
-          </button>
-          <button className="btn btn-primary" onClick={onNew}>
-            <FileText size={18} /> New Invoice
-          </button>
-        </div>
+        {activeTab === 'clients' && (
+          <div className="flex gap-2">
+            <input type="file" accept=".csv" ref={csvInputRef} style={{ display: 'none' }} onChange={handleCSVImport} />
+            <button className="btn btn-secondary" onClick={() => csvInputRef.current?.click()}>
+              <Upload size={16} /> Import CSV
+            </button>
+            <button className="btn btn-secondary" onClick={() => openAddClient()}>
+              <Plus size={18} /> Add Client
+            </button>
+            <button className="btn btn-primary" onClick={onNew}>
+              <FileText size={18} /> New Invoice
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Tabs: Clients | Vendors */}
+      <div
+        className="glass-panel mb-6"
+        style={{ display: 'inline-flex', gap: '0.35rem', padding: '0.35rem', borderRadius: 10 }}
+      >
+        <button
+          type="button"
+          className={`btn ${activeTab === 'clients' ? 'btn-primary' : 'btn-secondary'}`}
+          style={{ fontSize: '0.85rem', padding: '0.45rem 1rem' }}
+          onClick={() => setActiveTab('clients')}
+        >
+          <Users size={16} /> Clients
+        </button>
+        <button
+          type="button"
+          className={`btn ${activeTab === 'vendors' ? 'btn-primary' : 'btn-secondary'}`}
+          style={{ fontSize: '0.85rem', padding: '0.45rem 1rem' }}
+          onClick={() => setActiveTab('vendors')}
+        >
+          <Building2 size={16} /> Vendors &amp; Suppliers
+        </button>
+      </div>
+
+      {activeTab === 'vendors' ? (
+        <VendorsView embedded onOpenPurchases={onOpenPurchases} />
+      ) : (
+        <>
 
       {/* Add/Edit Client Modal */}
       <ClientModal show={showForm} onClose={closeForm} onSave={handleModalSave} client={modalClient} isEditing={!!editingClientId} defaultCountry={profileCountry} />
@@ -903,15 +956,29 @@ export default function ClientsView({ onEdit, onDuplicate, onNew }) {
                     })()}
 
                     {/* Client details */}
-                    {savedClient && (savedClient.address || savedClient.city || savedClient.email || savedClient.phone) && (
-                      <div style={{ padding: '0.75rem 1.5rem', borderBottom: '1px solid var(--border)', display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                        {(savedClient.address || savedClient.city || savedClient.pin) && (
-                          <span>{[savedClient.address, savedClient.city, savedClient.pin].filter(Boolean).join(', ')}</span>
-                        )}
-                        {savedClient.email && <span>{savedClient.email}</span>}
-                        {savedClient.phone && <span>{savedClient.phone}</span>}
-                      </div>
-                    )}
+                    {savedClient && (() => {
+                      const ba = savedClient.billingAddress || savedClient;
+                      const shipList = Array.isArray(savedClient.shippingAddresses) ? savedClient.shippingAddresses : [];
+                      const defShip = shipList.find((a) => a.isDefault) || shipList[0];
+                      const hasBilling = ba.address || ba.city || ba.pin;
+                      if (!hasBilling && !savedClient.email && !savedClient.phone && shipList.length === 0) return null;
+                      return (
+                        <div style={{ padding: '0.75rem 1.5rem', borderBottom: '1px solid var(--border)', display: 'flex', gap: '1.5rem', flexWrap: 'wrap', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                          {hasBilling && (
+                            <span><strong>Billing:</strong> {[ba.address, ba.city, ba.pin].filter(Boolean).join(', ')}</span>
+                          )}
+                          {shipList.length > 0 && (
+                            <span>
+                              <strong>Shipping ({shipList.length}):</strong>{' '}
+                              {defShip?.label ? `${defShip.label} — ` : ''}
+                              {[defShip?.address, defShip?.city, defShip?.pin].filter(Boolean).join(', ') || 'Configured'}
+                            </span>
+                          )}
+                          {savedClient.email && <span>{savedClient.email}</span>}
+                          {savedClient.phone && <span>{savedClient.phone}</span>}
+                        </div>
+                      );
+                    })()}
                     {clientBills.length === 0 ? (
                       <div style={{ padding: '1.5rem', textAlign: 'center' }}>
                         <p className="text-muted" style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>No invoices for this client yet.</p>
@@ -1007,6 +1074,8 @@ export default function ClientsView({ onEdit, onDuplicate, onNew }) {
             );
           })}
         </div>
+      )}
+        </>
       )}
     </div>
   );

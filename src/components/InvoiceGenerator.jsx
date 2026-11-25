@@ -1503,18 +1503,40 @@ export default function InvoiceGenerator({ onBack, profile: profileProp, editing
     // and silently dropped country/email/phone/isSEZ. Consequence: loading
     // an SEZ client via auto-complete cleared the SEZ flag, so the invoice
     // computed CGST+SGST instead of IGST → wrong tax on the filed return.
+    const ba = cli.billingAddress || cli;
     setClient({
       name: cli.name || '',
-      address: cli.address || '',
-      city: cli.city || '',
-      pin: cli.pin || '',
-      state: cli.state || '',
+      address: ba.address || cli.address || '',
+      city: ba.city || cli.city || '',
+      pin: ba.pin || cli.pin || '',
+      state: ba.state || cli.state || '',
       gstin: cli.gstin || '',
-      country: cli.country || '',
+      country: ba.country || cli.country || '',
       email: cli.email || '',
       phone: cli.phone || '',
       isSEZ: !!cli.isSEZ,
     });
+    const shippingList = Array.isArray(cli.shippingAddresses) ? cli.shippingAddresses : [];
+    const defaultShip = shippingList.find((a) => a.isDefault) || shippingList[0];
+    if (defaultShip) {
+      setDetails((prev) => ({
+        ...prev,
+        shipToSameAsBilling: false,
+        shippingAddress: defaultShip.address || '',
+        shippingCity: defaultShip.city || '',
+        shippingPin: defaultShip.pin || '',
+        shippingState: defaultShip.state || '',
+      }));
+    } else {
+      setDetails((prev) => ({
+        ...prev,
+        shipToSameAsBilling: true,
+        shippingAddress: '',
+        shippingCity: '',
+        shippingPin: '',
+        shippingState: '',
+      }));
+    }
     setSelectedClientId(cli.id);
     setShowClientSuggestions(false);
     // v1.9.1 — auto-apply per-client print preferences (if set on the client
@@ -1582,18 +1604,31 @@ export default function InvoiceGenerator({ onBack, profile: profileProp, editing
     setSavedClients(updated);
     // Sync the invoice form with the FULL saved record — dropping
     // country/email/phone/isSEZ here was the SEZ tax bug.
+    const ba = data.billingAddress || data;
     setClient({
       name: data.name || '',
-      address: data.address || '',
-      city: data.city || '',
-      pin: data.pin || '',
-      state: data.state || '',
+      address: ba.address || data.address || '',
+      city: ba.city || data.city || '',
+      pin: ba.pin || data.pin || '',
+      state: ba.state || data.state || '',
       gstin: data.gstin || '',
-      country: data.country || '',
+      country: ba.country || data.country || '',
       email: data.email || '',
       phone: data.phone || '',
       isSEZ: !!data.isSEZ,
     });
+    const shippingList = Array.isArray(data.shippingAddresses) ? data.shippingAddresses : [];
+    const defaultShip = shippingList.find((a) => a.isDefault) || shippingList[0];
+    if (defaultShip) {
+      setDetails((prev) => ({
+        ...prev,
+        shipToSameAsBilling: false,
+        shippingAddress: defaultShip.address || '',
+        shippingCity: defaultShip.city || '',
+        shippingPin: defaultShip.pin || '',
+        shippingState: defaultShip.state || '',
+      }));
+    }
     if (isEditingClient && modalClient?.id) {
       setSelectedClientId(modalClient.id);
       toast(`Client "${data.name}" updated!`, 'success');
@@ -4260,8 +4295,42 @@ export default function InvoiceGenerator({ onBack, profile: profileProp, editing
                     style={{ width: 16, height: 16, accentColor: 'var(--primary)' }} />
                   <span><strong>Ship to</strong> same as bill-to address</span>
                 </label>
-                {details.shipToSameAsBilling === false && (
+                {details.shipToSameAsBilling === false && (() => {
+                  const activeClient = savedClients.find(
+                    (c) => (selectedClientId && c.id === selectedClientId) || (client.name && c.name === client.name)
+                  );
+                  const savedShipping = Array.isArray(activeClient?.shippingAddresses) ? activeClient.shippingAddresses : [];
+                  return (
                   <div className="grid grid-cols-2 gap-3" style={{ marginTop: '0.6rem' }}>
+                    {savedShipping.length > 0 && (
+                      <div className="form-group full-width">
+                        <label className="form-label" style={{ fontSize: '0.78rem' }}>Saved Shipping Addresses</label>
+                        <select
+                          className="form-input"
+                          value=""
+                          onChange={(e) => {
+                            const addr = savedShipping.find((a) => a.id === e.target.value);
+                            if (addr) {
+                              setDetails((prev) => ({
+                                ...prev,
+                                shippingAddress: addr.address || '',
+                                shippingCity: addr.city || '',
+                                shippingPin: addr.pin || '',
+                                shippingState: addr.state || '',
+                              }));
+                            }
+                          }}
+                        >
+                          <option value="">— Pick a saved shipping address —</option>
+                          {savedShipping.map((a, idx) => (
+                            <option key={a.id || idx} value={a.id}>
+                              {a.label || [a.address, a.city].filter(Boolean).join(', ') || `Shipping #${idx + 1}`}
+                              {a.isDefault ? ' ★' : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                     <div className="form-group full-width">
                       <label className="form-label" style={{ fontSize: '0.78rem' }}>Shipping Address</label>
                       <textarea className="form-input" rows={2} value={details.shippingAddress || ''}
@@ -4297,7 +4366,8 @@ export default function InvoiceGenerator({ onBack, profile: profileProp, editing
                       })()}
                     </div>
                   </div>
-                )}
+                  );
+                })()}
               </div>
 
               {/* v1.10.73 - order, dispatch and reference details: the boxes on a

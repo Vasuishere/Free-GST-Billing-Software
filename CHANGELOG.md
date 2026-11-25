@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.10.83] - unreleased
+
+### Added
+- **Supporters list with amounts:** Support & About shows "Thank you to our
+  N supporters - see all"; one click opens the full list with each name, the
+  amount and the date, newest first, with a search once the list is long.
+- **Signature and stamp layout** (#117, thanks @CamClinic): Settings →
+  Business Profile → *Signature and stamp layout*: side by side, the stamp
+  above the signature, or the stamp on the signature, with a preview. Every
+  invoice design follows it.
+
+### Changed
+- **Purchases show CGST + SGST** (#117): the purchase form shows the tax split
+  as you type (IGST for an inter-state bill), and the purchase register export
+  has CGST, SGST and IGST columns instead of one tax column. CGST and SGST
+  always add up to the tax exactly.
+
+---
+
 ## [1.10.82] - 2026-10-29
 
 **Mac: the launcher opens again (#120).** A quick fix, released straight away
@@ -27,8 +46,11 @@ because Mac users could not start the app at all.
 3. The first time, macOS may say it "cannot be opened because Apple cannot
    check it". **Hold Control, click the file, choose Open, then Open again.**
    Only once.
-4. If you are updating, copy the new files over your old Free-GST-Billing
-   folder (keep the `_system/data` folder), or run **Update** from the app.
+4. Already using the app on this Mac? Use the **Update** button in the app
+   instead. **Never drag the new folder over the old one on a Mac**: Finder's
+   Replace swaps the whole folder, including `_system/data` with your
+   invoices. Step-by-step:
+   [Updating on a Mac](https://dicecodes.com/free-gst-software-documentation/update.html#mac).
 
 #### Windows (1.10.73 and later)
 Click **Update to v1.10.82** in the sidebar, or **Settings → App Updates →

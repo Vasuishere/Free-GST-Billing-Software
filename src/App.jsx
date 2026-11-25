@@ -72,7 +72,7 @@ function App() {
       const params = new URLSearchParams(window.location.search);
       const v = params.get('view');
       // v1.10.74 - 'controlpanel' added so ?view=controlpanel deep links work too.
-      const valid = ['dashboard', 'new', 'clients', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'reports', 'filing', 'incometax', 'settings', 'controlpanel', 'support'];
+      const valid = ['dashboard', 'new', 'clients', 'vendors', 'inventory', 'expenses', 'purchases', 'recurring', 'receipts', 'reports', 'filing', 'incometax', 'settings', 'controlpanel', 'support'];
       if (v && valid.includes(v)) {
         // Strip the query string so a refresh doesn't keep snapping back to
         // the shortcut target — only the *first* navigation honours it.
@@ -517,7 +517,7 @@ function App() {
   // If the user just disabled the module backing the current view, kick them to dashboard
   // so they don't land on an empty page after toggling.
   useEffect(() => {
-    const map = { new: 'invoicing', clients: 'clients', inventory: 'inventory', expenses: 'expenses', purchases: 'purchases', recurring: 'recurring', receipts: 'receipts', reports: 'reports', filing: 'gstReturns' };
+    const map = { new: 'invoicing', clients: 'clients', vendors: 'purchases', inventory: 'inventory', expenses: 'expenses', purchases: 'purchases', recurring: 'recurring', receipts: 'receipts', reports: 'reports', filing: 'gstReturns' };
     const moduleForView = map[currentView];
     if (moduleForView && !isModuleEnabled(moduleForView, enabledModules)) {
       setCurrentView('dashboard');
@@ -528,7 +528,7 @@ function App() {
   const navItems = [
     { id: 'dashboard', icon: Home, label: 'Dashboard', module: 'dashboard' },
     { id: 'new', icon: Plus, label: 'New Invoice', onClick: handleNewInvoice, module: 'invoicing' },
-    { id: 'clients', icon: Users, label: 'Clients', module: 'clients' },
+    { id: 'clients', icon: Users, label: 'Clients & Vendors', module: 'clients' },
     { id: 'inventory', icon: Package, label: 'Products', module: 'inventory' },
     { id: 'expenses', icon: Wallet, label: 'Expenses', module: 'expenses' },
     { id: 'purchases', icon: ShoppingCart, label: 'Purchases', module: 'purchases' },
@@ -1005,8 +1005,14 @@ function App() {
         {/* v1.10.4 — All lazy views under one Suspense boundary. Only the
              matched view's chunk actually loads; others stay unfetched. */}
         <Suspense fallback={<ViewLoading />}>
-        {currentView === 'clients' && (
-          <ClientsView onNew={handleNewInvoice} onEdit={handleEditInvoice} onDuplicate={handleDuplicateInvoice} />
+        {(currentView === 'clients' || currentView === 'vendors') && (
+          <ClientsView
+            initialTab={currentView === 'vendors' ? 'vendors' : 'clients'}
+            onNew={handleNewInvoice}
+            onEdit={handleEditInvoice}
+            onDuplicate={handleDuplicateInvoice}
+            onOpenPurchases={() => setCurrentView('purchases')}
+          />
         )}
         {currentView === 'inventory' && (
           <InventoryView />

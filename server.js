@@ -90,7 +90,7 @@ app.use((req, res, next) => {
 });
 
 // Ensure data directory and sub-directories exist
-const DIRS = ['bills', 'clients', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases'];
+const DIRS = ['bills', 'clients', 'vendors', 'templates', 'products', 'expenses', 'recurring', 'receipts', 'profiles', 'purchases'];
 for (const dir of DIRS) {
   const dirPath = path.join(DATA_DIR, dir);
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
@@ -340,15 +340,41 @@ app.post('/api/profile', (req, res) => {
 // ========================
 // CLIENTS
 // ========================
+/** Ensure a client record uses the v2 multi-address shape without mutating disk until saved. */
+function normaliseClientRecord(c) {
+  if (!c || c._v >= 2) return c;
+  const billingAddress = c.billingAddress || {
+    address: c.address || '',
+    city: c.city || '',
+    pin: c.pin || '',
+    state: c.state || '',
+    country: c.country || 'India',
+  };
+  return {
+    ...c,
+    billingAddress,
+    shippingAddresses: Array.isArray(c.shippingAddresses) ? c.shippingAddresses : [],
+    _v: 2,
+  };
+}
+
 app.get('/api/clients', (req, res) => {
-  const clients = readAllFromDir('clients');
+  const clients = readAllFromDir('clients').map(normaliseClientRecord);
   clients.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   res.json(clients);
 });
 
 app.post('/api/clients', (req, res) => {
-  const client = req.body;
+  const client = normaliseClientRecord({ ...req.body });
   if (!client.id) client.id = 'cli_' + Date.now();
+  // Keep flat fields synced from billingAddress for backward-compatible readers
+  if (client.billingAddress) {
+    client.address = client.billingAddress.address ?? client.address ?? '';
+    client.city = client.billingAddress.city ?? client.city ?? '';
+    client.pin = client.billingAddress.pin ?? client.pin ?? '';
+    client.state = client.billingAddress.state ?? client.state ?? '';
+    client.country = client.billingAddress.country ?? client.country ?? '';
+  }
   const filePath = path.join(DATA_DIR, 'clients', safeFileName(client.id) + '.json');
   writeJSON(filePath, client);
   res.json({ success: true, id: client.id });
@@ -356,6 +382,151 @@ app.post('/api/clients', (req, res) => {
 
 app.delete('/api/clients/:id', (req, res) => {
   const filePath = path.join(DATA_DIR, 'clients', safeFileName(req.params.id) + '.json');
+  deleteFile(filePath);
+  res.json({ success: true });
+});
+
+// ========================
+// VENDORS (SUPPLIERS) — with encrypted bank details at rest & masked reads
+// ========================
+const VENDOR_KEY_PATH = path.join(DATA_DIR, 'vendor_key.hex');
+
+function getVendorEncryptionKey() {
+  if (process.env.VENDOR_BANK_KEY) {
+    return crypto.createHash('sha256').update(process.env.VENDOR_BANK_KEY).digest();
+  }
+  if (fs.existsSync(VENDOR_KEY_PATH)) {
+    const hex = fs.readFileSync(VENDOR_KEY_PATH, 'utf8').trim();
+    if (/^[0-9a-f]{64}$/i.test(hex)) return Buffer.from(hex, 'hex');
+  }
+  const key = crypto.randomBytes(32);
+  fs.writeFileSync(VENDOR_KEY_PATH, key.toString('hex'), { mode: 0o600 });
+  return key;
+}
+
+function encryptSecret(plaintext) {
+  if (!plaintext) return '';
+  const key = getVendorEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(String(plaintext), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${enc.toString('hex')}`;
+}
+
+function decryptSecret(payload) {
+  if (!payload || typeof payload !== 'string' || !payload.includes(':')) return '';
+  try {
+    const [ivHex, tagHex, encHex] = payload.split(':');
+    const key = getVendorEncryptionKey();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(encHex, 'hex')), decipher.final()]).toString('utf8');
+  } catch {
+    return '';
+  }
+}
+
+function maskSecret(val) {
+  const s = String(val || '').trim();
+  if (!s) return '';
+  if (s.length <= 4) return '•'.repeat(s.length);
+  return '•'.repeat(Math.min(12, s.length - 4)) + s.slice(-4);
+}
+
+function isMaskedPlaceholder(val) {
+  return typeof val === 'string' && val.includes('•');
+}
+
+function sanitiseVendorForResponse(v) {
+  const bank = v.bankDetails || {};
+  const accEnc = bank.accountNumberEnc || '';
+  const routeEnc = bank.routingCodeEnc || '';
+  const accLast4 = bank.accountNumberLast4 || '';
+  const routeLast4 = bank.routingCodeLast4 || '';
+  return {
+    ...v,
+    bankDetails: {
+      accountHolderName: bank.accountHolderName || '',
+      bankName: bank.bankName || '',
+      accountNumberMasked: accEnc ? `••••••••${accLast4}` : (bank.accountNumber ? maskSecret(bank.accountNumber) : ''),
+      routingCodeMasked: routeEnc ? `••••${routeLast4}` : (bank.routingCode ? maskSecret(bank.routingCode) : ''),
+      hasAccountNumber: !!(accEnc || bank.accountNumber),
+      hasRoutingCode: !!(routeEnc || bank.routingCode),
+    },
+  };
+}
+
+app.get('/api/vendors', (req, res) => {
+  const vendors = readAllFromDir('vendors').map(sanitiseVendorForResponse);
+  vendors.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  res.json(vendors);
+});
+
+app.get('/api/vendors/:id/bank-details', (req, res) => {
+  const filePath = path.join(DATA_DIR, 'vendors', safeFileName(req.params.id) + '.json');
+  const existing = readJSON(filePath, null);
+  if (!existing) return res.status(404).json({ error: 'Vendor not found' });
+  const bank = existing.bankDetails || {};
+  res.json({
+    accountHolderName: bank.accountHolderName || '',
+    bankName: bank.bankName || '',
+    accountNumber: bank.accountNumberEnc ? decryptSecret(bank.accountNumberEnc) : (bank.accountNumber || ''),
+    routingCode: bank.routingCodeEnc ? decryptSecret(bank.routingCodeEnc) : (bank.routingCode || ''),
+  });
+});
+
+app.post('/api/vendors', (req, res) => {
+  try {
+    const incoming = { ...req.body };
+    if (!incoming.name || !String(incoming.name).trim()) {
+      return res.status(400).json({ error: 'Vendor name is required' });
+    }
+    if (!incoming.id) incoming.id = 'vnd_' + Date.now();
+    const vendorsDir = path.join(DATA_DIR, 'vendors');
+    if (!fs.existsSync(vendorsDir)) fs.mkdirSync(vendorsDir, { recursive: true });
+    const filePath = path.join(vendorsDir, safeFileName(incoming.id) + '.json');
+    const existing = readJSON(filePath, null);
+    const existingBank = existing?.bankDetails || {};
+    const inBank = incoming.bankDetails || {};
+
+    // Preserve existing encrypted secrets if the UI didn't modify the masked field
+    let accountNumberEnc = existingBank.accountNumberEnc || '';
+    let accountNumberLast4 = existingBank.accountNumberLast4 || '';
+    if (typeof inBank.accountNumber === 'string' && !isMaskedPlaceholder(inBank.accountNumber)) {
+      const cleanAcc = inBank.accountNumber.trim();
+      accountNumberEnc = cleanAcc ? encryptSecret(cleanAcc) : '';
+      accountNumberLast4 = cleanAcc.slice(-4);
+    }
+
+    let routingCodeEnc = existingBank.routingCodeEnc || '';
+    let routingCodeLast4 = existingBank.routingCodeLast4 || '';
+    if (typeof inBank.routingCode === 'string' && !isMaskedPlaceholder(inBank.routingCode)) {
+      const cleanRoute = inBank.routingCode.trim().toUpperCase();
+      routingCodeEnc = cleanRoute ? encryptSecret(cleanRoute) : '';
+      routingCodeLast4 = cleanRoute.slice(-4);
+    }
+
+    const vendorToStore = {
+      ...incoming,
+      bankDetails: {
+        accountHolderName: (inBank.accountHolderName || '').trim(),
+        bankName: (inBank.bankName || '').trim(),
+        accountNumberEnc,
+        accountNumberLast4,
+        routingCodeEnc,
+        routingCodeLast4,
+      },
+    };
+    writeJSON(filePath, vendorToStore);
+    res.json({ success: true, id: vendorToStore.id, vendor: sanitiseVendorForResponse(vendorToStore) });
+  } catch (err) {
+    return errRes(res, 500, 'server-error', err);
+  }
+});
+
+app.delete('/api/vendors/:id', (req, res) => {
+  const filePath = path.join(DATA_DIR, 'vendors', safeFileName(req.params.id) + '.json');
   deleteFile(filePath);
   res.json({ success: true });
 });
@@ -675,6 +846,7 @@ app.get('/api/export', (req, res) => {
     bills: readAllFromDir('bills'),
     profile: readJSON(PROFILE_PATH, DEFAULT_PROFILE),
     clients: readAllFromDir('clients'),
+    vendors: readAllFromDir('vendors').map(sanitiseVendorForResponse),
     termsTemplates: readAllFromDir('templates'),
     products: readAllFromDir('products'),
     expenses: readAllFromDir('expenses'),
@@ -706,6 +878,7 @@ app.post('/api/import', (req, res) => {
   const counts = {
     billCount: 0, billSkipped: 0,
     clientCount: 0, clientSkipped: 0,
+    vendorCount: 0, vendorSkipped: 0,
     templateCount: 0, templateSkipped: 0,
     productCount: 0, productSkipped: 0,
     expenseCount: 0, expenseSkipped: 0,
@@ -732,6 +905,7 @@ app.post('/api/import', (req, res) => {
   }
   (data.bills || []).forEach(b => upsertOne('bills', b, 'billCount', 'billSkipped'));
   (data.clients || []).forEach(c => upsertOne('clients', c, 'clientCount', 'clientSkipped'));
+  (data.vendors || []).forEach(v => upsertOne('vendors', v, 'vendorCount', 'vendorSkipped'));
   (data.termsTemplates || []).forEach(t => upsertOne('templates', t, 'templateCount', 'templateSkipped'));
   (data.products || []).forEach(p => upsertOne('products', p, 'productCount', 'productSkipped'));
   (data.expenses || []).forEach(e => upsertOne('expenses', e, 'expenseCount', 'expenseSkipped'));

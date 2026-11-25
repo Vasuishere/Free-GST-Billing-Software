@@ -310,6 +310,25 @@ export const deletePurchase = async (id) => {
   return apiFetch(`${API}/purchases/${encodeURIComponent(id)}`, { method: 'DELETE' });
 };
 
+// ---- Vendors (Suppliers) ----
+export const getAllVendors = async () => {
+  return apiFetch(`${API}/vendors`);
+};
+
+export const saveVendor = async (vendor) => {
+  const res = await apiFetch(`${API}/vendors`, { method: 'POST', body: JSON.stringify(vendor) });
+  if (res.id) vendor.id = res.id;
+  return res.vendor || vendor;
+};
+
+export const deleteVendor = async (id) => {
+  return apiFetch(`${API}/vendors/${encodeURIComponent(id)}`, { method: 'DELETE' });
+};
+
+export const revealVendorBankDetails = async (id) => {
+  return apiFetch(`${API}/vendors/${encodeURIComponent(id)}/bank-details`);
+};
+
 // ---- Recurring Invoices ----
 export const getAllRecurring = async () => {
   return apiFetch(`${API}/recurring`);

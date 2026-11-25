@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo, lazy, Suspense } from 'react';
 import { ShoppingCart, Plus, Edit3, Trash2, Search, X, Save, Download, Wand2, FileText, Eye } from 'lucide-react';
 import HelpButton from './HelpButton';
-import { getAllPurchases, savePurchase, deletePurchase, getAllProducts, saveProduct, getProfile } from '../store';
-import { formatCurrency, calculateRoundOff, getFYOptions, belongsToProfile, isUnassignedToBusiness, isInterstateSupply, localToday, roundQty } from '../utils';
+import { getAllPurchases, savePurchase, deletePurchase, getAllProducts, saveProduct, getProfile, getAllVendors } from '../store';
+import { formatCurrency, calculateRoundOff, getFYOptions, belongsToProfile, isUnassignedToBusiness, isInterstateSupply, localToday, roundQty, splitPurchaseTax } from '../utils';
 import TableExport from './TableExport';
 import BulkCsvImport from './BulkCsvImport';
 import UnassignedBanner from './UnassignedBanner';
@@ -48,6 +48,8 @@ const emptyItem = { name: '', hsn: '', quantity: 1, rate: 0, taxPercent: 18, ces
 
 const emptyForm = {
   date: '', // v1.10.74 - set to localToday() when the form opens
+  dueDate: '',
+  vendorId: '',
   supplierName: '',
   // v1.10.29 — supplier address for the PDF header. Optional; blank
   // pre-v1.10.29 records fall through gracefully.
@@ -56,6 +58,7 @@ const emptyForm = {
   invoiceNumber: '',
   items: [{ ...emptyItem }],
   paymentStatus: 'Unpaid',
+  paidAmount: '',
   interstate: false, // true ⇒ supplier charged IGST; false ⇒ CGST + SGST. Routes ITC correctly in GSTR-3B.
   applyRoundOff: false, // off by default — purchase bill totals are usually pre-rounded by the supplier. Users with suppliers that don't pre-round can opt in here.
   note: '',
@@ -94,6 +97,7 @@ export default function PurchaseBills() {
   // v1.10.54 (#42) — the Products & Services master, used to seed item
   // suggestions. Loaded on mount alongside purchases.
   const [products, setProducts] = useState([]);
+  const [vendors, setVendors] = useState([]);
   const [search, setSearch] = useState('');
   const [fyFilter, setFyFilter] = useState('');
   const [showForm, setShowForm] = useState(false);
@@ -203,6 +207,7 @@ export default function PurchaseBills() {
     if (fyOptions[0]) setFyFilter(fyOptions[0].value);
     loadPurchases();
     loadProducts();
+    getAllVendors().then((v) => setVendors(v || [])).catch(() => {});
   }, []);
 
   const filtered = purchases.filter(p => {
@@ -235,12 +240,15 @@ export default function PurchaseBills() {
   const openEdit = (purchase) => {
     setForm({
       date: purchase.date || '',
+      dueDate: purchase.dueDate || '',
+      vendorId: purchase.vendorId || '',
       supplierName: purchase.supplierName || '',
       supplierAddress: purchase.supplierAddress || '',
       supplierGstin: purchase.supplierGstin || '',
       invoiceNumber: purchase.invoiceNumber || '',
       items: purchase.items && purchase.items.length > 0 ? purchase.items.map(i => ({ ...i })) : [{ ...emptyItem }],
       paymentStatus: purchase.paymentStatus || 'Unpaid',
+      paidAmount: purchase.paidAmount ?? '',
       interstate: !!purchase.interstate,
       // Detect round-off from older entries: if roundOff field exists and is
       // non-zero, treat applyRoundOff as on. Older entries without the field
@@ -345,8 +353,9 @@ export default function PurchaseBills() {
       if (purchase.interstate) {
         doc.text('IGST', marginL + 100, y); doc.text(fmt(t.tax), marginR, y, { align: 'right' }); y += 5;
       } else {
-        doc.text('CGST', marginL + 100, y); doc.text(fmt(t.tax / 2), marginR, y, { align: 'right' }); y += 5;
-        doc.text('SGST', marginL + 100, y); doc.text(fmt(t.tax / 2), marginR, y, { align: 'right' }); y += 5;
+        const sp = splitPurchaseTax(t.tax, false);
+        doc.text('CGST', marginL + 100, y); doc.text(fmt(sp.cgst), marginR, y, { align: 'right' }); y += 5;
+        doc.text('SGST', marginL + 100, y); doc.text(fmt(sp.sgst), marginR, y, { align: 'right' }); y += 5;
       }
       if (t.cess > 0.005) { doc.text('Cess', marginL + 100, y); doc.text(fmt(t.cess), marginR, y, { align: 'right' }); y += 5; }
       if (Math.abs(t.roundOff) > 0.005) { doc.text('Round-off', marginL + 100, y); doc.text((t.roundOff > 0 ? '+' : '') + fmt(t.roundOff), marginR, y, { align: 'right' }); y += 5; }
@@ -388,6 +397,8 @@ export default function PurchaseBills() {
       const purchase = {
         ...(editingId ? { id: editingId } : {}),
         date: form.date,
+        dueDate: form.dueDate || '',
+        vendorId: form.vendorId || '',
         supplierName: form.supplierName.trim(),
         supplierAddress: (form.supplierAddress || '').trim(),
         supplierGstin: form.supplierGstin.trim(),
@@ -413,6 +424,12 @@ export default function PurchaseBills() {
         applyRoundOff: !!form.applyRoundOff,
         roundOff: totals.roundOff,
         paymentStatus: form.paymentStatus,
+        paidAmount:
+          form.paymentStatus === 'Paid'
+            ? totals.finalTotal
+            : form.paymentStatus === 'Partial'
+              ? Math.max(0, parseFloat(form.paidAmount) || 0)
+              : 0,
         interstate: !!form.interstate,
         note: form.note.trim(),
       };
@@ -621,6 +638,22 @@ export default function PurchaseBills() {
   // spelling of a supplier wins.
   const supplierHistory = useMemo(() => {
     const seen = new Map();
+    // Saved onboarded vendors take precedence
+    for (const v of vendors) {
+      const name = (v.name || '').trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (!seen.has(key)) {
+        seen.set(key, {
+          vendorId: v.id,
+          name,
+          gstin: (v.gstin || '').trim(),
+          address: [v.address, v.city, v.state, v.pin].filter(Boolean).join(', '),
+          interstate: false,
+          paymentTermsDays: v.paymentTermsDays,
+        });
+      }
+    }
     for (const p of purchases) {
       const name = (p.supplierName || '').trim();
       if (!name) continue;
@@ -629,15 +662,19 @@ export default function PurchaseBills() {
       // most recent details for a supplier rather than the oldest.
       if (!seen.has(key)) {
         seen.set(key, {
+          vendorId: p.vendorId || '',
           name,
           gstin: (p.supplierGstin || '').trim(),
           address: (p.supplierAddress || '').trim(),
           interstate: !!p.interstate,
+          paymentTermsDays: '',
         });
+      } else if (p.interstate && !seen.get(key).interstate) {
+        seen.get(key).interstate = true;
       }
     }
     return [...seen.values()];
-  }, [purchases]);
+  }, [purchases, vendors]);
 
   // v1.10.54 (#42) — suggestions come from the product master FIRST, then
   // anything else that has been typed on a past bill.
@@ -708,19 +745,19 @@ export default function PurchaseBills() {
   const updateSupplierName = (value) => {
     const match = supplierHistory.find(s => s.name.toLowerCase() === value.trim().toLowerCase());
     setForm(prev => {
-      const next = { ...prev, supplierName: value };
+      const next = { ...prev, supplierName: value, vendorId: match?.vendorId || '' };
       if (match) {
-        // v1.10.55 (#43) — same re-selection bug as the item rows, and worse
-        // here: switching supplier used to leave the PREVIOUS supplier's
-        // GSTIN in place, so the bill was filed against the wrong taxpayer
-        // and ITC reconciliation broke. See isOursToReplace above.
         const last = prev._autoSupplier || {};
         if (isOursToReplace(prev.supplierGstin, last.gstin)) next.supplierGstin = match.gstin;
         if (isOursToReplace(prev.supplierAddress, last.address)) next.supplierAddress = match.address;
-        // Interstate drives CGST+SGST vs IGST, so recall it too — it is a
-        // property of where the supplier is, and getting it wrong routes
-        // ITC to the wrong GSTR-3B column.
         next.interstate = match.interstate;
+        if (!prev.dueDate && match.paymentTermsDays !== '' && match.paymentTermsDays !== undefined && prev.date) {
+          const d = new Date(prev.date);
+          if (!Number.isNaN(d.getTime())) {
+            d.setDate(d.getDate() + (Number(match.paymentTermsDays) || 0));
+            next.dueDate = d.toISOString().slice(0, 10);
+          }
+        }
         next._autoSupplier = { gstin: match.gstin, address: match.address };
       }
       return next;
@@ -811,14 +848,15 @@ export default function PurchaseBills() {
   const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
   const registerRows = (() => {
     if (!filtered.length) return [];
-    const sum = { taxable: 0, tax: 0, cess: 0, roundOff: 0, finalTotal: 0 };
+    const sum = { taxable: 0, cgst: 0, sgst: 0, igst: 0, cess: 0, roundOff: 0, finalTotal: 0 };
     const rows = [...filtered].sort((x, y) => String(x.date || '').localeCompare(String(y.date || ''))).map(p => {
-      const t = calcPurchaseTotal(p.items, !!p.applyRoundOff);
+      const t = { ...calcPurchaseTotal(p.items, !!p.applyRoundOff) };
+      Object.assign(t, splitPurchaseTax(t.tax, !!p.interstate));
       for (const k of Object.keys(sum)) sum[k] += Number(t[k]) || 0;
-      return [p.date || '', p.supplierName || '', p.supplierGstin || '', p.invoiceNumber || '', r2(t.taxable), r2(t.tax), r2(t.cess),
+      return [p.date || '', p.supplierName || '', p.supplierGstin || '', p.invoiceNumber || '', r2(t.taxable), r2(t.cgst), r2(t.sgst), r2(t.igst), r2(t.cess),
         p.interstate ? 'Y' : 'N', r2(t.roundOff), r2(t.finalTotal), p.paymentStatus || '', p.note || ''];
     });
-    return [...rows, ['Total', '', '', '', r2(sum.taxable), r2(sum.tax), r2(sum.cess), '', r2(sum.roundOff), r2(sum.finalTotal), '', '']];
+    return [...rows, ['Total', '', '', '', r2(sum.taxable), r2(sum.cgst), r2(sum.sgst), r2(sum.igst), r2(sum.cess), '', r2(sum.roundOff), r2(sum.finalTotal), '', '']];
   })();
 
   const formTotals = calcPurchaseTotal(form.items, form.applyRoundOff);
@@ -920,8 +958,8 @@ export default function PurchaseBills() {
                   <><span style={{ color: 'var(--text-muted)' }}>IGST</span><span style={{ textAlign: 'right' }}>{formatCurrency(t.tax)}</span></>
                 ) : (
                   <>
-                    <span style={{ color: 'var(--text-muted)' }}>CGST</span><span style={{ textAlign: 'right' }}>{formatCurrency(t.tax / 2)}</span>
-                    <span style={{ color: 'var(--text-muted)' }}>SGST</span><span style={{ textAlign: 'right' }}>{formatCurrency(t.tax / 2)}</span>
+                    <span style={{ color: 'var(--text-muted)' }}>CGST</span><span style={{ textAlign: 'right' }}>{formatCurrency(splitPurchaseTax(t.tax, false).cgst)}</span>
+                    <span style={{ color: 'var(--text-muted)' }}>SGST</span><span style={{ textAlign: 'right' }}>{formatCurrency(splitPurchaseTax(t.tax, false).sgst)}</span>
                   </>
                 )}
                 {t.cess > 0.005 && <><span style={{ color: 'var(--text-muted)' }}>Cess</span><span style={{ textAlign: 'right' }}>{formatCurrency(t.cess)}</span></>}
@@ -998,11 +1036,22 @@ export default function PurchaseBills() {
                 <input type="date" className="form-input" value={form.date} onChange={e => updateField('date', e.target.value)} />
               </div>
               <div className="form-group">
+                <label className="form-label">Due Date</label>
+                <input type="date" className="form-input" value={form.dueDate || ''} onChange={e => updateField('dueDate', e.target.value)} />
+              </div>
+              <div className="form-group">
                 <label className="form-label">Payment Status</label>
                 <select className="form-input" value={form.paymentStatus} onChange={e => updateField('paymentStatus', e.target.value)}>
                   {PAYMENT_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
+              {form.paymentStatus === 'Partial' && (
+                <div className="form-group">
+                  <label className="form-label">Paid Amount</label>
+                  <input type="number" min="0" step="0.01" className="form-input" value={form.paidAmount}
+                    onChange={e => updateField('paidAmount', e.target.value)} placeholder="Amount paid so far" />
+                </div>
+              )}
               <div className="form-group">
                 <label className="form-label">Supplier Name *</label>
                 {/* v1.10.50 (#39) — recall previously used suppliers. A native
@@ -1159,7 +1208,15 @@ export default function PurchaseBills() {
             <div style={{ marginTop: '1rem', padding: '0.75rem', background: 'var(--bg-secondary)', borderRadius: 8, fontSize: '0.85rem' }}>
               <div style={{ display: 'flex', gap: '1.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
                 <span>Taxable: <strong>{formatCurrency(formTotals.taxable)}</strong></span>
-                <span>Tax: <strong>{formatCurrency(formTotals.tax)}</strong></span>
+                {/* v1.10.83 (#117) - the split as filed, not one tax figure. */}
+                {form.interstate ? (
+                  <span>IGST: <strong>{formatCurrency(formTotals.tax)}</strong></span>
+                ) : (
+                  <>
+                    <span>CGST: <strong>{formatCurrency(splitPurchaseTax(formTotals.tax, false).cgst)}</strong></span>
+                    <span>SGST: <strong>{formatCurrency(splitPurchaseTax(formTotals.tax, false).sgst)}</strong></span>
+                  </>
+                )}
                 {formTotals.cess > 0 && (
                   <span>Cess: <strong>{formatCurrency(formTotals.cess)}</strong></span>
                 )}
@@ -1197,7 +1254,7 @@ export default function PurchaseBills() {
           <h3>Purchase Records</h3>
           <TableExport title="Purchase register" filename="Purchases" landscape
             subtitle={ownerProfile?.businessName || ''}
-            headers={['Date', 'Supplier', 'GSTIN', 'Invoice No', 'Taxable Amount', 'Tax (excl. cess)', 'Cess', 'Inter-state', 'Round-off', 'Total', 'Status', 'Note']}
+            headers={['Date', 'Supplier', 'GSTIN', 'Invoice No', 'Taxable Amount', 'CGST', 'SGST', 'IGST', 'Cess', 'Inter-state', 'Round-off', 'Total', 'Status', 'Note']}
             rows={registerRows} />
         </div>
         {filtered.length === 0 ? (
