@@ -534,6 +534,7 @@ export default function SettingsView({ onSaved }) {
     { id: 'profiles',       label: 'All business profiles',    hint: 'Multi-business switcher entries' },
     { id: 'bills',          label: 'Invoices / bills',         hint: 'Tax invoices, proforma, credit notes, etc.' },
     { id: 'clients',        label: 'Clients',                  hint: 'Saved client directory' },
+    { id: 'vendors',        label: 'Vendors',                  hint: 'Supplier directory; bank details remain masked in backups' },
     { id: 'products',       label: 'Products / Inventory',     hint: 'Product catalog with HSN, rate, stock' },
     { id: 'expenses',       label: 'Expenses',                 hint: 'Expense tracker entries and the cash book' },
     { id: 'purchases',      label: 'Purchase bills',           hint: 'Vendor bills used for ITC, and purchase orders' },
@@ -626,6 +627,7 @@ export default function SettingsView({ onSaved }) {
       if (result.profileCount) parts.push(`${result.profileCount} business profile(s)`);
       if (result.templateCount) parts.push(`${result.templateCount} template(s)`);
       if (result.clientCount) parts.push(`${result.clientCount} client(s)`);
+      if (result.vendorCount) parts.push(`${result.vendorCount} vendor(s)`);
       if (result.productCount) parts.push(`${result.productCount} product(s)`);
       if (result.expenseCount) parts.push(`${result.expenseCount} expense(s)`);
       if (result.purchaseCount) parts.push(`${result.purchaseCount} purchase bill(s)`);

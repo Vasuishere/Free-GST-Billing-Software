@@ -1,4 +1,5 @@
 import { supabase, isSupabaseConfigured } from './supabaseClient';
+import { importBackupIntoSupabase } from './supabaseBackupImport';
 
 let cachedCompanyId = null;
 let cachedUserId = null;
@@ -171,6 +172,10 @@ export async function supabaseApiFetch(url, options = {}) {
   const companyId = await ensureActiveCompanyId();
   const { data: { user } } = await supabase.auth.getUser();
   const userId = user?.id || null;
+
+  if (parts[0] === 'import' && method === 'POST') {
+    return importBackupIntoSupabase(supabase, companyId, userId, body, toRow);
+  }
 
   // Settings singletons: /profile, /local-prefs, /meta
   if (parts[0] === 'profile' || parts[0] === 'local-prefs' || parts[0] === 'meta') {

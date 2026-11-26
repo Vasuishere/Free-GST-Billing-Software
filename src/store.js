@@ -929,13 +929,14 @@ const updateSteps = async () => {
 
 export const exportAllData = async (selection) => {
   const [all, version] = await Promise.all([apiFetch(`${API}/export`), getAppVersion()]);
-  const sel = selection || { profile: true, profiles: true, bills: true, clients: true, products: true, expenses: true, purchases: true, recurring: true, receipts: true, termsTemplates: true, meta: true, localStorage: true };
+  const sel = selection || { profile: true, profiles: true, bills: true, clients: true, vendors: true, products: true, expenses: true, purchases: true, recurring: true, receipts: true, termsTemplates: true, meta: true, localStorage: true };
 
   const data = { exportedAt: new Date().toISOString(), version, __freegstbill_backup: true };
   if (sel.profile)        data.profile = all.profile;
   if (sel.profiles)       data.profiles = all.profiles;
   if (sel.bills)          data.bills = all.bills;
   if (sel.clients)        data.clients = all.clients;
+  if (sel.vendors)        data.vendors = all.vendors;
   if (sel.termsTemplates) data.termsTemplates = all.termsTemplates;
   if (sel.products)       data.products = all.products;
   // v1.10.83 (#115) - production entries travel with products: stock is the result of both.
@@ -970,6 +971,7 @@ export const inspectBackup = (jsonString) => {
       profiles: Array.isArray(data.profiles) ? data.profiles.length : 0,
       bills: Array.isArray(data.bills) ? data.bills.length : 0,
       clients: Array.isArray(data.clients) ? data.clients.length : 0,
+      vendors: Array.isArray(data.vendors) ? data.vendors.length : 0,
       termsTemplates: Array.isArray(data.termsTemplates) ? data.termsTemplates.length : 0,
       products: Array.isArray(data.products) ? data.products.length : 0,
       expenses: Array.isArray(data.expenses) ? data.expenses.length : 0,
@@ -987,7 +989,7 @@ export const inspectBackup = (jsonString) => {
 export const importData = async (jsonString, selection) => {
   const inspected = typeof jsonString === 'string' ? inspectBackup(jsonString) : { raw: jsonString };
   const data = inspected.raw;
-  const sel = selection || { profile: true, profiles: true, bills: true, clients: true, products: true, expenses: true, purchases: true, recurring: true, receipts: true, termsTemplates: true, meta: true, localStorage: true };
+  const sel = selection || { profile: true, profiles: true, bills: true, clients: true, vendors: true, products: true, expenses: true, purchases: true, recurring: true, receipts: true, termsTemplates: true, meta: true, localStorage: true };
 
   // Build a filtered payload — never touch collections the user didn't tick.
   const payload = {};
@@ -995,6 +997,7 @@ export const importData = async (jsonString, selection) => {
   if (sel.profiles && data.profiles)             payload.profiles = data.profiles;
   if (sel.bills && data.bills)                   payload.bills = data.bills;
   if (sel.clients && data.clients)               payload.clients = data.clients;
+  if (sel.vendors && data.vendors)               payload.vendors = data.vendors;
   if (sel.termsTemplates && data.termsTemplates) payload.termsTemplates = data.termsTemplates;
   if (sel.products && data.products)             payload.products = data.products;
   if (sel.products && data.productions)          payload.productions = data.productions;
