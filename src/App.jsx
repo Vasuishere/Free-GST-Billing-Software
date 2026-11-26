@@ -3,6 +3,9 @@ import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, Refr
 import { getAllProfilesWithHidden, saveProfile, getEnabledModules, getMenuOrder, getMenuHidden, getMenuDots, onMenuChanged, getAllBills, getAllProducts, getAllRecurring, getStockAlertSettings, runUpdateNow, getLockStatus, visibleProfiles, hasHiddenProfiles, openHiddenCompanies, hideCompaniesAgain, isOpenedHidden, DATA_SAVED_EVENT } from './store';
 import { isModuleEnabled, localToday, DOCS_URL, trackedStock } from './utils';
 import { isLocalhostOrigin, enableBrowserMode, browserApiFetch } from './utils/browserApi';
+import { supabase, isSupabaseConfigured, enableSupabaseMode, disableSupabaseMode } from './utils/supabaseClient';
+import { supabaseApiFetch, clearSupabaseSessionCache, hasLocalBrowserData, migrateLocalStorageToSupabase } from './utils/supabaseApi';
+import AuthGate from './components/AuthGate';
 import { orderedMenu } from './utils/businessTypes';
 import SidebarMenu, { NavDot } from './components/SidebarMenu';
 import MenuCustomise, { onOpenCustomiseMenu } from './components/MenuCustomise';
@@ -137,6 +140,9 @@ function App() {
   });
   const [showWelcome, setShowWelcome] = useState(false);
   const [serverDown, setServerDown] = useState(false);
+  const [needsAuth, setNeedsAuth] = useState(false);
+  const [canMigrateLocal, setCanMigrateLocal] = useState(false);
+  const [migratingLocal, setMigratingLocal] = useState(false);
   const retryTimer = useRef(null);
 
   const [serverStatus, setServerStatus] = useState('checking'); // 'checking' | 'online' | 'offline'
@@ -366,9 +372,36 @@ function App() {
         throw new Error('not ok');
       } catch {
         if (cancelled) return;
-        // On static hosted deployments (e.g. Vercel) without server.js,
-        // switch to browser localStorage mode instead of showing "Needs a Quick Start".
+        // On static hosted deployments (e.g. Vercel) without server.js:
+        // use Supabase cloud DB when configured, else browser localStorage fallback.
         if (!isLocalhostOrigin()) {
+          if (retryTimer.current) {
+            clearInterval(retryTimer.current);
+            retryTimer.current = null;
+          }
+          if (isSupabaseConfigured() && supabase) {
+            const { data: { session } } = await supabase.auth.getSession();
+            if (!session) {
+              setNeedsAuth(true);
+              setServerDown(false);
+              setServerStatus('offline');
+              return;
+            }
+            enableSupabaseMode();
+            setNeedsAuth(false);
+            setServerDown(false);
+            setServerStatus('online');
+            setCanMigrateLocal(hasLocalBrowserData());
+            if (!profileLoaded.current) {
+              profileLoaded.current = true;
+              const p = await supabaseApiFetch('/api/profile');
+              setProfile(p);
+              if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
+                setShowWelcome(true);
+              }
+            }
+            return;
+          }
           enableBrowserMode();
           setServerDown(false);
           setServerStatus('online');
@@ -379,10 +412,6 @@ function App() {
             if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
               setShowWelcome(true);
             }
-          }
-          if (retryTimer.current) {
-            clearInterval(retryTimer.current);
-            retryTimer.current = null;
           }
           return;
         }
@@ -840,6 +869,26 @@ function App() {
     );
   }
 
+  if (needsAuth) {
+    return (
+      <AuthGate
+        onAuthenticated={async () => {
+          enableSupabaseMode();
+          setNeedsAuth(false);
+          setServerDown(false);
+          setServerStatus('online');
+          setCanMigrateLocal(hasLocalBrowserData());
+          profileLoaded.current = true;
+          const p = await supabaseApiFetch('/api/profile');
+          setProfile(p);
+          if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
+            setShowWelcome(true);
+          }
+        }}
+      />
+    );
+  }
+
   if (serverDown) {
     return (
       <div className="server-down-overlay">
@@ -1084,6 +1133,37 @@ function App() {
             onBack={() => { setEditingBill(null); setCurrentView('dashboard'); }}
             profile={profile} editingBill={editingBill}
           />
+        )}
+        {canMigrateLocal && (
+          <div className="notice notice-info" style={{ margin: '0.75rem 1rem 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem', flexWrap: 'wrap' }}>
+            <span>Local browser data found. Migrate it to your company&apos;s Supabase cloud database?</span>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <button
+                type="button"
+                className="btn btn-primary"
+                style={{ fontSize: '0.78rem', padding: '0.3rem 0.75rem' }}
+                disabled={migratingLocal}
+                onClick={async () => {
+                  setMigratingLocal(true);
+                  try {
+                    const res = await migrateLocalStorageToSupabase();
+                    toast(`Migrated ${res.records} record(s) to Supabase`, 'success');
+                    setCanMigrateLocal(false);
+                    setBusinessKey((k) => k + 1);
+                  } catch (err) {
+                    toast(err?.message || 'Migration failed', 'error');
+                  } finally {
+                    setMigratingLocal(false);
+                  }
+                }}
+              >
+                {migratingLocal ? 'Migrating…' : 'Migrate to Cloud'}
+              </button>
+              <button type="button" className="btn btn-secondary" style={{ fontSize: '0.78rem', padding: '0.3rem 0.6rem' }} onClick={() => setCanMigrateLocal(false)}>
+                Dismiss
+              </button>
+            </div>
+          </div>
         )}
         {/* v1.10.4 — All lazy views under one Suspense boundary. Only the
              matched view's chunk actually loads; others stay unfetched. */}

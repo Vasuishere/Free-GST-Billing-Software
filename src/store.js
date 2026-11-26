@@ -11,6 +11,8 @@ import { logProblem } from './utils/problemLog';
 import { setUpdateProgress } from './utils/updateNotice';
 import { defaultTermsFor } from './utils/termsDefaults';
 import { isBrowserMode, browserApiFetch } from './utils/browserApi';
+import { isSupabaseMode } from './utils/supabaseClient';
+import { supabaseApiFetch } from './utils/supabaseApi';
 
 const API = '/api';
 
@@ -25,6 +27,9 @@ const logApiProblem = (options, url, status, message) => {
 };
 
 async function apiFetch(url, options = {}) {
+  if (isSupabaseMode()) {
+    return supabaseApiFetch(url, options);
+  }
   if (isBrowserMode()) {
     return browserApiFetch(url, options);
   }
