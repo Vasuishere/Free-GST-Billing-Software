@@ -2,10 +2,9 @@ import { useState, useEffect, useRef, useMemo, lazy, Suspense } from 'react';
 import { Home, FileText, Settings, Plus, Users, Package, BarChart3, Wallet, RefreshCw, Receipt, BookOpen, Moon, Sun, Download, X, ShoppingCart, ChevronDown, Building2, Pencil, HelpCircle, Search, Command, Bell, Calculator, Menu, Heart, Banknote } from 'lucide-react';
 import { getAllProfilesWithHidden, saveProfile, getEnabledModules, getMenuOrder, getMenuHidden, getMenuDots, onMenuChanged, getAllBills, getAllProducts, getAllRecurring, getStockAlertSettings, runUpdateNow, getLockStatus, visibleProfiles, hasHiddenProfiles, openHiddenCompanies, hideCompaniesAgain, isOpenedHidden, DATA_SAVED_EVENT } from './store';
 import { isModuleEnabled, localToday, DOCS_URL, trackedStock } from './utils';
-import { isLocalhostOrigin, enableBrowserMode, browserApiFetch } from './utils/browserApi';
-import { supabase, isSupabaseConfigured, enableSupabaseMode, disableSupabaseMode } from './utils/supabaseClient';
-import { supabaseApiFetch, clearSupabaseSessionCache, hasLocalBrowserData, migrateLocalStorageToSupabase } from './utils/supabaseApi';
-import AuthGate from './components/AuthGate';
+import { isLocalhostOrigin } from './utils/browserApi';
+import { supabase, isSupabaseConfigured, enableSupabaseMode } from './utils/supabaseClient';
+import { supabaseApiFetch, hasLocalBrowserData, migrateLocalStorageToSupabase } from './utils/supabaseApi';
 import { orderedMenu } from './utils/businessTypes';
 import SidebarMenu, { NavDot } from './components/SidebarMenu';
 import MenuCustomise, { onOpenCustomiseMenu } from './components/MenuCustomise';
@@ -140,7 +139,6 @@ function App() {
   });
   const [showWelcome, setShowWelcome] = useState(false);
   const [serverDown, setServerDown] = useState(false);
-  const [needsAuth, setNeedsAuth] = useState(false);
   const [canMigrateLocal, setCanMigrateLocal] = useState(false);
   const [migratingLocal, setMigratingLocal] = useState(false);
   const retryTimer = useRef(null);
@@ -346,6 +344,34 @@ function App() {
     let misses = 0;
 
     const checkServer = async () => {
+      // Cloud-first: whenever Supabase is configured, use it in both dev and production
+      // instead of local server ./data/ or browser localStorage.
+      if (isSupabaseConfigured() && supabase) {
+        if (retryTimer.current) {
+          clearInterval(retryTimer.current);
+          retryTimer.current = null;
+        }
+        enableSupabaseMode();
+        setServerDown(false);
+        setServerStatus('online');
+        setCanMigrateLocal(hasLocalBrowserData());
+        if (!profileLoaded.current) {
+          profileLoaded.current = true;
+          try {
+            const p = await supabaseApiFetch('/api/profile');
+            if (cancelled) return;
+            setProfile(p);
+            if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
+              setShowWelcome(true);
+            }
+          } catch (err) {
+            profileLoaded.current = false;
+            toast(err?.message || 'Failed to connect to Supabase cloud database', 'error');
+          }
+        }
+        return;
+      }
+
       try {
         // v1.10.84 - is the app's server really running? A GET can be answered
         // by the offline copy (the api-cache), so with the server stopped the
@@ -372,47 +398,13 @@ function App() {
         throw new Error('not ok');
       } catch {
         if (cancelled) return;
-        // On static hosted deployments (e.g. Vercel) without server.js:
-        // use Supabase cloud DB when configured, else browser localStorage fallback.
         if (!isLocalhostOrigin()) {
           if (retryTimer.current) {
             clearInterval(retryTimer.current);
             retryTimer.current = null;
           }
-          if (isSupabaseConfigured() && supabase) {
-            const { data: { session } } = await supabase.auth.getSession();
-            if (!session) {
-              setNeedsAuth(true);
-              setServerDown(false);
-              setServerStatus('offline');
-              return;
-            }
-            enableSupabaseMode();
-            setNeedsAuth(false);
-            setServerDown(false);
-            setServerStatus('online');
-            setCanMigrateLocal(hasLocalBrowserData());
-            if (!profileLoaded.current) {
-              profileLoaded.current = true;
-              const p = await supabaseApiFetch('/api/profile');
-              setProfile(p);
-              if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
-                setShowWelcome(true);
-              }
-            }
-            return;
-          }
-          enableBrowserMode();
-          setServerDown(false);
-          setServerStatus('online');
-          if (!profileLoaded.current) {
-            profileLoaded.current = true;
-            const p = await browserApiFetch('/api/profile');
-            setProfile(p);
-            if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
-              setShowWelcome(true);
-            }
-          }
+          setServerDown(true);
+          setServerStatus('offline');
           return;
         }
         misses += 1;
@@ -869,26 +861,6 @@ function App() {
     );
   }
 
-  if (needsAuth) {
-    return (
-      <AuthGate
-        onAuthenticated={async () => {
-          enableSupabaseMode();
-          setNeedsAuth(false);
-          setServerDown(false);
-          setServerStatus('online');
-          setCanMigrateLocal(hasLocalBrowserData());
-          profileLoaded.current = true;
-          const p = await supabaseApiFetch('/api/profile');
-          setProfile(p);
-          if (!p.businessName && !localStorage.getItem('freegstbill_onboarded')) {
-            setShowWelcome(true);
-          }
-        }}
-      />
-    );
-  }
-
   if (serverDown) {
     return (
       <div className="server-down-overlay">
@@ -1149,7 +1121,8 @@ function App() {
                     const res = await migrateLocalStorageToSupabase();
                     toast(`Migrated ${res.records} record(s) to Supabase`, 'success');
                     setCanMigrateLocal(false);
-                    setBusinessKey((k) => k + 1);
+                    const p = await supabaseApiFetch('/api/profile');
+                    setProfile(p);
                   } catch (err) {
                     toast(err?.message || 'Migration failed', 'error');
                   } finally {

@@ -13,8 +13,8 @@ export const disableSupabaseMode = () => { supabaseMode = false; };
 export const supabase = isSupabaseConfigured()
   ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: {
-        persistSession: true,
-        autoRefreshToken: true,
+        persistSession: false,
+        autoRefreshToken: false,
       },
     })
   : null;

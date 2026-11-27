@@ -1,12 +1,11 @@
 import { supabase, isSupabaseConfigured } from './supabaseClient';
 import { importBackupIntoSupabase } from './supabaseBackupImport';
 
+const DEFAULT_COMPANY_ID = '00000000-0000-0000-0000-000000000001';
 let cachedCompanyId = null;
-let cachedUserId = null;
 
 export function clearSupabaseSessionCache() {
   cachedCompanyId = null;
-  cachedUserId = null;
 }
 
 function maskVal(val) {
@@ -34,30 +33,30 @@ function sanitiseVendor(v) {
 
 export async function ensureActiveCompanyId() {
   if (!supabase) throw new Error('Supabase is not configured');
-  const { data: { user }, error: userErr } = await supabase.auth.getUser();
-  if (userErr || !user) throw new Error('Please sign in to continue');
+  if (cachedCompanyId) return cachedCompanyId;
 
-  if (cachedCompanyId && cachedUserId === user.id) return cachedCompanyId;
-
-  const { data: memberships, error: memErr } = await supabase
-    .from('company_members')
-    .select('company_id')
-    .eq('user_id', user.id)
+  const { data: companies, error: compErr } = await supabase
+    .from('companies')
+    .select('id')
+    .order('created_at', { ascending: true })
     .limit(1);
-  if (memErr) throw new Error(memErr.message);
+  if (compErr) throw new Error(compErr.message);
 
-  if (memberships && memberships.length > 0) {
-    cachedCompanyId = memberships[0].company_id;
-    cachedUserId = user.id;
+  if (companies && companies.length > 0) {
+    cachedCompanyId = companies[0].id;
     return cachedCompanyId;
   }
 
-  const { data: bootstrappedId, error: bootErr } = await supabase.rpc('bootstrap_company', {
-    p_name: user.email ? `${user.email.split('@')[0]}'s Company` : 'My Company',
-  });
-  if (bootErr) throw new Error(bootErr.message);
-  cachedCompanyId = bootstrappedId;
-  cachedUserId = user.id;
+  const { error: insertErr } = await supabase
+    .from('companies')
+    .upsert({ id: DEFAULT_COMPANY_ID, name: 'Default Company' }, { onConflict: 'id' });
+  if (insertErr) throw new Error(insertErr.message);
+
+  await supabase
+    .from('app_settings')
+    .upsert({ company_id: DEFAULT_COMPANY_ID }, { onConflict: 'company_id' });
+
+  cachedCompanyId = DEFAULT_COMPANY_ID;
   return cachedCompanyId;
 }
 
@@ -170,8 +169,7 @@ export async function supabaseApiFetch(url, options = {}) {
   if (parts[0] === 'lock' && parts[1] === 'status') return { enabled: false, unlocked: true };
 
   const companyId = await ensureActiveCompanyId();
-  const { data: { user } } = await supabase.auth.getUser();
-  const userId = user?.id || null;
+  const userId = null;
 
   if (parts[0] === 'import' && method === 'POST') {
     return importBackupIntoSupabase(supabase, companyId, userId, body, toRow);
@@ -381,8 +379,7 @@ export function hasLocalBrowserData() {
 export async function migrateLocalStorageToSupabase() {
   if (!supabase) throw new Error('Supabase is not configured');
   const companyId = await ensureActiveCompanyId();
-  const { data: { user } } = await supabase.auth.getUser();
-  const userId = user?.id || null;
+  const userId = null;
 
   const readLocal = (key, fallback) => {
     try {
@@ -431,6 +428,16 @@ export async function migrateLocalStorageToSupabase() {
     if (error) throw new Error(`Failed migrating ${col}: ${error.message}`);
     summary.records += rows.length;
   }
+
+  // Clear legacy browser localStorage data once migrated to cloud
+  try {
+    const keysToRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('fgsb_browser_v1:')) keysToRemove.push(k);
+    }
+    for (const k of keysToRemove) localStorage.removeItem(k);
+  } catch { /* ignore */ }
 
   return summary;
 }

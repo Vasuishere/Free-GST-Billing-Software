@@ -256,7 +256,7 @@ create trigger trg_company_documents_updated_at
   before update on public.company_documents
   for each row execute function public.set_updated_at();
 
--- 12. Atomic counter increment RPC (multi-employee safe invoice/PO/DN numbering)
+-- 12. Atomic counter increment RPC (multi-device safe invoice/PO/DN numbering)
 create or replace function public.increment_meta_counter(p_company_id uuid, p_key text)
 returns integer
 language plpgsql
@@ -266,9 +266,6 @@ as $$
 declare
   v_next integer;
 begin
-  if not public.is_company_member(p_company_id) then
-    raise exception 'Not authorized';
-  end if;
   insert into public.app_settings (company_id, meta)
   values (p_company_id, jsonb_build_object(p_key, 1))
   on conflict (company_id) do update
@@ -283,35 +280,34 @@ begin
 end;
 $$;
 
--- 13. Bootstrap a company on first employee sign-up
-create or replace function public.bootstrap_company(p_name text default 'My Company')
-returns uuid
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  v_company_id uuid;
-  v_email text;
-begin
-  if auth.uid() is null then
-    raise exception 'Authentication required';
-  end if;
-  select company_id into v_company_id from public.company_members where user_id = auth.uid() limit 1;
-  if v_company_id is not null then
-    return v_company_id;
-  end if;
-  select email into v_email from auth.users where id = auth.uid();
-  insert into public.companies (name) values (coalesce(nullif(trim(p_name), ''), 'My Company')) returning id into v_company_id;
-  insert into public.company_members (company_id, user_id, email, role) values (v_company_id, auth.uid(), coalesce(v_email, ''), 'admin');
-  insert into public.app_settings (company_id) values (v_company_id) on conflict do nothing;
-  return v_company_id;
-end;
-$$;
+-- 13. Seed default shared company (no employee login required)
+insert into public.companies (id, name)
+values ('00000000-0000-0000-0000-000000000001', 'Default Company')
+on conflict (id) do nothing;
+
+insert into public.app_settings (company_id)
+values ('00000000-0000-0000-0000-000000000001')
+on conflict (company_id) do nothing;
 
 -- ============================================================================
--- 14. Row Level Security (RLS) Policies
+-- 14. Row Level Security (RLS) Policies & Grants (Direct / No-Auth Cloud Mode)
 -- ============================================================================
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on
+  public.companies,
+  public.app_settings,
+  public.clients,
+  public.vendors,
+  public.products,
+  public.bills,
+  public.purchases,
+  public.purchase_orders,
+  public.expenses,
+  public.receipts,
+  public.company_documents
+to anon, authenticated;
+grant execute on function public.increment_meta_counter(uuid, text) to anon, authenticated;
+
 alter table public.companies enable row level security;
 alter table public.company_members enable row level security;
 alter table public.app_settings enable row level security;
@@ -325,22 +321,21 @@ alter table public.expenses enable row level security;
 alter table public.receipts enable row level security;
 alter table public.company_documents enable row level security;
 
--- Companies: members can view, admins can update
-create policy "companies_select_member" on public.companies for select using (public.is_company_member(id));
-create policy "companies_update_admin" on public.companies for update using (public.is_company_admin(id));
+-- Drop old auth-based policies if re-running on an existing database
+drop policy if exists "companies_select_member" on public.companies;
+drop policy if exists "companies_update_admin" on public.companies;
+drop policy if exists "companies_public_all" on public.companies;
+create policy "companies_public_all" on public.companies
+  for all to anon, authenticated using (true) with check (true);
 
--- Company members: members can view their company's team, admins manage members
-create policy "members_select_member" on public.company_members for select using (public.is_company_member(company_id));
-create policy "members_insert_admin" on public.company_members for insert with check (public.is_company_admin(company_id));
-create policy "members_update_admin" on public.company_members for update using (public.is_company_admin(company_id));
-create policy "members_delete_admin" on public.company_members for delete using (public.is_company_admin(company_id));
+drop policy if exists "settings_select_member" on public.app_settings;
+drop policy if exists "settings_insert_member" on public.app_settings;
+drop policy if exists "settings_update_member" on public.app_settings;
+drop policy if exists "settings_public_all" on public.app_settings;
+create policy "settings_public_all" on public.app_settings
+  for all to anon, authenticated using (true) with check (true);
 
--- App settings: members read & update
-create policy "settings_select_member" on public.app_settings for select using (public.is_company_member(company_id));
-create policy "settings_insert_member" on public.app_settings for insert with check (public.is_company_member(company_id));
-create policy "settings_update_member" on public.app_settings for update using (public.is_company_member(company_id));
-
--- Standard multi-employee policies for all business tables
+-- Open shared-workspace policies for all business tables (no login required)
 do $$
 declare
   tbl text;
@@ -349,9 +344,11 @@ begin
     'clients', 'vendors', 'products', 'bills', 'purchases',
     'purchase_orders', 'expenses', 'receipts', 'company_documents'
   ] loop
-    execute format('create policy "%s_select_member" on public.%I for select using (public.is_company_member(company_id))', tbl, tbl);
-    execute format('create policy "%s_insert_member" on public.%I for insert with check (public.is_company_member(company_id))', tbl, tbl);
-    execute format('create policy "%s_update_member" on public.%I for update using (public.is_company_member(company_id))', tbl, tbl);
-    execute format('create policy "%s_delete_admin" on public.%I for delete using (public.is_company_admin(company_id))', tbl, tbl);
+    execute format('drop policy if exists "%s_select_member" on public.%I', tbl, tbl);
+    execute format('drop policy if exists "%s_insert_member" on public.%I', tbl, tbl);
+    execute format('drop policy if exists "%s_update_member" on public.%I', tbl, tbl);
+    execute format('drop policy if exists "%s_delete_admin" on public.%I', tbl, tbl);
+    execute format('drop policy if exists "%s_public_all" on public.%I', tbl, tbl);
+    execute format('create policy "%s_public_all" on public.%I for all to anon, authenticated using (true) with check (true)', tbl, tbl);
   end loop;
 end $$;
