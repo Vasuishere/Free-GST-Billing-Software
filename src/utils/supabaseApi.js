@@ -74,8 +74,19 @@ function tableNameFor(col) {
   return col === 'purchase-orders' ? 'purchase_orders' : col;
 }
 
+function safeDate(val) {
+  const s = String(val || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+function safeIntOrNull(val) {
+  if (val === '' || val == null) return null;
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
 function toRow(col, item, companyId, userId) {
-  const id = item.id || `${col.slice(0, 3)}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const id = String(item.id || `${col.slice(0, 3)}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
   const payload = { ...item, id };
   const base = { company_id: companyId, id, data: payload, created_by: userId };
 
@@ -98,7 +109,7 @@ function toRow(col, item, companyId, userId) {
       gstin: payload.gstin || '',
       email: payload.email || '',
       phone: payload.phone || '',
-      payment_terms_days: payload.paymentTermsDays === '' || payload.paymentTermsDays == null ? null : Number(payload.paymentTermsDays),
+      payment_terms_days: safeIntOrNull(payload.paymentTermsDays),
       bank_details: payload.bankDetails || {},
     };
   }
@@ -120,7 +131,7 @@ function toRow(col, item, companyId, userId) {
       client_id: payload.client?.id || payload.clientId || null,
       invoice_number: payload.invoiceNumber || '',
       invoice_type: payload.invoiceType || 'tax-invoice',
-      invoice_date: payload.invoiceDate || null,
+      invoice_date: safeDate(payload.invoiceDate),
       total_amount: Number(payload.totalAmount) || 0,
       paid_amount: Number(payload.paidAmount) || 0,
       status: payload.status || 'unpaid',
@@ -132,8 +143,8 @@ function toRow(col, item, companyId, userId) {
       vendor_id: payload.vendorId || null,
       supplier_name: payload.supplierName || '',
       invoice_number: payload.invoiceNumber || '',
-      bill_date: payload.date || null,
-      due_date: payload.dueDate || null,
+      bill_date: safeDate(payload.date),
+      due_date: safeDate(payload.dueDate),
       total_amount: Number(payload.totalAmount) || 0,
       paid_amount: Number(payload.paidAmount) || 0,
       payment_status: payload.paymentStatus || 'Unpaid',
@@ -144,15 +155,15 @@ function toRow(col, item, companyId, userId) {
       ...base,
       vendor_id: payload.vendorId || null,
       po_number: payload.poNumber || '',
-      po_date: payload.date || null,
+      po_date: safeDate(payload.date),
       total_amount: Number(payload.totalAmount) || 0,
     };
   }
   if (col === 'expenses') {
-    return { ...base, expense_date: payload.date || null, amount: Number(payload.amount) || 0 };
+    return { ...base, expense_date: safeDate(payload.date), amount: Number(payload.amount) || 0 };
   }
   if (col === 'receipts') {
-    return { ...base, receipt_date: payload.date || null, amount: Number(payload.amount) || 0 };
+    return { ...base, receipt_date: safeDate(payload.date), amount: Number(payload.amount) || 0 };
   }
   return base;
 }
@@ -382,12 +393,29 @@ export async function migrateLocalStorageToSupabase() {
   const userId = null;
 
   const readLocal = (key, fallback) => {
+    let raw;
     try {
-      const raw = localStorage.getItem('fgsb_browser_v1:' + key);
-      return raw ? JSON.parse(raw) : fallback;
-    } catch {
-      return fallback;
+      raw = localStorage.getItem('fgsb_browser_v1:' + key);
+    } catch (error) {
+      throw new Error(`Could not read local browser data "${key}": ${error.message}`);
     }
+    if (!raw) return fallback;
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`Could not parse local browser data "${key}": ${error.message}`);
+    }
+  };
+
+  const readCollection = (col) => {
+    const items = readLocal(`col:${col}`, []);
+    if (!Array.isArray(items)) {
+      throw new Error(`Could not migrate ${col}: local browser data must be a list`);
+    }
+    if (items.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) {
+      throw new Error(`Could not migrate ${col}: local browser data contains an invalid record`);
+    }
+    return items;
   };
 
   const summary = { settings: 0, records: 0 };
@@ -408,25 +436,46 @@ export async function migrateLocalStorageToSupabase() {
     summary.settings = 1;
   }
 
+  const dedupeById = (rows) => Array.from(new Map(rows.map((r) => [r.id, r])).values());
+  const upsertBatched = async (table, rows, onConflict, label) => {
+    const uniqueRows = dedupeById(rows);
+    for (let i = 0; i < uniqueRows.length; i += 200) {
+      const batch = uniqueRows.slice(i, i + 200);
+      const { error } = await supabase.from(table).upsert(batch, { onConflict });
+      if (error) throw new Error(`Failed migrating ${label}: ${error.message}`);
+    }
+    return uniqueRows.length;
+  };
+
   for (const col of CORE_TABLES) {
-    const items = readLocal(`col:${col}`, []);
-    if (!Array.isArray(items) || items.length === 0) continue;
-    const rows = items.map((it) => toRow(col, it, companyId, userId));
-    const { error } = await supabase.from(tableNameFor(col)).upsert(rows, { onConflict: 'company_id,id' });
-    if (error) throw new Error(`Failed migrating ${col}: ${error.message}`);
-    summary.records += rows.length;
+    const items = readCollection(col);
+    if (items.length === 0) continue;
+    let rows = items.map((it) => toRow(col, it, companyId, userId));
+
+    if (col === 'bills') {
+      const { data: clientRows, error } = await supabase.from('clients').select('id').eq('company_id', companyId);
+      if (error) throw new Error(`Failed checking client references: ${error.message}`);
+      const validClientIds = new Set((clientRows || []).map((c) => c.id));
+      rows = rows.map((r) => (r.client_id && !validClientIds.has(r.client_id) ? { ...r, client_id: null } : r));
+    }
+    if (col === 'purchases' || col === 'purchase-orders') {
+      const { data: vendorRows, error } = await supabase.from('vendors').select('id').eq('company_id', companyId);
+      if (error) throw new Error(`Failed checking vendor references: ${error.message}`);
+      const validVendorIds = new Set((vendorRows || []).map((v) => v.id));
+      rows = rows.map((r) => (r.vendor_id && !validVendorIds.has(r.vendor_id) ? { ...r, vendor_id: null } : r));
+    }
+
+    summary.records += await upsertBatched(tableNameFor(col), rows, 'company_id,id', col);
   }
 
   for (const col of DOC_COLLECTIONS) {
-    const items = readLocal(`col:${col}`, []);
-    if (!Array.isArray(items) || items.length === 0) continue;
+    const items = readCollection(col);
+    if (items.length === 0) continue;
     const rows = items.map((it) => {
-      const id = it.id || `${col.slice(0, 3)}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const id = String(it.id || `${col.slice(0, 3)}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
       return { company_id: companyId, collection: col, id, data: { ...it, id }, created_by: userId };
     });
-    const { error } = await supabase.from('company_documents').upsert(rows, { onConflict: 'company_id,collection,id' });
-    if (error) throw new Error(`Failed migrating ${col}: ${error.message}`);
-    summary.records += rows.length;
+    summary.records += await upsertBatched('company_documents', rows, 'company_id,collection,id', col);
   }
 
   // Clear legacy browser localStorage data once migrated to cloud

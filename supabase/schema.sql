@@ -23,6 +23,7 @@ create table if not exists public.companies (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+drop trigger if exists trg_companies_updated_at on public.companies;
 create trigger trg_companies_updated_at
   before update on public.companies
   for each row execute function public.set_updated_at();
@@ -37,6 +38,7 @@ create table if not exists public.company_members (
   updated_at timestamptz not null default now(),
   unique (company_id, user_id)
 );
+drop trigger if exists trg_company_members_updated_at on public.company_members;
 create trigger trg_company_members_updated_at
   before update on public.company_members
   for each row execute function public.set_updated_at();
@@ -77,6 +79,7 @@ create table if not exists public.app_settings (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+drop trigger if exists trg_app_settings_updated_at on public.app_settings;
 create trigger trg_app_settings_updated_at
   before update on public.app_settings
   for each row execute function public.set_updated_at();
@@ -97,6 +100,7 @@ create table if not exists public.clients (
   updated_at timestamptz not null default now(),
   primary key (company_id, id)
 );
+drop trigger if exists trg_clients_updated_at on public.clients;
 create trigger trg_clients_updated_at
   before update on public.clients
   for each row execute function public.set_updated_at();
@@ -118,6 +122,7 @@ create table if not exists public.vendors (
   updated_at timestamptz not null default now(),
   primary key (company_id, id)
 );
+drop trigger if exists trg_vendors_updated_at on public.vendors;
 create trigger trg_vendors_updated_at
   before update on public.vendors
   for each row execute function public.set_updated_at();
@@ -139,6 +144,7 @@ create table if not exists public.products (
   updated_at timestamptz not null default now(),
   primary key (company_id, id)
 );
+drop trigger if exists trg_products_updated_at on public.products;
 create trigger trg_products_updated_at
   before update on public.products
   for each row execute function public.set_updated_at();
@@ -162,6 +168,7 @@ create table if not exists public.bills (
   foreign key (company_id, client_id) references public.clients(company_id, id) on delete set null
 );
 create index if not exists idx_bills_company_date on public.bills(company_id, invoice_date desc);
+drop trigger if exists trg_bills_updated_at on public.bills;
 create trigger trg_bills_updated_at
   before update on public.bills
   for each row execute function public.set_updated_at();
@@ -186,6 +193,7 @@ create table if not exists public.purchases (
   foreign key (company_id, vendor_id) references public.vendors(company_id, id) on delete set null
 );
 create index if not exists idx_purchases_company_date on public.purchases(company_id, bill_date desc);
+drop trigger if exists trg_purchases_updated_at on public.purchases;
 create trigger trg_purchases_updated_at
   before update on public.purchases
   for each row execute function public.set_updated_at();
@@ -205,6 +213,7 @@ create table if not exists public.purchase_orders (
   primary key (company_id, id),
   foreign key (company_id, vendor_id) references public.vendors(company_id, id) on delete set null
 );
+drop trigger if exists trg_purchase_orders_updated_at on public.purchase_orders;
 create trigger trg_purchase_orders_updated_at
   before update on public.purchase_orders
   for each row execute function public.set_updated_at();
@@ -221,6 +230,7 @@ create table if not exists public.expenses (
   updated_at timestamptz not null default now(),
   primary key (company_id, id)
 );
+drop trigger if exists trg_expenses_updated_at on public.expenses;
 create trigger trg_expenses_updated_at
   before update on public.expenses
   for each row execute function public.set_updated_at();
@@ -236,6 +246,7 @@ create table if not exists public.receipts (
   updated_at timestamptz not null default now(),
   primary key (company_id, id)
 );
+drop trigger if exists trg_receipts_updated_at on public.receipts;
 create trigger trg_receipts_updated_at
   before update on public.receipts
   for each row execute function public.set_updated_at();
@@ -252,6 +263,7 @@ create table if not exists public.company_documents (
   primary key (company_id, collection, id)
 );
 create index if not exists idx_company_docs_col on public.company_documents(company_id, collection);
+drop trigger if exists trg_company_documents_updated_at on public.company_documents;
 create trigger trg_company_documents_updated_at
   before update on public.company_documents
   for each row execute function public.set_updated_at();
